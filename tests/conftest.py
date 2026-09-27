@@ -183,6 +183,43 @@ def scheduler(
 
 
 @pytest.fixture
+def engine_factory(store: Store, tmp_path: Path):
+    """在测试已有的 store 之上装配一个真 Engine（含真实适配层）。
+
+    给需要走完整链路的集成／验收测试用——它们验证的是「产品声称解决的问题」，
+    所以不能只测内核，必须有真的适配层与真的 harness。
+    """
+    from workerbee.app import Engine, EngineConfig
+
+    engines: list[Any] = []
+
+    async def _make(**overrides: Any) -> Any:
+        cfg = EngineConfig(
+            data_dir=tmp_path,
+            workspace_dir=tmp_path / "workspace",
+            # 摘要器要调 LLM，测试里默认关掉（交接失败会被显式标记，不会假装成功）。
+            # 上下文组装器是纯逻辑、无外部依赖，**保持开启**——DATA-05 要求
+            # 「交接了什么及其来源」可检查，关掉它就把这条能力测没了。
+            use_summarizer=False,
+            **overrides,
+        )
+        engine = await Engine.create(cfg, store=store)
+        engines.append(engine)
+        await engine.start(reconcile=False)
+        return engine
+
+    yield _make
+
+    for engine in engines:
+        try:
+            engine.scheduler.stop()
+            if engine.reaper is not None:
+                engine.reaper.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.fixture
 def make_workflow(store: Store):
     """创建一个已发布的 Workflow，返回 ``(workflow, revision)``。"""
 

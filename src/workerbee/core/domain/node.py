@@ -63,7 +63,16 @@ class ExecutionProfile(DomainModel):
     """
 
     profile_id: str = Field(default_factory=new_id)
-    model_name: str
+
+    model_name: str = ""
+    """模型名。**留空表示使用该 harness 的默认模型。**
+
+    CFG-01 要求候选「能明确关联模型」，留空并不意味着不明确：它明确表达了
+    「由 harness 自己决定」。强迫用户为每个 harness 猜一个模型别名只会
+    制造一行假配置。实际使用的模型由适配器在会话建立后如实上报，
+    记进 ``Attempt.profile_snapshot``，CFG-07 的可追溯性由此保证。
+    """
+
     harness_ref: str | None = None
     """引用 HarnessRegistration.harness_id。模型与 harness 解耦，多对多可表达。"""
 
@@ -103,7 +112,7 @@ class ExecutionProfile(DomainModel):
         return v
 
     def display(self) -> str:
-        bits = [self.model_name]
+        bits = [self.model_name or "(harness 默认)"]
         if self.harness_ref:
             bits.append(f"@{self.harness_ref}")
         if self.reasoning_effort:

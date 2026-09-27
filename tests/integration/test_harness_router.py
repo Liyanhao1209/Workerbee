@@ -26,6 +26,7 @@ import pytest
 from workerbee.adapters.host.router import HarnessRouter
 from workerbee.adapters.sdk.contract import PermissionRequest
 from workerbee.adapters.sdk.protocol import METHODS, AdapterError, ErrorCode
+from workerbee.core.runtime.ports import SessionCaps
 from workerbee.core.domain import Attempt
 from workerbee.core.domain.registry import (
     AuthMode,
@@ -722,5 +723,149 @@ async def test_spawn_failure_surfaces_as_harness_unavailable(store, tmp_path):
             await open_session(router, reg)
         assert excinfo.value.code == ErrorCode.HARNESS_UNAVAILABLE
         assert "拉起适配器失败" in excinfo.value.message
+    finally:
+        await router.stop()
+
+
+# ----------------------------------------------------------------------
+# 7. 首轮输入（initial_input）与权限模式
+# ----------------------------------------------------------------------
+
+
+async def test_initial_input_travels_in_extra_prompt(mock_router):
+    """首轮输入必须随建会话一起给到适配器（claude -p 只有这一次机会）。
+
+    通道是协议约定的 ``extra["prompt"]``——适配器的 ``extra_prompt()`` 读它。
+    """
+    captured: dict[str, Any] = {}
+
+    router, rec, reg = await mock_router(
+        {"steps": [{"do": "output", "text": "收到"}]}
+    )
+    original = router._build_request
+
+    def spy(*args: Any, **kwargs: Any):
+        request = original(*args, **kwargs)
+        captured["extra"] = dict(request.extra)
+        return request
+
+    router._build_request = spy  # type: ignore[method-assign]
+    handle = await open_session(router, reg, initial_input="只回复四个字：你好世界")
+
+    assert captured["extra"]["prompt"] == "只回复四个字：你好世界"
+    assert handle.accepted_initial_input is True, "mock 已按 extra.prompt 认领首轮输入"
+
+
+async def test_initial_input_is_not_overwritten_when_extra_already_has_one(mock_router):
+    """调用方显式放了 prompt 就以它为准，路由器不覆盖上层准备的内容。"""
+    captured: dict[str, Any] = {}
+    router, rec, reg = await mock_router({"steps": []})
+    original = router._build_request
+
+    def spy(*args: Any, **kwargs: Any):
+        request = original(*args, **kwargs)
+        captured["extra"] = dict(request.extra)
+        return request
+
+    router._build_request = spy  # type: ignore[method-assign]
+    await open_session(router, reg, initial_input="新输入", extra={"prompt": "上层给的"})
+    assert captured["extra"]["prompt"] == "上层给的"
+
+
+async def test_accepted_initial_input_uses_the_adapter_answer(mock_router):
+    """适配器说没收到就是没收到：内核据此决定要不要再投一次。"""
+    router, rec, reg = await mock_router(
+        {"accepted_initial_input": False, "steps": [{"do": "output", "text": "x"}]}
+    )
+    handle = await open_session(router, reg, initial_input="投给我")
+    assert handle.accepted_initial_input is False
+
+
+async def test_accepted_initial_input_fallback_is_conservative(mock_router):
+    """适配器没回这个字段（老适配器）时的兜底：只在「确实给了首轮输入」且
+    「适配器自述 interact=False」两件事都成立才判 True。
+
+    其余一律 False——判 True 猜错的代价是内核不再投输入，阶段会永远等一个
+    不会开始的任务；判 False 猜错的代价只是一次会被如实拒绝的多余投递。
+    """
+    router, _, reg = await mock_router({"steps": []})
+    proc = router._procs[reg.harness_id]
+    caps = proc.manifest.capabilities
+    original = caps.interact
+    try:
+        caps.interact = False
+        assert router._accepted_initial_input({}, initial_input="有输入", proc=proc) is True
+        assert router._accepted_initial_input({}, initial_input=None, proc=proc) is False
+        # 自述可交互的适配器拿不到这份信任：它随时能收输入，不能假定已交付
+        caps.interact = True
+        assert router._accepted_initial_input({}, initial_input="有输入", proc=proc) is False
+        # 适配器进程都没了更不敢说 True
+        assert router._accepted_initial_input({}, initial_input="有输入", proc=None) is False
+    finally:
+        caps.interact = original
+
+
+async def test_permission_mode_is_passed_through(mock_router):
+    """内核算出来的候选权限模式必须原样到达适配器（CFG-02：不静默忽略）。"""
+    captured: dict[str, Any] = {}
+    router, _, reg = await mock_router({"steps": []})
+    original = router._build_request
+
+    def spy(*args: Any, **kwargs: Any):
+        request = original(*args, **kwargs)
+        captured["mode"] = request.permission_mode
+        return request
+
+    router._build_request = spy  # type: ignore[method-assign]
+    await open_session(router, reg, permission_mode="auto")
+    assert captured["mode"] == "auto"
+
+
+async def test_permission_capabilities_reach_the_kernel(mock_router):
+    """HUM-03 的校验读的是这份能力：两个新字段必须真的流到 SessionCaps。"""
+    router, _, reg = await mock_router({"steps": []})
+    caps = await router.capabilities(reg.harness_id)
+    assert caps.permission_modes == ["default", "auto", "manual"]
+    assert caps.non_interactive_modes == ["default", "auto"]
+
+
+async def test_capabilities_start_the_harness_on_demand(store, tmp_path):
+    """还没拉起适配器时问能力：按需拉起后问，而不是回一份全 False 的假声明。
+
+    回假声明的后果很具体：校验管线会认为「该 harness 未声明任何不询问的权限
+    模式」，于是 claude / kimi 这类没有权限钩子的 harness 永远不可用。
+    """
+    reg = await register_harness(
+        store,
+        harness_id="h1",
+        name="Mock",
+        adapter_id="mock",
+        cwd=str(tmp_path),
+        env_template={"WORKERBEE_MOCK_SCRIPT": json.dumps({"steps": []})},
+    )
+    router = HarnessRouter(
+        store, adapter_commands={"mock": MOCK_MAIN}, on_event=Recorder().on_event
+    )
+    try:
+        assert router._procs.get("h1") is None, "前提：这时还没拉起适配器"
+        caps = await router.capabilities("h1")
+        assert caps.interact is True and caps.permission_modes == ["default", "auto", "manual"]
+    finally:
+        await router.stop()
+
+
+async def test_capabilities_of_an_unspawnable_harness_stay_conservative(store):
+    """拉不起来就回保守默认值，并且**记一笔**——不假装它支持什么。"""
+    await register_harness(
+        store, harness_id="h1", name="Mock", adapter_id="mock"
+    )
+    rec = Recorder()
+    router = HarnessRouter(
+        store, adapter_commands={"mock": ["/definitely/not/here"]}, log=rec.log
+    )
+    try:
+        caps = await router.capabilities("h1")
+        assert caps == SessionCaps()
+        assert any("未能拉起" in line for line in rec.logs)
     finally:
         await router.stop()

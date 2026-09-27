@@ -125,14 +125,24 @@ class Engine:
 
     @classmethod
     async def create(
-        cls, config: EngineConfig | None = None, *, harness: Any | None = None
+        cls,
+        config: EngineConfig | None = None,
+        *,
+        harness: Any | None = None,
+        store: Store | None = None,
     ) -> "Engine":
+        """装配内核。
+
+        ``store`` 允许调用方传入一个已打开的 Store（测试、或嵌到别的进程里时用）。
+        不传则按 ``config.db_path()`` 自己开一个。
+        """
         cfg = config or EngineConfig()
         Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
         cfg.resolved_workspace().mkdir(parents=True, exist_ok=True)
 
-        store = await Store.open(str(cfg.db_path()))
-        store.artifacts.root = cfg.artifact_root()
+        if store is None:
+            store = await Store.open(str(cfg.db_path()))
+            store.artifacts.root = cfg.artifact_root()
 
         engine = cls(cfg, store)
         engine.harness = harness if harness is not None else await engine._build_harness()
@@ -348,29 +358,71 @@ class Engine:
         return self._secret_store
 
     async def unlock_secrets(self, passphrase: str) -> int:
-        """解锁凭据库并把全部密值登记进脱敏器。返回登记条数。"""
-        from .security.secret_store import SecretStore
+        """解锁凭据库并把全部密值登记进脱敏器。返回登记条数。
 
+        两条容易写错、写错了还不会报错的地方，这里都显式处理：
+
+        1. ``bind_store`` 是**协程**。漏掉 await 不会抛异常，只会让脱敏器永远
+           登记不到任何密值——表面一切正常，直到某天一个不含可识别前缀的密钥
+           原样出现在事件历史里。所以这里 await，并且核对登记条数。
+        2. 库不存在时抛的是 ``StoreNotFoundError``（``SecretStoreError`` 的子类），
+           不是 ``FileNotFoundError``。捕错异常会让首次启动直接失败。
+
+        口令错误必须原样上抛：那不是「降级」，是用户必须知道的事。
+        """
+        from .security.secret_store import SecretStore, StoreNotFoundError
+
+        vault = str(self.config.data_dir / "secrets.vault")
         try:
-            store = await SecretStore.open(
-                passphrase, str(self.config.data_dir / "secrets.vault")
-            )
-        except FileNotFoundError:
-            store = await SecretStore.create(
-                passphrase, str(self.config.data_dir / "secrets.vault")
-            )
-        except Exception as exc:  # noqa: BLE001 - 口令错等，如实上抛
-            raise
+            store = await SecretStore.open(passphrase, vault)
+        except StoreNotFoundError:
+            store = await SecretStore.create(passphrase, vault)
 
         self._secret_store = store
+
         n = 0
-        redactor = getattr(self, "_redactor", None)
-        if redactor is not None:
-            with contextlib.suppress(Exception):
-                n = redactor.bind_store(store)
+        if self._redactor is not None:
+            # bind_store 是协程。漏掉 await 不会抛异常，只会让脱敏器永远登记不到
+            # 任何密值——表面正常，直到某天一个不含可识别前缀的密钥原样进了历史。
+            n = await self._redactor.bind_store(store)
+
         if self.harness is not None and hasattr(self.harness, "set_secret_store"):
             self.harness.set_secret_store(store)
+
+        locator_count: int | None = None
+        try:
+            locator_count = len(await store.list_locators())
+        except Exception:  # noqa: BLE001 - 统计失败不该阻断解锁
+            locator_count = None
+
+        if n == 0 and locator_count:
+            # 库里有凭据却一个都没登记——这正是那个静默失效的特征，必须报出来。
+            self.startup_notes.append(
+                f"凭据库已解锁（{locator_count} 条）但脱敏器登记到 0 个密值；"
+                f"事件历史中的凭据可能不会被替换为掩码"
+            )
+
+        await self.store.events.append(
+            scope=_scope("system"),
+            type=_event("SECRET_BOUND"),
+            actor=_actor("user"),
+            payload={
+                "locator_count": locator_count,
+                "bound_values": n,
+                "note": "凭据库已解锁；密值已登记进脱敏器",
+            },
+        )
         return n
+
+    async def lock_secrets(self) -> None:
+        """锁定凭据库并清空脱敏器里登记的密值。"""
+        if self._secret_store is not None:
+            with contextlib.suppress(Exception):
+                await self._secret_store.lock()
+        if self._redactor is not None:
+            with contextlib.suppress(Exception):
+                self._redactor.clear()
+        self._secret_store = None
 
     async def _load_secret_value(self, locator: str) -> str | None:
         """取一个凭据值。库未解锁时返回 None，由调用方如实降级而不是匿名运行。"""
@@ -426,6 +478,9 @@ class Engine:
                     f"对账恢复了 {len(report.reattached)} 个仍在执行的会话监控"
                 )
 
+        with contextlib.suppress(Exception):
+            await self._ensure_capability_snapshots()
+
         self._spawn(self.scheduler.run_forever(), "scheduler")
         self._spawn(self.reaper.run_forever(), "reaper")
         self._spawn(self._approval_expiry_loop(), "approval-expiry")
@@ -459,6 +514,48 @@ class Engine:
                 payload={},
             )
         await self.store.close()
+
+    async def _ensure_capability_snapshots(self, *, force: bool = False) -> dict[str, str]:
+        """给尚未探测过的 harness 补一次能力探测。
+
+        为什么必须有这一步：HUM-03 的权限门禁读的是库里的 ``capabilities_snapshot``。
+        如果用户登记了 harness 却从未点过「探测」，快照为空——校验管线只会给一条
+        INFO 就放过，于是「没有权限钩子 + 没说权限模式」这个组合可以一路发射，
+        最终在运行时卡在一个无人应答的提问上。**能绕过的门禁等于没有门禁。**
+
+        探测失败如实记录，不伪造能力（HAR-02）。返回 ``{harness_id: 结论}``。
+        """
+        results: dict[str, str] = {}
+        harnesses = await self.store.registry.list_harnesses()
+        for reg in harnesses:
+            if not reg.enabled:
+                continue
+            if reg.capabilities_snapshot is not None and not force:
+                continue
+            try:
+                caps = await self.harness.capabilities(reg.harness_id)
+                import dataclasses
+
+                payload = (
+                    dataclasses.asdict(caps) if dataclasses.is_dataclass(caps) else dict(caps)
+                )
+                await self.store.registry.record_probe(
+                    reg.harness_id, ok=True, capabilities=payload, error=None
+                )
+                results[reg.harness_id] = "probed"
+            except Exception as exc:  # noqa: BLE001 - 探测失败如实记录，不伪造
+                await self.store.registry.record_probe(
+                    reg.harness_id,
+                    ok=False,
+                    capabilities=None,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                results[reg.harness_id] = f"failed: {type(exc).__name__}"
+                self.startup_notes.append(
+                    f"harness「{reg.name}」能力探测失败：{type(exc).__name__}。"
+                    f"未探测的能力无法参与兼容性判定，发射时会被如实提示（HAR-02）。"
+                )
+        return results
 
     async def _approval_expiry_loop(self) -> None:
         while self._running:
@@ -626,6 +723,10 @@ class Engine:
         actor: str = "user",
     ) -> dict[str, Any]:
         from .core.runtime.launch import launch_task
+
+        # 发射前补齐能力快照：否则「登记了但没探测」的 harness 会绕过权限门禁。
+        with contextlib.suppress(Exception):
+            await self._ensure_capability_snapshots()
 
         try:
             result = await launch_task(

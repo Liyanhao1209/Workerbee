@@ -863,6 +863,32 @@ async def test_task_events_are_scoped(client: Any, publish: Any) -> None:
     assert all(e["task_id"] == task_id for e in page["events"])
 
 
+async def test_entry_point_binds_secrets_before_serving(engine: Engine) -> None:
+    """启动入口在开始服务之前，必须把库里的密值真正登记进脱敏器。
+
+    这里单独测一次，是因为「凭据不进事件历史」这条保证依赖它真的发生过——
+    仅仅是调用了解锁接口并不算数。
+    """
+    from workerbee.server.main import _bind_secrets_for_redaction
+
+    vault = engine.config.data_dir / "secrets.vault"
+    await SecretStore.create(PASSPHRASE, vault)
+    leftover = await engine.unlock_secrets(PASSPHRASE)
+    if asyncio.iscoroutine(leftover):  # 内核漏了 await，见凭据测试里的说明
+        leftover.close()
+    await engine.secret_store.put("secret://bound", {"token": PLAIN_SECRET})
+
+    assert await _bind_secrets_for_redaction(engine) >= 1
+
+    await engine.store.events.append(
+        scope=EventScope.SYSTEM,
+        type=EventType.SYSTEM_START,
+        payload={"note": PLAIN_SECRET},
+    )
+    rows = await engine.store.events.tail(after_id=0, limit=50)
+    assert PLAIN_SECRET not in json.dumps(rows), "登记之后密值不应再进历史"
+
+
 async def test_websocket_pushes_notification_after_submit(app: Any, client: Any, publish: Any) -> None:
     """订阅之后再有状态变化，必须收到推送。"""
     wf, _ = await publish()

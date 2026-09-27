@@ -906,3 +906,93 @@ def test_kimi_default_permission_mode_adds_no_flag(mode):
     )
     assert "-y" not in argv and "--yolo" not in argv
     assert "--auto" not in argv and "--plan" not in argv
+
+
+# ----------------------------------------------------------------------
+# 6. 流式输入通道的行解析纪律（实测发现的三个坑）
+# ----------------------------------------------------------------------
+
+
+def _emitted(adapter: Any, ref: str = "s1") -> list[tuple[str, str, dict]]:
+    """收集适配器上报的事件（不启进程，纯解析）。"""
+    out: list[tuple[str, str, dict]] = []
+
+    async def _emit(kind: Any, **kwargs: Any) -> None:
+        out.append((str(kind), kwargs.get("text") or "", kwargs.get("data") or {}))
+
+    async def _notify(_method: Any, _params: Any) -> None:
+        return None
+
+    adapter.emit_event = _emit  # type: ignore[method-assign]
+    adapter.notify = _notify  # type: ignore[method-assign]
+    adapter._sessions.setdefault(
+        ref,
+        CliSession(session_ref=ref, harness_id="h1", persist_locator=None, proc=None, label="fake"),
+    )
+    return out
+
+
+async def test_replayed_user_message_is_not_treated_as_harness_output():
+    """实测：--replay-user-messages 会把我们投进去的输入原样回显。
+
+    当成输出会让产物里出现用户指令的副本，看起来像「harness 说了这句话」。
+    """
+    adapter = ClaudeCodeAdapter(input_format="stream-json")
+    events = _emitted(adapter)
+    session = adapter._sessions["s1"]
+    await adapter._handle_user(
+        session,
+        {
+            "type": "user",
+            "isReplay": True,
+            "message": {"role": "user", "content": [{"type": "text", "text": "我投进去的话"}]},
+        },
+    )
+    assert events == []
+
+    # 非 replay 的 user 行（工具结果、打断回执）仍然如实转成事件
+    await adapter._handle_user(
+        session,
+        {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}},
+    )
+    assert [e[1] for e in events] == ["[Request interrupted by user]"]
+
+
+async def test_only_the_first_init_line_reports_session_started():
+    """实测：流式通道下**每一轮**都会重发 system/init（同一个会话）。
+
+    重复上报会让上游以为开了好几个会话；但 persist_locator 仍要跟着更新。
+    """
+    adapter = ClaudeCodeAdapter(input_format="stream-json")
+    events = _emitted(adapter)
+    session = adapter._sessions["s1"]
+
+    await adapter._handle_system(session, {"subtype": "init", "session_id": "abc"})
+    await adapter._handle_system(session, {"subtype": "init", "session_id": "abc"})
+    assert [e[0] for e in events] == ["session_started"]
+    assert session.persist_locator == "abc"
+
+
+async def test_interrupted_turn_is_reported_as_user_cancelled_not_harness_error():
+    """实测：打断后本轮以 result/error_during_execution 收尾。
+
+    如实报成「用户取消」；报成 harness 故障会触发一次毫无意义的重试。
+    """
+    adapter = ClaudeCodeAdapter(input_format="stream-json")
+    events = _emitted(adapter)
+    session = adapter._sessions["s1"]
+    adapter._interrupted["s1"] = time.monotonic()
+
+    await adapter._handle_result(
+        session,
+        {"subtype": "error_during_execution", "is_error": True, "usage": {"input_tokens": 10, "output_tokens": 0}},
+    )
+    error = [e for e in events if e[0] == "error"][0]
+    assert error[2]["error_class"] == "user_cancelled"
+    assert error[2]["error_kind"] == "interrupted_by_user"
+    # 一次打断只解释一轮：下一轮真出错时照旧按 harness 错误报
+    await adapter._handle_result(
+        session, {"subtype": "error_during_execution", "is_error": True}
+    )
+    second = [e for e in events if e[0] == "error"][1]
+    assert second[2]["error_kind"] == "harness_error"

@@ -607,14 +607,7 @@ class Scheduler:
                 )
             )
         elif kind == "usage":
-            rt.usage = Usage(
-                input_tokens=payload.get("input_tokens"),
-                output_tokens=payload.get("output_tokens"),
-                cache_read_tokens=payload.get("cache_read_tokens"),
-                cache_write_tokens=payload.get("cache_write_tokens"),
-                cost_estimate=payload.get("cost_estimate"),
-                cost_basis=payload.get("cost_basis"),
-            )
+            rt.usage = _usage_from_payload(payload)
         elif kind == "error":
             rt.error_detail = str(payload.get("message", "未知错误"))
             rt.error_kind = payload.get("kind")
@@ -1089,6 +1082,44 @@ class _NoContract:
 
 def _no_contract() -> _NoContract:
     return _NoContract()
+
+
+def _usage_from_payload(payload: dict[str, Any]) -> Usage:
+    """把适配器上报的用量收敛成 ``Usage``。
+
+    别名归一化放在**消费端**而不是生产端：同一条事件可能经由 router 的翻译路径
+    到达，也可能被组合根以原始形态直接转发过来。把归一化放在这里，两条路径
+    都能拿到完整数据；放在生产端则只要有一条路径绕开它，数据就会静默变成「未知」。
+    （OBS-04：可取得则记录。丢掉厂商已经告诉我们的用量，等于把「可取得」
+    硬说成「不可得」。）
+
+    **不做** 0 兜底：字段缺失一律保持 None。未知与零是两回事。
+    """
+
+    def pick(*names: str) -> Any:
+        for name in names:
+            if name in payload and payload[name] is not None:
+                return payload[name]
+        return None
+
+    cost = pick("cost_estimate", "total_cost_usd", "cost_usd")
+    basis = pick("cost_basis")
+    if cost is not None and basis is None:
+        basis = "provider_reported"
+
+    return Usage(
+        input_tokens=pick("input_tokens", "inputTokens"),
+        output_tokens=pick("output_tokens", "outputTokens"),
+        cache_read_tokens=pick(
+            "cache_read_tokens", "cache_read_input_tokens", "cacheReadInputTokens"
+        ),
+        cache_write_tokens=pick(
+            "cache_write_tokens", "cache_creation_input_tokens", "cacheCreationInputTokens"
+        ),
+        cost_estimate=cost,
+        cost_basis=basis,
+        notes=pick("notes"),
+    )
 
 
 def _fallback_input(task: Task, node: Any) -> str:

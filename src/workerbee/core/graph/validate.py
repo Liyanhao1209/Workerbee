@@ -473,6 +473,23 @@ def _check_one_node(
             )
         seen_profile_ids.add(profile.profile_id)
 
+        if not profile.model_name:
+            report.diagnostics.append(
+                Diagnostic(
+                    code="model_is_harness_default",
+                    severity=Severity.INFO,
+                    message=(
+                        f"节点「{node.name}」的第 {idx + 1} 组候选未指定模型，"
+                        f"将使用 harness「{profile.harness_ref or '?'}」的默认模型"
+                    ),
+                    node_id=node.node_id,
+                    node_name=node.name,
+                    slot=f"{slot_base}.model_name",
+                    hint="实际使用的模型会在会话建立后如实记入执行尝试，可在任务详情里核对",
+                    requirement="CFG-07",
+                )
+            )
+
         if not profile.harness_ref:
             _add(
                 report,
