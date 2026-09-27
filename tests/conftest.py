@@ -1,4 +1,4 @@
-"""共享测试夹具。
+"""共享测试夹具与构造器。
 
 每个用例一个独立的临时数据库与产物目录——测试之间不共享状态，
 因此可以放心并行与乱序执行。
@@ -13,6 +13,12 @@ from typing import Any
 import pytest
 
 from workerbee.core.domain import (
+    Approval,
+    ApprovalBinding,
+    ApprovalStatus,
+    PinnedGraph,
+    Task,
+    TaskStage,
     WorkflowDefinition,
     WorkflowRevision,
     WorkflowStatus,
@@ -24,8 +30,71 @@ from workerbee.core.runtime.state import StateMachine
 from workerbee.data.store import Store
 
 from tests.fakes import FakeContextBuilder, FakeHarness, FakeSummarizer
+from tests.helpers import edge, graph, node
 
-__all__ = []
+# ===========================================================================
+# 实体构造器（供仓储层与调度层测试共用）
+# ===========================================================================
+
+
+def make_graph() -> GraphSpec:
+    """一个最小的 DAG：A → B。"""
+    return graph({"A": ["B"], "B": []})
+
+
+def make_task(**overrides: Any) -> Task:
+    g = make_graph()
+    pinned = PinnedGraph(
+        graph=g,
+        effective_edges=[("A", "B")],
+        effective_graph_version=g.effective_graph_version(),
+    )
+    defaults: dict[str, Any] = {
+        "task_id": "t1",
+        "workflow_id": "w1",
+        "revision_seq": 1,
+        "effective_graph_version": pinned.effective_graph_version,
+        "graph_snapshot": pinned,
+        "input_payload": {"goal": "写一个测试"},
+    }
+    defaults.update(overrides)
+    return Task(**defaults)
+
+
+def make_stage(**overrides: Any) -> TaskStage:
+    defaults: dict[str, Any] = {
+        "stage_id": "s1",
+        "task_id": "t1",
+        "node_id": "A",
+        "node_name": "A",
+    }
+    defaults.update(overrides)
+    return TaskStage(**defaults)
+
+
+def make_approval(**overrides: Any) -> Approval:
+    """审批的绑定字段是扁平的，构造器把它们折进 ``bound_to``。"""
+    bound = ApprovalBinding(
+        task_id=overrides.pop("task_id", "t1"),
+        stage_id=overrides.pop("stage_id", "s1"),
+        attempt_id=overrides.pop("attempt_id", "at1"),
+        revision_seq=overrides.pop("revision_seq", 1),
+        node_id=overrides.pop("node_id", "A"),
+    )
+    defaults: dict[str, Any] = {
+        "approval_id": "ap1",
+        "bound_to": bound,
+        "action": "Bash(rm -rf build/)",
+        "target": "build/",
+        "status": ApprovalStatus.PENDING,
+    }
+    defaults.update(overrides)
+    return Approval(**defaults)
+
+
+# ===========================================================================
+# 夹具
+# ===========================================================================
 
 
 @pytest.fixture
@@ -34,6 +103,29 @@ async def store(tmp_path: Path) -> Any:
     s.artifacts.root = tmp_path / "artifacts"
     yield s
     await s.close()
+
+
+@pytest.fixture
+async def db(tmp_path: Path) -> Any:
+    """裸数据库连接，供只测事务与迁移的用例使用。"""
+    from workerbee.data.db import Database
+
+    d = Database(str(tmp_path / "raw.db"))
+    await d.connect()
+    yield d
+    await d.close()
+
+
+@pytest.fixture
+async def artifacts(tmp_path: Path) -> Any:
+    """独立的产物存储，不依赖完整 Store。"""
+    from workerbee.data.artifact_store import ArtifactStore
+    from workerbee.data.db import Database
+
+    d = Database(str(tmp_path / "artifact.db"))
+    await d.connect()
+    yield ArtifactStore(d, root=tmp_path / "artifacts")
+    await d.close()
 
 
 @pytest.fixture
@@ -46,6 +138,10 @@ def harness() -> FakeHarness:
     return FakeHarness()
 
 
+async def _fake_harness_teardown(spec: dict) -> tuple[bool, str | None]:
+    return True, None
+
+
 @pytest.fixture
 def ledger(store: Store, tmp_path: Path) -> ResourceLedger:
     return ResourceLedger(
@@ -54,10 +150,6 @@ def ledger(store: Store, tmp_path: Path) -> ResourceLedger:
         harness_teardown=_fake_harness_teardown,
         default_grace_ms=200,
     )
-
-
-async def _fake_harness_teardown(spec: dict) -> tuple[bool, str | None]:
-    return True, None
 
 
 @pytest.fixture
@@ -92,9 +184,9 @@ def scheduler(
 
 @pytest.fixture
 def make_workflow(store: Store):
-    """创建一个已发布的 Workflow，返回 (workflow, revision)。"""
+    """创建一个已发布的 Workflow，返回 ``(workflow, revision)``。"""
 
-    async def _make(graph: GraphSpec, *, name: str = "wf", max_concurrent: int = 8):
+    async def _make(graph_spec: GraphSpec, *, name: str = "wf", max_concurrent: int = 8):
         wf = WorkflowDefinition(
             name=name,
             status=WorkflowStatus.DRAFT,
@@ -104,13 +196,11 @@ def make_workflow(store: Store):
         rev = WorkflowRevision(
             workflow_id=wf.workflow_id,
             revision_seq=1,
-            graph=graph,
+            graph=graph_spec,
             source=RevisionSource.MANUAL,
             is_published=True,
         )
-        await store.workflows.save_revision(
-            rev, publish=True, expected_revision_seq=0
-        )
+        await store.workflows.save_revision(rev, publish=True, expected_revision_seq=0)
         wf.current_revision_seq = 1
         wf.status = WorkflowStatus.PUBLISHED
         return wf, rev
