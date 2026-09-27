@@ -110,6 +110,10 @@ class Engine:
             notifier=self.notifier,
             timeout_seconds=config.approval_timeout,
         )
+        # 回注通道必须在装配期就接上。不接的话决定会被照常记录、照常显示为
+        # 「已批准」，然后静静地送不出去——agent 在那头一直等，用户以为处理完了。
+        # 这正是「静默失败」最危险的一种：两端各自都觉得自己是对的。
+        self.approvals.set_deliver(self._deliver_approval)
         self.scheduler: Scheduler | None = None
         self.reaper: Reaper | None = None
         self.harness: Any | None = None
@@ -169,6 +173,7 @@ class Engine:
             secret_store=self._secret_store,
             on_event=self._on_adapter_event,
             on_permission=self.on_permission_request,
+            on_session_ended=self._on_session_ended,
             on_exit=self._on_adapter_exit,
             log=self._log_adapter,
         )
@@ -205,8 +210,67 @@ class Engine:
     async def _harness_registration(self, harness_id: str) -> Any:
         return await self.store.registry.get_harness(harness_id)
 
+    async def _deliver_approval(
+        self, approval: Any, status: Any, modified_action: str | None
+    ) -> bool:
+        """把审批决定回注到原会话（HUM-04）。
+
+        找不到会话就如实返回 False，由网关标成 ``undeliverable`` 并保持可见——
+        「决定已产生但没送到」是必须让用户看到的事实，不能悄悄吞掉。
+        """
+        from .core.domain.approval import ApprovalStatus
+
+        attempt = await self.store.tasks.get_attempt(approval.bound_to.attempt_id)
+        session_ref = attempt.session_ref if attempt is not None else None
+        if not session_ref:
+            self.startup_notes.append(
+                f"审批 {approval.approval_id[:8]} 无法回注：找不到对应会话"
+            )
+            return False
+
+        respond = getattr(self.harness, "respond_permission", None)
+        if respond is None:
+            return False
+
+        # 只有 approved / denied / expired 三种决定有明确语义；其中 expired 按
+        # deny_pause 的策略等价于「拒绝该动作」，agent 应当收到一个否定答复而不是
+        # 继续等下去。
+        approved = status == ApprovalStatus.APPROVED
+        return bool(
+            await respond(
+                session_ref,
+                approval_id=approval.approval_id,
+                approved=approved,
+                modified_action=modified_action,
+            )
+        )
+
+    async def _on_session_ended(
+        self, session_ref: str, ok: bool, detail: str | None
+    ) -> None:
+        """会话终结（正常结束或进程死亡）→ 交给调度器走完成／失败判定。
+
+        **这条接线漏了的后果特别隐蔽**：harness 崩溃时没有任何 ``session_ended``
+        事件（进程直接没了，SDK 的清理路径根本没跑）。此时如果把崩溃信号丢在地上，
+        阶段会永远停在 running，界面显示一切正常，用户等到天荒地老。
+        「永远 running」是架构设计点名要消灭的失败模式（HAR-03）。
+        """
+        if self.scheduler is None:
+            return
+        await self.scheduler.on_session_ended(
+            session_ref=session_ref, ok=ok, detail=detail
+        )
+        await self.notifier.state_changed(task_id="", stage_id=None)
+
     async def _on_session_died(self, session_ref: str, reason: str) -> None:
         """会话非正常终止 → 走 REC-02 的恢复路径，而不是直接判失败。"""
+        # 先让调度器知道会话没了，否则阶段会卡在 running（同上）。
+        if self.scheduler is not None:
+            with contextlib.suppress(Exception):
+                await self.scheduler.on_session_ended(
+                    session_ref=session_ref, ok=False, detail=reason
+                )
+
         await self.store.db.execute(
             "UPDATE session_handle SET state='lost', updated_at=datetime('now') "
             "WHERE session_ref=?",
@@ -655,26 +719,61 @@ class Engine:
             await self.notifier.state_changed(task_id="", stage_id=None)
 
     async def on_permission_request(self, request: Any) -> None:
-        """把 harness 的权限事件转译为 Approval（HUM-03）。"""
-        rt = None
-        if self.scheduler is not None:
+        """把 harness 的权限事件转译为 Approval（HUM-03）。
+
+        **归属优先用适配器回带的 ``attempt_id``，而不是用 ``session_ref`` 去反查在途表。**
+        理由是一处真实存在的时序：权限请求可能在 ``session.create`` 尚未返回、
+        调度器还没来得及把这次尝试登记进在途表时就到达（harness 在建会话的过程中
+        就发问，是完全正常的行为）。此时按 session 反查会查不到，请求会被当成
+        「无法归属」丢弃——用户永远看不到那条该由他决定的审批，而 agent 在那头干等。
+        ``attempt_id`` 是适配器从建会话请求里带出来的，不依赖任何登记顺序。
+        """
+        attempt_id = getattr(request, "attempt_id", None)
+        stage_id = task_id = None
+
+        if attempt_id:
+            attempt = await self.store.tasks.get_attempt(attempt_id)
+            if attempt is not None:
+                stage_id, task_id = attempt.stage_id, attempt.task_id
+
+        if stage_id is None and self.scheduler is not None:
             rt = self.scheduler.runtime_for_session(request.session_ref)
-        if rt is None:
-            # 会话不在我们的在途表里：可能是已结束阶段的迟到请求。
-            # 不能凭空授权——如实登记一条无法归属的请求并拒发决定。
+            if rt is not None:
+                attempt_id, stage_id, task_id = rt.attempt_id, rt.stage_id, rt.task_id
+
+        if stage_id is None or task_id is None:
+            # 既没有 attempt_id、也查不到在途会话：可能是已结束阶段的迟到请求，
+            # 也可能是适配器没带上归属信息。**不能凭空授权**——如实登记并让用户知道。
             await self.notifier.attention_required(
                 kind="orphan_permission",
                 task_id=None,
                 payload={
                     "session_ref": request.session_ref,
+                    "attempt_id": attempt_id,
                     "action": request.action,
-                    "note": "该权限请求无法归属到任何在途阶段，未自动处理",
+                    "target": request.target,
+                    "note": (
+                        "该权限请求无法归属到任何阶段，未自动处理。"
+                        "若这属于一个仍在运行的任务，请人工介入——agent 可能在等待答复。"
+                    ),
+                },
+            )
+            await self.store.events.append(
+                scope=_scope("approval"),
+                type=_event("APPROVAL_REQUESTED"),
+                actor=_actor("adapter"),
+                payload={
+                    "orphan": True,
+                    "session_ref": request.session_ref,
+                    "attempt_id": attempt_id,
+                    "action": request.action,
+                    "note": "无法归属，未生成审批项",
                 },
             )
             return
 
-        stage = await self.store.tasks.get_stage(rt.stage_id)
-        task = await self.store.tasks.get_task(rt.task_id)
+        stage = await self.store.tasks.get_stage(stage_id)
+        task = await self.store.tasks.get_task(task_id)
         if stage is None or task is None:
             return
 
@@ -682,7 +781,7 @@ class Engine:
             approval_id=request.approval_id,
             task_id=task.task_id,
             stage_id=stage.stage_id,
-            attempt_id=rt.attempt_id,
+            attempt_id=attempt_id,
             revision_seq=task.revision_seq,
             node_id=stage.node_id,
             action=request.action,

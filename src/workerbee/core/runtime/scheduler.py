@@ -138,6 +138,16 @@ class Scheduler:
 
         self._runtimes: dict[str, AttemptRuntime] = {}
         self._stop = asyncio.Event()
+        #: 在派发完成之前就到达的「会话已结束」结论。
+        #:
+        #: 存在的理由是一处真实时序：harness 可能在 ``session.create`` 返回的
+        #: 同一瞬间崩溃（或干脆就在建会话途中崩）。此时调度器还没把这次尝试
+        #: 登记进 ``_runtimes``，按会话查不到归属，那条结束信号就会被丢掉——
+        #: 结果是阶段**永远停在 running**，界面显示一切正常。
+        #: 「永远 running」是架构设计点名要消灭的失败模式（HAR-03）。
+        #: 缓冲它，等派发走到登记那一步再兑现。
+        self._ended_early: dict[str, tuple[bool, str | None]] = {}
+        self._ended_early_limit = 64
         # 退避中的阶段：到点后回队。放在内存里是有意的——重启后这些阶段
         # 由启动对账重新评估（REC-03），不需要为「还要等几秒」做持久化。
         self._retry_heap: list[tuple[float, str]] = []
@@ -492,6 +502,43 @@ class Scheduler:
             actor="system",
         )
 
+        # 会话可能在派发完成之前就没了（harness 建会话途中崩溃、或结束得太快）。
+        # 两条独立的判据，缺一不可：
+        #
+        # 1. **心跳信号**：结束通知早于在途登记到达时，被 `on_session_ended` 缓冲下来，
+        #    这里兑现。它快，但依赖通知真的到达。
+        # 2. **主动查活**：直接问「这个会话还活着吗」。它不依赖任何信号的到达顺序，
+        #    是最后一道兜底——没有它，一次丢掉的信号就会让阶段**永远停在 running**，
+        #    界面显示一切正常。「永远 running」是架构设计点名要消灭的失败模式（HAR-03）。
+        early = self._ended_early.pop(session.session_ref, None)
+        if early is None:
+            try:
+                alive = await self.harness.session_alive(session.session_ref)
+            except Exception:  # noqa: BLE001 - 查不到就当未知，走正常路径
+                alive = True
+            if not alive:
+                early = (False, "会话在本阶段派发完成前即已结束")
+
+        if early is not None:
+            ended_ok, ended_detail = early
+            await self.store.events.append(
+                scope=EventScope.ATTEMPT,
+                type=EventType.ATTEMPT_ENDED,
+                actor=EventActor.ADAPTER,
+                scope_id=attempt.attempt_id,
+                task_id=fresh_task.task_id,
+                stage_id=fresh_stage.stage_id,
+                payload={
+                    "note": "会话在本阶段派发完成前即已结束，按已结束处理",
+                    "ok": ended_ok,
+                    "detail": ended_detail,
+                },
+            )
+            await self.on_session_ended(
+                session_ref=session.session_ref, ok=ended_ok, detail=ended_detail
+            )
+            return True
+
         await self.store.events.append(
             scope=EventScope.ATTEMPT,
             type=EventType.ATTEMPT_STARTED,
@@ -575,6 +622,12 @@ class Scheduler:
         """适配器报告会话结束。**不等于阶段成功**（RUN-06）。"""
         rt = self.runtime_for_session(session_ref)
         if rt is None:
+            # 派发还没走到登记那一步（或这次会话压根没归属）。
+            # 先存下来——如果是前者，dispatch 登记完会回头兑现它。
+            if len(self._ended_early) >= self._ended_early_limit:
+                # 有界：极端情况下也不让这张表无限长。丢最旧的一条。
+                self._ended_early.pop(next(iter(self._ended_early)), None)
+            self._ended_early[session_ref] = (ok, detail)
             return False
         rt.session_ended = True
         rt.ended_ok = ok

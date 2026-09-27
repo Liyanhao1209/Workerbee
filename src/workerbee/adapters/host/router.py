@@ -692,6 +692,53 @@ class HarnessRouter:
             return False
         return bool(result.get("delivered", True))
 
+    async def respond_permission(
+        self,
+        session_ref: str,
+        *,
+        approval_id: str,
+        approved: bool,
+        modified_action: str | None = None,
+        note: str | None = None,
+    ) -> bool:
+        """把审批决定回注给提出请求的会话（HUM-04）。
+
+        返回 False 表示**没送到**——调用方必须据此把审批标成 undeliverable 并保持可见，
+        不能假装送达。回传失败与「用户没批准」是两回事：前者 agent 还在等，后者它已经
+        拿到答复了。混为一谈会让用户以为事情处理完了，而 agent 那头其实还挂着。
+        """
+        proc = self._proc_for(self._sessions.get(session_ref))
+        if proc is None:
+            self._emit_log(
+                f"[router] 回注审批 {approval_id} 失败：会话 {session_ref} 不在活着的适配器上"
+            )
+            return False
+        # 参数形状按 §8.1 的 ``respond(decision)``：decision 是 "approve"/"deny" 字符串。
+        # 不要再用布尔别名——两种形状并存会逼每个适配器作者写兼容分支，
+        # 而写漏的那一支只会在运行时才暴露。
+        params: dict[str, Any] = {
+            "session_ref": session_ref,
+            "approval_id": approval_id,
+            "decision": "approve" if approved else "deny",
+        }
+        if modified_action is not None:
+            params["modified_action"] = modified_action
+        if note is not None:
+            params["note"] = note
+        try:
+            result = await proc.call(
+                METHODS.PERMISSION_RESPOND, params, timeout=self._call_timeout
+            )
+        except (AdapterError, JsonRpcError) as exc:
+            self._emit_log(f"[router] 回注审批 {approval_id} 失败：{exc}")
+            return False
+        if isinstance(result, dict) and result.get("ok") is False:
+            self._emit_log(
+                f"[router] 适配器拒绝回注审批 {approval_id}：{result.get('detail') or result}"
+            )
+            return False
+        return True
+
     async def interrupt(self, session_ref: str) -> bool:
         proc = self._proc_for(self._sessions.get(session_ref))
         if proc is None:
