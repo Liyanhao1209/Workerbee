@@ -531,7 +531,19 @@ class Engine:
             if not reg.enabled:
                 continue
             if reg.capabilities_snapshot is not None and not force:
-                continue
+                snap = reg.capabilities_snapshot or {}
+                # 快照存在不等于快照可信。三种情况都要重新探测：
+                #   1) 上次探测失败；
+                #   2) **权限模式声明为空**——校验管线会把它读成「该 harness 不支持
+                #      任何不询问的模式」，从而拒绝一次本应合法的发射。一个「取不到」
+                #      的能力被当成「没有」，正是本项目明令禁止的失败模式；
+                #   3) 显式要求强制刷新。
+                # 第 2 条的代价是：真的什么都不声明的 harness 每次发射会多一次
+                # 廉价 RPC。用它换「绝不让陈旧空快照挡掉合法提交」，划算。
+                # 只有「探测成功**且**声明完整」才跳过；其余一律重探。
+                if reg.last_probe_ok is True and snap.get("permission_modes"):
+                    continue
+                results[reg.harness_id] = "reprobed"
             try:
                 caps = await self.harness.capabilities(reg.harness_id)
                 import dataclasses
@@ -542,6 +554,18 @@ class Engine:
                 await self.store.registry.record_probe(
                     reg.harness_id, ok=True, capabilities=payload, error=None
                 )
+                if not payload.get("permission_modes"):
+                    # 适配层没能给出完整声明（例如它自己也拿不到注册信息，
+                    # 只好回一份保守默认值）。把它记成**未验证**而不是成功，
+                    # 下一次发射会再试一次。
+                    await self.store.registry.record_probe(
+                        reg.harness_id,
+                        ok=None,  # 未知，不是失败——两者混同会阻断合法发射
+                        capabilities=payload,
+                        error="适配层未给出权限模式声明，本次结论视为未验证（HAR-02）",
+                    )
+                    results[reg.harness_id] = "unverified"
+                    continue
                 results[reg.harness_id] = "probed"
             except Exception as exc:  # noqa: BLE001 - 探测失败如实记录，不伪造
                 await self.store.registry.record_probe(

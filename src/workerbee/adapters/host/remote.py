@@ -412,9 +412,22 @@ class SupervisorClient:
         return bool(result.get("alive"))
 
     async def capabilities(self, harness_id: str) -> SessionCaps:
+        """取能力声明。
+
+        **必须先 `ensure_harness`**：supervisor 刻意不读 core 的数据库，
+        「怎么启动这个 harness」只能由 core 显式告诉它。若不先推注册信息，
+        supervisor 侧就查不到这个 harness，只能返回一份保守的空声明——
+        而空声明会让校验管线以为「该 harness 不支持任何不询问的权限模式」，
+        从而拒绝一次本应合法的发射。
+
+        这是只有 supervisor 部署形态才会暴露的失败：单进程模式永远走不到这里。
+        """
         try:
-            result = await self.call(METHODS.HARNESS_CAPABILITIES, {"harness_id": harness_id})
-        except Exception:  # noqa: BLE001
+            await self._ensure_harness_ready(harness_id)
+            result = await self.call(
+                METHODS.HARNESS_CAPABILITIES, {"harness_id": harness_id}
+            )
+        except Exception:  # noqa: BLE001 - 取不到就如实返回保守声明
             return SessionCaps()
         return SessionCaps.from_mapping(result)
 

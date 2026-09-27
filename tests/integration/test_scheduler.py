@@ -470,6 +470,43 @@ class TestCompletionCriteria:
             "一次性形态：建会话时已交付，绝不能再 send_input 一次"
         )
 
+    async def test_success_releases_resources(
+        self, store, sm, harness, scheduler, ledger, make_workflow, tick
+    ):
+        """阶段成功后必须释放其资源（RES-01）。
+
+        这条曾经是坏的：失败与取消路径都走了台账清理，唯独**成功**路径漏掉，
+        于是每个跑完的阶段都在台账里留下一个永不关闭的句柄。成功是最常见的路径，
+        所以这种漏洞积累得最快，而且在功能上完全看不出来——直到磁盘和连接耗尽。
+        """
+        await _setup_harness(store)
+        g = graph({"A": ["B"], "B": []})
+        wf, _ = await make_workflow(g)
+        task_id = (await launch_task(store=store, workflow_id=wf.workflow_id)).task.task_id
+
+        await tick(scheduler)
+        rt = _only_runtime(scheduler)
+        attempt = (await store.tasks.list_attempts(rt.stage_id))[0]
+
+        opened = await store.resources.list_for_attempt(attempt.attempt_id)
+        assert opened, "派发时必须先登记会话资源（先登记后使用）"
+
+        await scheduler.on_event(
+            session_ref=rt.session_ref, kind="output", payload={"text": "产出"}
+        )
+        await scheduler.on_session_ended(session_ref=rt.session_ref, ok=True)
+        await tick(scheduler)
+
+        stage = (await store.tasks.list_stages(task_id))[0]
+        assert stage.observed_state == StageState.SUCCEEDED
+
+        rows = await store.resources.list_for_attempt(attempt.attempt_id)
+        assert rows, "台账记录本身保留用于审计"
+        assert all(r["state"] == "closed" for r in rows), (
+            f"成功后句柄必须全部关闭，实际：{[r['state'] for r in rows]}"
+        )
+        assert rt.session_ref in harness.disposed, "会话必须被归档（§8.2）"
+
     async def test_no_output_fails(self, store, sm, harness, scheduler, make_workflow, tick):
         """会话正常结束但什么都没产出 → 阶段失败。
 

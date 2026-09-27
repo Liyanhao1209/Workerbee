@@ -649,6 +649,8 @@ def _check_harness(
                 requirement="CFG-02",
             )
 
+    # 只有**探测失败**（False）才阻断。``None`` 表示「没探测出结论」——
+    # 那是未知，不是坏掉；把它当失败会拒绝一次本应合法的发射。
     if mode == ValidationMode.LAUNCH and reg.last_probe_ok is False:
         _add(
             report,

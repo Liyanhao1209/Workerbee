@@ -782,6 +782,15 @@ class Scheduler:
                 compact_events=[e.model_dump(mode="json") for e in rt.compact_events],
             )
 
+        # 成功路径同样必须释放资源。失败与取消路径都走了台账清理，唯独成功路径
+        # 漏掉的话，每个跑完的阶段都会在台账里留下一个永不关闭的句柄——
+        # 「完成」是最常见的路径，所以这个漏洞积累得最快（RES-01）。
+        # 会话按 §8.2 归档：阶段结束后不再作为运行会话使用，历史阶段只读。
+        await self.ledger.close_for_attempt(attempt.attempt_id)
+        if attempt.session_ref:
+            with contextlib.suppress(Exception):
+                await self.harness.dispose(attempt.session_ref)
+
         ok = await self.sm.set_stage_state(
             stage,
             StageState.SUCCEEDED,
