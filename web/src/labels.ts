@@ -111,11 +111,29 @@ const STAGE_LABELS: Record<StageState, StateLabel> = {
   reconciling: { text: '核对中', tone: 'transition', transitioning: true, terminal: false },
 };
 
-export function taskStateLabel(state: TaskState): StateLabel {
-  return TASK_LABELS[state];
+/**
+ * 未知状态的兜底。
+ *
+ * 状态值来自网络（事件历史里可能是旧版本写入的、或后端将来新增的）。字典查不到
+ * 时返回一个**原样显示**的标签，而不是 undefined —— 后者会让调用方取 `.text`
+ * 时抛异常，把整页打成白屏。用户看到「queued」这种英文原文是可以接受的，
+ * 看到白屏不可接受。
+ */
+function unknownStateLabel(value: string): StateLabel {
+  return {
+    text: value,
+    tone: 'idle',
+    transitioning: false,
+    terminal: false,
+    hint: '内核上报了本界面尚未认识的状态，已原样显示',
+  };
 }
-export function stageStateLabel(state: StageState): StateLabel {
-  return STAGE_LABELS[state];
+
+export function taskStateLabel(state: TaskState | string): StateLabel {
+  return TASK_LABELS[state as TaskState] ?? unknownStateLabel(String(state));
+}
+export function stageStateLabel(state: StageState | string): StateLabel {
+  return STAGE_LABELS[state as StageState] ?? unknownStateLabel(String(state));
 }
 
 /** Task 状态的完整中文名清单，供筛选器使用。顺序与后端枚举一致。 */

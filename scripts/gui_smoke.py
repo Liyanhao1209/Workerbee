@@ -104,13 +104,22 @@ async def main() -> int:
     ap.add_argument("--base", default="http://127.0.0.1:8765")
     ap.add_argument("--token", required=True)
     ap.add_argument("--out", default=".workerbee/gui-smoke")
+    ap.add_argument("--task", default=None, help="额外检查某个任务详情页")
+    ap.add_argument("--workflow", default=None, help="额外检查某个流程编辑器（画布）")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    routes = list(ROUTES)
+    if args.workflow:
+        routes.append(("editor", f"/#/workflows/{args.workflow}", ["节点", "校验"]))
+    if args.task:
+        routes.append(("task-detail", f"/#/tasks/{args.task}", ["阶段"]))
+        routes.append(("task-graph", f"/#/execution/{args.task}", ["执行"]))
+
     results = []
-    for name, path, needles in ROUTES:
+    for name, path, needles in routes:
         results.append(await _check(name, path, needles, args.base, args.token, out_dir))
 
     print(f"{'页面':<12} {'结果':<6} 说明")

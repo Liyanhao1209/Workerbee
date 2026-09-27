@@ -49,6 +49,7 @@ import {
   PARTITION_LABELS,
   SENSITIVITY_LABELS,
   stageStateLabel,
+  taskStateLabel,
 } from '../labels';
 
 export function TaskDetailPage(): JSX.Element {
@@ -1144,11 +1145,13 @@ function summarizeEvent(event: EventRecord): JSX.Element {
     typeof p['from_state'] === 'string' ? p['from_state'] : typeof p['from'] === 'string' ? p['from'] : null;
   const to = typeof p['to_state'] === 'string' ? p['to_state'] : typeof p['to'] === 'string' ? p['to'] : null;
   if (from && to) {
-    const fromLabel = stageStateLabel(from as TaskStage['observed_state']).text;
-    const toLabel = stageStateLabel(to as TaskStage['observed_state']).text;
+    // 按**事件类型**选标签表，不能只看载荷里有没有 from/to：任务状态与阶段状态
+    // 是两套枚举（如 queued 只属于 TaskState），用错表会查到 undefined。
+    const isTaskState = event.type.startsWith('task.');
+    const label = isTaskState ? taskStateLabel : stageStateLabel;
     return (
       <span>
-        {fromLabel} → {toLabel}
+        {label(from).text} → {label(to).text}
         {typeof p['reason'] === 'string' ? ` · ${p['reason']}` : ''}
       </span>
     );
