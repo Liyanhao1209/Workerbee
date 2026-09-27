@@ -45,7 +45,11 @@ packages = ["src/workerbee"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-timeout = 300
+timeout = 120
+# 必须用 signal 方法：默认的 thread 方法在「事件循环阻塞在 epoll_wait」时
+# 根本不会触发——那正是异步代码最典型的挂起形态。用 thread 方法等于没有超时，
+# 实测出现过整整跑了一小时四十分钟还没被中断的用例。
+timeout_method = "signal"
 # 默认不跑真实 harness（慢、要登录、要花 token）。要跑显式指定：
 #   .venv/bin/python -m pytest -m interactive tests/interactive
 addopts = '-m "not interactive"'

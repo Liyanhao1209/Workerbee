@@ -490,7 +490,12 @@ class Engine:
         task = asyncio.create_task(coro, name=f"workerbee:{name}")
         self._tasks.append(task)
 
-    async def stop(self) -> None:
+    async def stop(self, *, close_store: bool = True) -> None:
+        """停止全部后台循环。
+
+        ``close_store=False`` 供「store 由调用方持有」的场景（测试夹具、嵌入宿主）
+        使用——那种情况下关库是调用方的事，这里再关一次会让它的清理报错。
+        """
         self._running = False
         if self.scheduler is not None:
             self.scheduler.stop()
@@ -513,7 +518,8 @@ class Engine:
                 actor=_actor("system"),
                 payload={},
             )
-        await self.store.close()
+        if close_store:
+            await self.store.close()
 
     async def _ensure_capability_snapshots(self, *, force: bool = False) -> dict[str, str]:
         """给尚未探测过的 harness 补一次能力探测。

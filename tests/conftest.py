@@ -183,7 +183,7 @@ def scheduler(
 
 
 @pytest.fixture
-def engine_factory(store: Store, tmp_path: Path):
+async def engine_factory(store: Store, tmp_path: Path):
     """在测试已有的 store 之上装配一个真 Engine（含真实适配层）。
 
     给需要走完整链路的集成／验收测试用——它们验证的是「产品声称解决的问题」，
@@ -210,11 +210,15 @@ def engine_factory(store: Store, tmp_path: Path):
 
     yield _make
 
+    # 必须走 engine.stop()，不能只停 scheduler/reaper：
+    # Engine.start() 还起了「审批超时」与「排水推进」两个循环，它们的退出条件是
+    # 一个只有 stop() 才会清的标志。只停前两个的话，这两个循环会活到事件循环关闭，
+    # 变成「Task was destroyed but it is pending」，极端情况下把测试挂住。
+    # 用 close() 而不是 stop()：测试里的 store 由 store 夹具持有并关闭，
+    # 这里再关一次会让夹具的清理报错。
     for engine in engines:
         try:
-            engine.scheduler.stop()
-            if engine.reaper is not None:
-                engine.reaper.stop()
+            await engine.stop(close_store=False)
         except Exception:  # noqa: BLE001
             pass
 
