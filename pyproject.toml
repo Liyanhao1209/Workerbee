@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Workerbee - a cross-platform multi-agent workflow orchestration framework over local agent harnesses"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "Proprietary" }
+license = { text = "Apache-2.0" }
 dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.2",

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128"
+     role="img" aria-label="Workerbee">
+  <title>Workerbee</title>
+  <defs>
+    <!-- 蜂窝的金色。实心填充让它同时适配浅色与深色背景，README 里不用两套图。 -->
+    <linearGradient id="comb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFC85C"/>
+      <stop offset="100%" stop-color="#F0910F"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 六边形：一枚蜂窝格。linejoin=round + 同色描边把尖角磨圆。 -->
+  <polygon points="118,64 91,110.8 37,110.8 10,64 37,17.2 91,17.2"
+           fill="url(#comb)" stroke="url(#comb)" stroke-width="9"
+           stroke-linejoin="round"/>
+
+  <g stroke="#3B2A12" stroke-width="4.5" stroke-linecap="round" fill="none">
+    <!-- 两条并行分支汇聚到一处：多 agent 各跑一段，结果在一点合流。 -->
+    <path d="M48 51 L 64 76"/>
+    <path d="M80 51 L 64 76"/>
+  </g>
+
+  <g fill="#3B2A12">
+    <circle cx="48" cy="51" r="8"/>
+    <circle cx="80" cy="51" r="8"/>
+    <circle cx="64" cy="76" r="8"/>
+  </g>
+</svg>

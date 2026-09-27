@@ -10,15 +10,21 @@ dist/
 build/
 
 # 运行时数据：数据库、产物、临时工作目录、密钥
-.workerbee/
+# 用 .workerbee*/ 而不是 .workerbee/：后者匹配不到 .workerbee-demo/ 一类的
+# 演示数据目录，而数据库恰好被下面的 *.db 规则挡住、产物文件（无扩展名）挡不住，
+# 结果是「库没进去、产物进去了」这种半泄漏。
+.workerbee*/
 data/
 *.db
 *.db-wal
 *.db-shm
 
+# 仓库内的临时比对产物，不属于发布内容
+assets/logo-preview.*
+
 # 前端
 node_modules/
 web/dist/
 
-# 文档抽取产物
-docs/_txt/
+# 文档以及抽取产物
+docs/

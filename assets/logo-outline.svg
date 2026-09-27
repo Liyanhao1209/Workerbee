@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128"
+     role="img" aria-label="Workerbee">
+  <title>Workerbee</title>
+  <defs>
+    <linearGradient id="amber" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FFC85C"/>
+      <stop offset="100%" stop-color="#F0910F"/>
+    </linearGradient>
+  </defs>
+  <!-- 描边版：蜂窝格只留边框，节点用实心。整体更轻，配深色界面不抢眼。 -->
+  <polygon points="115,64 89.5,108.2 38.5,108.2 13,64 38.5,19.8 89.5,19.8"
+           fill="none" stroke="url(#amber)" stroke-width="9" stroke-linejoin="round"/>
+  <g stroke="url(#amber)" stroke-width="5" stroke-linecap="round" fill="none">
+    <path d="M48 51 L 64 76"/>
+    <path d="M80 51 L 64 76"/>
+  </g>
+  <g fill="url(#amber)">
+    <circle cx="48" cy="51" r="8"/>
+    <circle cx="80" cy="51" r="8"/>
+    <circle cx="64" cy="76" r="8"/>
+  </g>
+</svg>
