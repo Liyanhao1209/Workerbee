@@ -340,6 +340,27 @@ class SystemService(_Service):
             note=note,
         )
 
+    # ---- 接入运行中的会话（HUM-01/02） ----
+
+    async def attach(self, session_ref: str) -> S.SessionAttachResponse:
+        """取一个会话的可看输出与可做操作。"""
+        return S.SessionAttachResponse(**await self.engine.attach_session(session_ref))
+
+    async def send_input(
+        self, session_ref: str, req: S.SessionInputRequest
+    ) -> S.SessionInputResponse:
+        """向运行中的会话注入一条消息。
+
+        空白内容在这里就拒绝，不往下传：一条空消息到了 agent 那头可能被当成
+        一次「继续」，白烧一轮 token，而用户以为什么都没发。
+        """
+        text = req.text.strip()
+        if not text:
+            raise BadRequest("注入的内容不能为空。")
+        return S.SessionInputResponse(
+            **await self.engine.send_to_session(session_ref, text)
+        )
+
     # ---- 手动清理（RES-03） ----
 
     async def prune(self, req: S.PruneRequest) -> S.PruneResponse:

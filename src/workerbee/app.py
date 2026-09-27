@@ -356,6 +356,87 @@ class Engine:
             await asyncio.sleep(0.5)
         return False, f"会话 {session_ref} 在 dispose 之后仍然存活"
 
+    async def attach_session(self, session_ref: str) -> dict[str, Any]:
+        """接入一个正在运行的会话：取出可看的输出与可做的操作。
+
+        三个判据分开报，因为它们对应三种不同的处置：
+
+        - 会话不在运行 → 没有可接入的对象（已结束，或不是内核本地持有的会话）
+        - harness 不支持运行中注入 → **能看不能发**。这是正常状态，不是错误；
+          Kimi 的 ``-p`` 模式就是这种，输入在建会话时就给定，运行中无法再注入。
+        - 会话已失联 → 既不能看也不能发
+
+        把「完全不可用」和「只能看」混成同一个 false，界面就只能对用户说
+        「不支持」——而用户真正需要知道的是「能看，但发不进去」。
+        """
+        rt = self.scheduler.runtime_for_session(session_ref) if self.scheduler else None
+        if rt is None:
+            return {
+                "attachable": False,
+                "readable": False,
+                "writable": False,
+                "interruptible": False,
+                "reason": "这个会话不在运行中。已结束的尝试请到任务详情页看事件时间线与产物。",
+                "output": "",
+                "total_chars": 0,
+                "truncated": False,
+                "harness_id": "",
+            }
+
+        alive = False
+        with contextlib.suppress(Exception):
+            alive = bool(await self.harness.session_alive(session_ref))
+
+        caps: Any = None
+        with contextlib.suppress(Exception):
+            caps = await self.harness.capabilities(rt.harness_id)
+        # 能力取不到时按「不支持」处理：宁可少给一个按钮，也不能让用户输完才失败。
+        interact = bool(getattr(caps, "interact", False))
+        can_interrupt = bool(getattr(caps, "interrupt", False))
+
+        text, total, truncated = self.scheduler.session_output(session_ref)
+
+        reason: str | None = None
+        if not alive:
+            reason = "会话已失联，无法接入。"
+        elif not interact:
+            reason = (
+                f"{rt.harness_id} 不支持运行中交互，只能查看输出。"
+                "这类 harness 的输入在创建会话时已经给定。"
+            )
+
+        return {
+            "attachable": alive and interact,
+            "readable": alive,
+            "writable": alive and interact,
+            "interruptible": alive and can_interrupt,
+            "reason": reason,
+            "output": text,
+            "total_chars": total,
+            "truncated": truncated,
+            "harness_id": rt.harness_id,
+        }
+
+    async def send_to_session(self, session_ref: str, text: str) -> dict[str, Any]:
+        """向运行中的会话注入一条消息。
+
+        只投递**首轮之后**的消息。首轮输入若已在建会话时交付（``claude -p``
+        这类一次性形态），再投一遍会让同一条指令执行两次——对会改文件的 agent
+        那是数据损坏，不是小毛病。``accepted_initial_input`` 那条纪律管的就是
+        这件事，这里沿用它。
+        """
+        info = await self.attach_session(session_ref)
+        if not info["writable"]:
+            return {"delivered": False, "reason": info["reason"] or "这个会话不接受输入。"}
+        try:
+            ok = await self.harness.send_input(session_ref, text, kind="user")
+        except Exception as exc:  # noqa: BLE001 - 注入失败要变成可读结果
+            return {"delivered": False, "reason": f"{type(exc).__name__}: {exc}"}
+        return {
+            "delivered": bool(ok),
+            "reason": None if ok else "适配器拒绝了这条输入。",
+        }
+
     def _wire_security(self) -> None:
         """把脱敏器接进事件日志。凭据在任何情况下都不进历史（AUTH-02）。"""
         try:

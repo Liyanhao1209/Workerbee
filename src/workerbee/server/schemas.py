@@ -413,6 +413,43 @@ class SessionListResponse(ApiResponse):
     note: str | None = None
 
 
+class SessionAttachResponse(ApiResponse):
+    """接入一个正在运行的会话（HUM-01/02）。
+
+    ``readable`` 与 ``writable`` 分开报，因为它们对应不同的处置：有些 harness
+    的输入在创建会话时就已给定（``claude -p`` 一类），运行中无法再注入——那是
+    「能看不能发」，不是「不可用」。合成一个布尔值，界面就只能对用户说
+    「不支持」，而用户需要知道的是「能看，但发不进去」。
+
+    ``output`` 只包含**本次内核进程内**累积的输出。它随尝试结束而消失，这是
+    有意的：它是「看现在跑到哪了」的窗口，不是历史。回看已结束的尝试请看
+    事件时间线与产物。
+    """
+
+    attachable: bool = False
+    readable: bool = False
+    writable: bool = False
+    interruptible: bool = False
+    reason: str | None = None
+    """不可用的原因。可用时为 ``None``。"""
+    output: str = ""
+    total_chars: int = 0
+    truncated: bool = False
+    harness_id: str = ""
+
+
+class SessionInputRequest(ApiRequest):
+    """向运行中的会话注入一条消息（HUM-01）。"""
+
+    text: str
+    """要注入的内容。空字符串会被拒绝。"""
+
+
+class SessionInputResponse(ApiResponse):
+    delivered: bool = False
+    reason: str | None = None
+
+
 class PruneRequest(ApiRequest):
     """手动清理入口（RES-03）。**默认 dry_run**：先看清要删什么，再动手。"""
 

@@ -69,6 +69,38 @@ async def sessions(services: ServicesDep) -> S.SessionListResponse:
 
 
 @router.get(
+    "/api/sessions/{session_ref}/attach",
+    response_model=S.SessionAttachResponse,
+    summary="接入运行中的会话（HUM-02）",
+)
+async def session_attach(
+    session_ref: str, services: ServicesDep
+) -> S.SessionAttachResponse:
+    """取该会话已累积的输出，以及对它可做哪些操作。
+
+    只对**此刻在运行**的会话有效。已结束的尝试没有可接入的对象，返回的
+    ``reason`` 会说明这一点并指向任务详情页。
+    """
+    return await services.system.attach(session_ref)
+
+
+@router.post(
+    "/api/sessions/{session_ref}/input",
+    response_model=S.SessionInputResponse,
+    summary="向运行中的会话注入输入（HUM-01）",
+)
+async def session_input(
+    session_ref: str, req: S.SessionInputRequest, services: ServicesDep
+) -> S.SessionInputResponse:
+    """把一条消息投给正在跑的 agent。
+
+    只投**首轮之后**的消息。首轮输入若已在建会话时交付，重复投递会让同一条
+    指令执行两遍。
+    """
+    return await services.system.send_input(session_ref, req)
+
+
+@router.get(
     "/api/storage",
     response_model=S.StorageReportResponse,
     summary="存储占用（RES-03）",

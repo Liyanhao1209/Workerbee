@@ -85,6 +85,9 @@ class AttemptRuntime:
     task_id: str
     node_id: str
     session_ref: str | None = None
+    #: 承载这次尝试的 harness。attach 要据此查能力（能不能运行中注入输入），
+    #: 而能力是按 harness 声明的，按会话查不到。
+    harness_id: str = ""
     output: list[str] = field(default_factory=list)
     output_chars: int = 0
     truncated: bool = False
@@ -420,6 +423,7 @@ class Scheduler:
             node_id=fresh_stage.node_id,
             resume_from_checkpoint=fresh_stage.checkpoint_ref,
             dispatched_at=asyncio.get_running_loop().time(),
+            harness_id=profile.harness_ref,
         )
 
         try:
@@ -670,6 +674,18 @@ class Scheduler:
             if rt.session_ref == session_ref:
                 return rt
         return None
+
+    def session_output(self, session_ref: str) -> tuple[str, int, bool]:
+        """取某个在跑会话已累积的输出，返回 ``(文本, 总字符数, 是否被截断)``。
+
+        缓冲在内存里，随尝试结束（``_runtimes`` 弹出）一起消失。这是有意的：
+        它是「看现在跑到哪了」的窗口，不是历史。要回看已结束的尝试请看事件
+        时间线与产物——那两处才是持久化的。
+        """
+        rt = self.runtime_for_session(session_ref)
+        if rt is None:
+            return "", 0, False
+        return rt.text(self.config.default_max_output_chars), rt.output_chars, rt.truncated
 
     async def on_session_ended(
         self, *, session_ref: str, ok: bool, detail: str | None = None

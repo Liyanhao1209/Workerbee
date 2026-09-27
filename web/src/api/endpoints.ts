@@ -29,6 +29,8 @@ import type {
   RevisionSaveResult,
   RevisionSource,
   SessionRecord,
+  SessionAttach,
+  SessionInputResult,
   SkillDoc,
   SkillScope,
   StageResumeResponse,
@@ -214,6 +216,27 @@ export const sessions = {
    * 而「按任务看它的会话」是排障主路径，客户端筛选能保证切筛选不重新请求。
    */
   list: () => listRequest<SessionRecord>('/api/sessions', 'sessions'),
+
+  /**
+   * 接入一个正在运行的会话，取它的输出与可做的操作。
+   *
+   * 只对**此刻在运行**的会话有效。已结束的尝试会返回 `attachable: false` 与
+   * 一句说明，指向任务详情页——那里才是持久化的历史。
+   */
+  attach: (sessionRef: string) =>
+    request<SessionAttach>(`/api/sessions/${encodeURIComponent(sessionRef)}/attach`),
+
+  /**
+   * 向运行中的会话注入一条消息。
+   *
+   * 只投**首轮之后**的消息：首轮输入若已在建会话时交付，重复投递会让同一条
+   * 指令执行两遍，对会改文件的 agent 是数据损坏。
+   */
+  sendInput: (sessionRef: string, text: string) =>
+    request<SessionInputResult>(`/api/sessions/${encodeURIComponent(sessionRef)}/input`, {
+      method: 'POST',
+      body: { text },
+    }),
 };
 
 // ---------------------------------------------------------------------------

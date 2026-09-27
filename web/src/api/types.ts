@@ -812,6 +812,39 @@ export interface SessionRecord {
   last_heartbeat: string | null;
 }
 
+/**
+ * `GET /api/sessions/{ref}/attach`：接入一个正在运行的会话。
+ *
+ * `readable` 与 `writable` 分开，是因为它们对应不同的处置：有些 harness 的输入
+ * 在创建会话时就已给定，运行中无法再注入——那是「能看不能发」，不是「不可用」。
+ */
+export interface SessionAttach {
+  attachable: boolean;
+  /** 能看输出。 */
+  readable: boolean;
+  /** 能往里发消息。 */
+  writable: boolean;
+  /** 能打断当前这一轮。 */
+  interruptible: boolean;
+  /** 不可用的原因。可用时为 null。 */
+  reason: string | null;
+  /**
+   * 已累积的输出。**只包含本次内核进程内产出的部分**——它随尝试结束而消失。
+   * 它是「看现在跑到哪了」的窗口，不是历史。
+   */
+  output: string;
+  total_chars: number;
+  /** 输出超过缓冲上限，这里只给到了前面一段。 */
+  truncated: boolean;
+  harness_id: string;
+}
+
+/** `POST /api/sessions/{ref}/input`：向运行中的会话注入一条消息。 */
+export interface SessionInputResult {
+  delivered: boolean;
+  reason: string | null;
+}
+
 /** `GET /api/nodes/{node_id}/queue`（RUN-04）：只读投影，权威队列在任务／阶段表里。 */
 export interface NodeQueueResponse {
   node_id: string;

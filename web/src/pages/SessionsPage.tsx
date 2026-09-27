@@ -34,6 +34,7 @@ import {
   humanDuration,
 } from '../components/common';
 import { SESSION_STATE_LABELS } from '../labels';
+import { SessionConsole } from '../components/SessionConsole';
 
 /**
  * supervisor 的心跳循环每 5 秒刷一次台账（`supervisor/server.py` 的 `_heartbeat_loop`）。
@@ -123,6 +124,8 @@ export function SessionsPage(): JSX.Element {
   const [params, setParams] = useSearchParams();
   const taskFilter = params.get('task_id') ?? '';
   const [stateFilter, setStateFilter] = useState('');
+  /** 正在接入的会话。null 表示控制台没打开。 */
+  const [attaching, setAttaching] = useState<SessionRecord | null>(null);
   const systemStatus = useSystem((s) => s.status);
 
   const fetchSessions = useCallback((_signal: AbortSignal) => sessionApi.list(), []);
@@ -305,6 +308,7 @@ export function SessionsPage(): JSX.Element {
                   <th>状态</th>
                   <th>最近心跳</th>
                   <th>创建</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -347,6 +351,21 @@ export function SessionsPage(): JSX.Element {
                     <td className="text-xs">
                       <RelTime value={row.created_at} />
                     </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn btn--xs"
+                        disabled={row.state !== 'alive'}
+                        title={
+                          row.state === 'alive'
+                            ? '查看这个会话正在产出什么，并可向它发消息'
+                            : '只有还活着的会话可以接入'
+                        }
+                        onClick={() => setAttaching(row)}
+                      >
+                        接入
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -359,6 +378,10 @@ export function SessionsPage(): JSX.Element {
           心跳只说明进程还在，不说明任务在推进，进展请看执行图里的阶段状态与事件时间线。
         </div>
       </div>
+
+      {attaching ? (
+        <SessionConsole record={attaching} onClose={() => setAttaching(null)} />
+      ) : null}
     </div>
   );
 }
