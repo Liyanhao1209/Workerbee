@@ -2,7 +2,7 @@
  * 实际执行图（OBS-02）。运维时看的是这一张，不是编辑器那张。
  *
  * 硬要求：
- * - 图来自任务**发射时钉扎的快照**（`graph_snapshot`），不是当前流程定义；
+ * - 图来自任务**发射时 pinned 的快照**（`graph_snapshot`），不是当前流程定义；
  * - 节点状态用阶段的 `observed_state` 着色，**过渡态（分派中／暂停中／退避中／
  *   等待审批／核对中／状态不明）必须与稳定态一眼可分**（OBS-01）；
  * - 任务失败时，**失败原因与仍在运行的分支同时显示**（RUN-07）。
@@ -79,7 +79,7 @@ function TaskPicker(): JSX.Element {
         <div className="page-head__titles">
           <h1>实际执行图</h1>
           <div className="page-head__sub">
-            选一个任务看它<strong>钉扎</strong>的那张有效图与实时状态。这里画的是执行记录，不是可编辑的定义。
+            选一个任务看它<strong>pinned</strong>的那张有效图与实时状态。这里画的是执行记录，不是可编辑的定义。
           </div>
         </div>
         <div className="page-head__actions">
@@ -227,7 +227,7 @@ function ExecutionView({ taskId }: { taskId: string }): JSX.Element {
               </span>
             </h1>
             <div className="page-head__sub">
-              {task.workflow_name ?? <ShortId id={task.workflow_id} />} · 钉扎于修订 #{task.revision_seq} ·
+              {task.workflow_name ?? <ShortId id={task.workflow_id} />} · pinned 修订 #{task.revision_seq} ·
               有效图版本 {task.effective_graph_version} · 控制意图：{DESIRED_LABELS[task.desired_state]} ·
               控制纪元 {task.control_epoch}
             </div>
@@ -254,7 +254,7 @@ function ExecutionView({ taskId }: { taskId: string }): JSX.Element {
           </Banner>
         ) : null}
 
-        <Banner variant="info" title="这张图是钉扎快照" hint="之后对流程定义的修改不会改变它——依赖推进以发射时的有效边集为准（WF-06、REC-03）。">
+        <Banner variant="info" title="这张图是 pinned 快照" hint="之后对流程定义的修改不会改变它。">
           虚线节点 = 过渡态（正在收敛，尚未停住） · 绿色描边 = 仍在运行的分支 · 虚线边 = 内核派生的绕过边。
         </Banner>
 
@@ -293,7 +293,7 @@ function ExecutionView({ taskId }: { taskId: string }): JSX.Element {
           }}
         >
           {snapshot.graph.nodes.length === 0 ? (
-            <Empty title="钉扎快照里没有节点" hint="这次任务发射时的有效图为空。这通常说明发射校验应该先拦下它。" />
+            <Empty title="pinned 快照里没有节点" hint="这次任务发射时的有效图为空。这通常说明发射校验应该先拦下它。" />
           ) : (
             <ExecutionCanvas
               pinnedGraph={snapshot.graph}
@@ -590,10 +590,10 @@ function StagePanel({
           },
           {
             k: '需要核对',
-            v: stage.requires_reconcile ? <span className="text-warn">是——系统无法确认真实状态，不得盲目重放</span> : '否',
+            v: stage.requires_reconcile ? <span className="text-warn">是。系统无法确认是否还在运行，需要人工核对</span> : '否',
           },
           {
-            k: '上游钉扎',
+            k: '上游 pinned',
             v:
               Object.keys(stage.upstream_pins).length === 0 ? (
                 <span className="dim">无上游</span>
@@ -630,7 +630,7 @@ function StagePanel({
           <button type="button" className="btn btn--sm btn--primary" disabled={busy} onClick={() => void doResumeStage()}>
             断点续跑该阶段
           </button>
-          <span className="text-xs dim">只重跑这一个阶段；没有断点时从头重跑，会如实告知。</span>
+          <span className="text-xs dim">只重跑这一个阶段。没有断点时会从头重跑。</span>
         </div>
       ) : null}
       {resumeNote ? <Banner variant="ok">{resumeNote}</Banner> : null}

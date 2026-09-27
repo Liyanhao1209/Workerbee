@@ -121,7 +121,7 @@ export function TaskDetailPage(): JSX.Element {
             </span>
           </h1>
           <div className="page-head__sub">
-            {task.workflow_name ?? <ShortId id={task.workflow_id} />} · 钉扎修订 #{task.revision_seq} · 有效图版本{' '}
+            {task.workflow_name ?? <ShortId id={task.workflow_id} />} · pinned 修订 #{task.revision_seq} · 有效图版本{' '}
             {task.effective_graph_version} · 优先级 {task.priority} · 提交者 {task.submitted_by} ·{' '}
             <TimeText value={task.created_at ?? null} />
           </div>
@@ -140,7 +140,7 @@ export function TaskDetailPage(): JSX.Element {
       <div className="row row--tight" style={{ marginBottom: 'var(--sp-3)' }}>
         <TaskControls task={task} onChanged={reload} />
         <span className="text-xs dim">
-          控制范围是<strong>整次任务</strong>；暂停/删除不会改写已完成阶段的真实结果。
+          控制范围是<strong>整次任务</strong>。暂停或删除不会改变已完成阶段的结果。
         </span>
       </div>
 
@@ -164,7 +164,7 @@ export function TaskDetailPage(): JSX.Element {
         <Banner
           variant="danger"
           title={`${brokenArtifacts.length} 项产物的摘要不合格（交接失败）`}
-          hint="摘要没有覆盖边输出契约的必填要点时，下游必须被显式受阻——这不等于「任务失败」，但等于「材料不可用」。"
+          hint="摘要没有覆盖下游需要的要点时，下游会被挡住，直到材料补齐。这不代表任务本身失败。"
         >
           涉及产物：
           {brokenArtifacts.map((a) => (
@@ -183,7 +183,7 @@ export function TaskDetailPage(): JSX.Element {
         </div>
         <div className="panel__body">
           {artifacts.length === 0 ? (
-            <Empty title="还没有产物" hint="阶段完成后才产生产物；摘要与指针会随产物一起记录。" />
+            <Empty title="还没有产物" hint="阶段完成后才产生产物。" />
           ) : (
             <div className="col" style={{ gap: 6 }}>
               {artifacts.map((artifact) => (
@@ -254,7 +254,7 @@ export function TaskDetailPage(): JSX.Element {
           {approvals.length === 0 ? (
             <Empty
               title="没有审批请求"
-              hint="工具调用命中审批策略时才会产生；超时策略默认「拒绝并暂停」。"
+              hint="只在节点配置了需要审批的操作时产生。超时后按拒绝处理，任务暂停。"
             />
           ) : (
             <div className="col" style={{ gap: 'var(--sp-3)' }}>
@@ -269,7 +269,7 @@ export function TaskDetailPage(): JSX.Element {
       {/* ------------------------------ 节点队列 ------------------------------ */}
       <div className="panel">
         <div className="panel__head">
-          节点队列（RUN-04）
+          节点队列
           <div className="panel__head-actions">
             <select
               className="select select--sm"
@@ -289,7 +289,7 @@ export function TaskDetailPage(): JSX.Element {
           {queueNode ? (
             <NodeQueue nodeId={queueNode.node_id} nodeName={queueNode.name} />
           ) : (
-            <Empty title="钉扎快照里没有节点" />
+            <Empty title="pinned 快照里没有节点" />
           )}
         </div>
       </div>
@@ -300,18 +300,18 @@ export function TaskDetailPage(): JSX.Element {
       {/* ------------------------------ 事件时间线 ------------------------------ */}
       <EventTimeline taskId={task.task_id} onRefreshRequested={reload} />
 
-      {/* ------------------------------ 输入与钉扎快照 ------------------------------ */}
+      {/* ------------------------------ 输入与 pinned 快照 ------------------------------ */}
       <div className="panel">
-        <div className="panel__head">输入与钉扎快照</div>
+        <div className="panel__head">输入与 pinned 快照</div>
         <div className="panel__body">
           <KV
             items={[
-              { k: '幂等键', v: task.idempotency_key ? <span className="mono">{task.idempotency_key}</span> : <span className="dim">未提供</span> },
+              { k: '去重标识', v: task.idempotency_key ? <span className="mono">{task.idempotency_key}</span> : <span className="dim">未提供</span> },
               { k: '控制意图', v: DESIRED_LABELS[task.desired_state] },
               { k: '控制纪元', v: <span className="mono">{task.control_epoch}</span> },
               { k: '最后更新', v: <TimeText value={task.updated_at ?? null} /> },
               {
-                k: '钉扎的有效边',
+                k: 'pinned 的有效边',
                 v: (
                   <span className="mono">
                     {snapshot.effective_edges.length} 条（有效图版本 {snapshot.effective_graph_version}）
@@ -319,7 +319,7 @@ export function TaskDetailPage(): JSX.Element {
                 ),
               },
               {
-                k: '钉扎的节点',
+                k: 'pinned 的节点',
                 v: (
                   <span className="mono">
                     {snapshot.graph.nodes.length} 个（其中停用{' '}
@@ -337,7 +337,7 @@ export function TaskDetailPage(): JSX.Element {
             {JSON.stringify(task.input_payload, null, 2)}
           </pre>
           <div className="text-xs dim" style={{ marginTop: 4 }}>
-            这张图与这些边是发射时钉扎的：之后对流程定义的修改不会改变本次执行的依赖关系。
+            这张图与这些边是发射时 pinned 的：之后对流程定义的修改不会改变本次执行的依赖关系。
           </div>
         </div>
       </div>
@@ -378,7 +378,7 @@ function RunOverview({
   return (
     <div className="panel">
       <div className="panel__head">
-        运行总览（RUN-07）
+        运行总览
         <div className="panel__head-actions">
           <span className="chip">{stages.length} 个阶段</span>
           {failedStages.length > 0 ? <span className="chip chip--danger">失败/受阻 {failedStages.length}</span> : null}
@@ -419,7 +419,7 @@ function RunOverview({
               <div className="text-sm dim">
                 {task.observed_state === 'succeeded'
                   ? '任务已成功结束，没有失败记录。'
-                  : '内核未提供失败摘要——这不代表没有失败，请以下方的阶段明细为准。'}
+                  : '内核没有提供失败摘要，请看下方的阶段明细。'}
               </div>
             )}
             {failedStages.length > 0 ? (
@@ -441,7 +441,7 @@ function RunOverview({
           <div>
             <div className="section-title">③ 仍在运行的分支</div>
             {runningBranches.length === 0 ? (
-              <div className="text-sm dim">没有在运行的阶段（这里的「没有」是内核事实，不是加载中）。</div>
+              <div className="text-sm dim">当前没有阶段在运行。</div>
             ) : (
               <>
                 <div className="chips">
@@ -798,21 +798,19 @@ function ContextPackagePanel({ taskId }: { taskId: string }): JSX.Element {
         </div>
       </div>
       <div className="panel__hint">
-        分区语义固定（§7.3）：P1 角色与任务 5% · P2 输入与上游材料 25% · P3 输出要求 10% · P4 工具与权限 10% ·
-        P5 运行保留 50%（吃剩余）。P2 超支按「全文 → 短摘要 → 纯指针」降级，每降一级都留痕——
-        下面「降级」一栏非空就说明这次注入的材料被削弱了。
+        每次派发阶段时写给模型的上下文。「降级」一栏不为空，说明这次材料被压缩过。
       </div>
       <div className="panel__body">
         {loading ? (
           <Loading label="加载组装记录" />
         ) : error ? (
           <Banner variant="danger" title="无法读取事件日志">
-            组装记录来自事件日志（`context.assembled`）。读不到时不显示任何推测内容。
+            组装记录来自事件日志。读不到时不显示推测内容。
           </Banner>
         ) : records.length === 0 ? (
           <Empty
             title="没有组装记录"
-            hint="内核只在阶段派发时写 context.assembled 事件。任务还没派发过阶段，或事件已被清理时会是空的。"
+            hint="任务还没有派发过阶段，或历史记录已被清理。"
           />
         ) : (
           <div className="col" style={{ gap: 'var(--sp-3)' }}>
@@ -850,7 +848,7 @@ function ContextPackagePanel({ taskId }: { taskId: string }): JSX.Element {
                   </div>
 
                   {record.handoffFailures.length > 0 ? (
-                    <Banner variant="danger" title="交接失败（该次组装曾把阶段置为受阻）">
+                    <Banner variant="danger" title="交接失败，这个阶段因此受阻">
                       <ul className="list-reset text-xs">
                         {record.handoffFailures.map((f, i) => (
                           <li key={i}>· {f}</li>
@@ -864,7 +862,7 @@ function ContextPackagePanel({ taskId }: { taskId: string }): JSX.Element {
                       <thead>
                         <tr>
                           <th style={{ width: 44 }}>分区</th>
-                          <th>含义</th>
+                          <th>名称</th>
                           <th className="table__num">占比</th>
                           <th className="table__num">预算 token</th>
                           <th className="table__num">实际 token</th>
@@ -921,7 +919,7 @@ function ContextPackagePanel({ taskId }: { taskId: string }): JSX.Element {
                   ) : null}
                   {record.excluded.length > 0 ? (
                     <div className="text-xs muted" style={{ marginTop: 2 }}>
-                      被排除的来源（排除必须留痕）：{record.excluded.join('；')}
+                      被排除的来源：{record.excluded.join('；')}
                     </div>
                   ) : null}
 
@@ -1030,10 +1028,7 @@ function EventTimeline({
           {page?.has_more ? <span className="chip">内核还有更早的记录未读取</span> : null}
         </div>
       </div>
-      <div className="panel__hint">
-        事件日志是 append-only 的：这里显示的是**已写入的事实**，不包含任何推测。时间线按写入顺序分页拉取，
-        每页 {200} 条。
-      </div>
+      <div className="panel__hint">按写入顺序分页拉取，每页 200 条。</div>
       <div className="panel__body">
         <div className="row row--tight" style={{ marginBottom: 'var(--sp-2)' }}>
           <input

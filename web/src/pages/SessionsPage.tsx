@@ -212,8 +212,7 @@ export function SessionsPage(): JSX.Element {
           {error.detail}
           {error.kind === 'not_found' ? (
             <div className="text-xs" style={{ marginTop: 4 }}>
-              内核还没有这个端点（<span className="mono">GET /api/sessions</span>
-              ）。这里如实报「读不到」，不会显示成「没有会话」。
+              内核没有返回会话列表。这里报「读不到」，不显示成「没有会话」。
             </div>
           ) : null}
         </Banner>
@@ -221,8 +220,8 @@ export function SessionsPage(): JSX.Element {
 
       {systemStatus && systemStatus.session_hosting === 'in_process' ? (
         <Banner variant="warn" title="会话托管：内核内进程（in_process）">
-          harness 会话由内核自己持有——内核重启会打断在途会话，台账里标着「存活」的记录届时会变成失联。
-          需要跨重启保活，请改用独立的 supervisor 进程重启内核。
+          harness 会话由内核自己持有，内核重启会打断在途会话，台账里标着「存活」的记录届时会变成失联。
+          需要跨重启保活，请改用独立的 supervisor 进程。
         </Banner>
       ) : null}
 
@@ -291,7 +290,7 @@ export function SessionsPage(): JSX.Element {
             title={rows.length === 0 ? '台账里还没有会话记录' : '当前筛选下没有匹配的会话'}
             hint={
               rows.length === 0
-                ? '任务开始执行、harness 创建会话之后，这里会出现记录。空台账不等于「没有任务在跑」——任务可能还在排队，或还没进入派发。'
+                ? '任务开始执行、harness 创建会话之后，这里会出现记录。台账为空也可能是任务还在排队。'
                 : '换个状态或归属再试。'
             }
           />
@@ -356,9 +355,8 @@ export function SessionsPage(): JSX.Element {
         )}
 
         <div className="panel__hint">
-          「已失联」是监督进程实测 <span className="mono">session_alive</span> 为假后写入的结论——
-          它意味着该会话不能再复用；对应阶段会走重试或对账，不会假装还连着。
-          心跳只说明「进程还在」，不说明「任务在推进」：进展请看执行图里的阶段状态与事件时间线。
+          「已失联」表示监督进程确认该会话已经不在，不能再复用；对应阶段会走重试或对账。
+          心跳只说明进程还在，不说明任务在推进，进展请看执行图里的阶段状态与事件时间线。
         </div>
       </div>
     </div>

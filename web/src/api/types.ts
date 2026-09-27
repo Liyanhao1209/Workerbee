@@ -330,7 +330,7 @@ export interface TaskStage {
   /** 面向用户的状态说明，例如「等待审批中，不占用执行槽」。 */
   status_reason: string | null;
   origin_of_control: OriginOfControl | null;
-  /** 上游 node_id → 该上游本次成功尝试产出的 artifact_id 列表（D-06 版本钉扎）。 */
+  /** 上游 node_id → 该上游本次成功尝试产出的 artifact_id 列表（D-06 版本 pinned ）。 */
   upstream_pins: Record<string, string[]>;
   checkpoint_ref: string | null;
   requires_reconcile: boolean;

@@ -235,7 +235,7 @@ export function TaskControls({
             迟到的输出不会推进它。再次提交相同输入是<strong>新任务</strong>，不是恢复。
           </Banner>
           <ul className="list-reset text-sm">
-            <li>· 已完成的阶段以其<strong>真实结果</strong>留在历史中，不改写为失败。</li>
+            <li>· 已完成的阶段保留原有结果，不会被改写成失败。</li>
             <li>· 删除只终止后续执行，<strong>不承诺撤销</strong>已经写入的项目文件或已发生的外部副作用。</li>
             <li>· 完成判据分三件事：已接受删除 / 执行已停止 / 资源清理完成——清理失败会保持可见。</li>
           </ul>
@@ -260,7 +260,7 @@ export function TaskControls({
               tone="warn"
             />
             <DetailList
-              title="harness 不支持暂停（已如实拒绝，未显示为已暂停）"
+              title="harness 不支持暂停，命令已被拒绝"
               ids={pauseResult.unsupported}
               tone="danger"
             />

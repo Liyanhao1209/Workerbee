@@ -201,9 +201,9 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
         </div>
       )}
 
-      {/* 降级声明：如实呈现，不折叠、不截断、不塞进 tooltip。 */}
+      {/* 运行提示：不折叠、不截断、不塞进 tooltip。 */}
       {notes.length > 0 ? (
-        <Banner variant="warn" title={`内核降级声明 · ${notes.length} 项`}>
+        <Banner variant="warn" title={`运行提示 · ${notes.length} 项`}>
           <ul className="list-reset text-sm">
             {notes.map((note, index) => (
               <li key={index}>
@@ -211,9 +211,6 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
               </li>
             ))}
           </ul>
-          <div className="text-sm" style={{ marginTop: 'var(--sp-2)' }}>
-            这些是内核如实上报的降级事实，不是可以被忽略的提示。
-          </div>
         </Banner>
       ) : null}
 
@@ -243,7 +240,7 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
             ) : (
               <span>
                 <span className="text-warn">未解锁</span>
-                <span className="text-xs muted"> —— 引用凭据的节点会明确报错，而不是匿名运行。</span>
+                <span className="text-xs muted">。引用凭据的节点会明确报错，不会匿名运行。</span>
               </span>
             ),
           },
@@ -272,8 +269,8 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
               ),
           },
           { k: '产物回收', v: artifactGc === null ? '未知' : artifactGc ? '已启用' : '未启用' },
-          { k: '推送订阅者', v: <CountOrUnknown value={notifierSubscribers} /> },
-          { k: '推送丢弃', v: <CountOrUnknown value={notifierDropped} /> },
+          { k: '已连接的页面数', v: <CountOrUnknown value={notifierSubscribers} /> },
+          { k: '丢弃的推送数', v: <CountOrUnknown value={notifierDropped} /> },
         ]}
       />
 
@@ -313,7 +310,7 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
       </div>
 
       <div>
-        <div className="section-title">清理器 · 上次运行（reaper.last_run）</div>
+        <div className="section-title">清理器上次运行</div>
         {lastRun === null ? (
           <div className="text-sm dim">尚未运行</div>
         ) : (
@@ -448,7 +445,7 @@ export function StoragePage(): JSX.Element {
         <div className="page-head__titles">
           <h1>存储与清理</h1>
           <div className="page-head__sub">
-            内核的部署形态、降级声明与数据占用。手动清理只能从这一页发起，且默认只做预览。
+            部署形态、运行提示与数据占用。手动清理只能从这一页发起，默认只做预览。
           </div>
         </div>
         <div className="page-head__actions">
@@ -586,7 +583,7 @@ export function StoragePage(): JSX.Element {
       <div className="panel">
         <div className="panel__head">手动清理</div>
         <div className="panel__hint panel__hint--warn">
-          清理是不可撤销的删除。默认勾选「仅预览」，先看清将要执行的动作，再决定是否真删。
+          清理是永久删除，不能撤销。默认只预览，不实际删除。
         </div>
         <div className="panel__body">
           <div className="col" style={{ gap: 'var(--sp-3)' }}>
@@ -806,8 +803,8 @@ export function StoragePage(): JSX.Element {
           </div>
           {includeUnreferenced ? (
             <div style={{ marginTop: 'var(--sp-3)' }}>
-              <Banner variant="warn" title="已启用最激进的产物回收">
-                连未标记删除的零引用产物也会被回收；被活跃任务引用的数据仍会被拒绝清理。
+              <Banner variant="warn" title="已启用最彻底的产物回收">
+                连没有被标记删除的零引用产物也会被回收。仍被活跃任务引用的数据不会被清理。
               </Banner>
             </div>
           ) : null}

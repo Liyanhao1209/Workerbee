@@ -102,7 +102,7 @@ type CapabilityCell =
   | { kind: 'undeclared' }
   | { kind: 'limited'; detail: string };
 
-const UNPROBED_NOTE = '尚未探测，能力未知；请先运行探测。';
+const UNPROBED_NOTE = '尚未探测，先运行一次探测。';
 
 function stringifyValue(value: unknown): string {
   if (typeof value === 'string') return value;
@@ -134,11 +134,11 @@ function CapabilityCellView({ cell }: { cell: CapabilityCell }): JSX.Element {
     case 'unprobed':
       return <Pill tone="idle" title={UNPROBED_NOTE}>未探测</Pill>;
     case 'supported':
-      return <Pill tone="success" title="capabilities_snapshot 中该项为 true。">支持</Pill>;
+      return <Pill tone="success" title="适配器声明支持这项功能。">支持</Pill>;
     case 'unsupported':
-      return <Pill tone="danger" title="capabilities_snapshot 中该项显式为 false——是「不支持」，不是「没声明」。">不支持</Pill>;
+      return <Pill tone="danger" title="适配器明确声明不支持，而不是没有声明。">不支持</Pill>;
     case 'undeclared':
-      return <Pill tone="idle" title="适配器未在 manifest 中声明该项。">未声明</Pill>;
+      return <Pill tone="idle" title="适配器没有声明这一项。">未声明</Pill>;
     case 'limited':
       return <Pill tone="warn" title={`适配器返回了非布尔取值：${cell.detail}`}>受限</Pill>;
   }
@@ -187,19 +187,19 @@ function CapabilityLegend(): JSX.Element {
   return (
     <div className="row row--tight text-xs muted">
       <span className="row row--tight">
-        <Pill tone="success">支持</Pill> 接口声明为 true
+        <Pill tone="success">支持</Pill> 适配器声明支持
       </span>
       <span className="row row--tight">
-        <Pill tone="danger">不支持</Pill> 显式声明为 false，而不是「没声明」
+        <Pill tone="danger">不支持</Pill> 适配器明确声明不支持
       </span>
       <span className="row row--tight">
-        <Pill tone="idle">未声明</Pill> 适配器未在 manifest 中声明该项
+        <Pill tone="idle">未声明</Pill> 适配器没有声明这一项
       </span>
       <span className="row row--tight">
         <Pill tone="warn">受限</Pill> 返回非布尔取值，原文见悬停提示
       </span>
       <span className="row row--tight">
-        <Pill tone="idle">未探测</Pill> 尚无 capabilities_snapshot
+        <Pill tone="idle">未探测</Pill> 还没有探测结果
       </span>
     </div>
   );
@@ -289,8 +289,7 @@ export function RegistryPage(): JSX.Element {
         <div className="page-head__titles">
           <h1>注册表</h1>
           <div className="page-head__sub">
-            Harness、凭据、Skill、MCP 工具的共享配置。这里登记的都是**引用**：密钥本体只在
-            Secret Store，能力结论只在探测之后。
+            Harness、凭据、Skill、MCP 工具的共享配置。凭据只登记引用，密钥本体存放在 Secret Store；功能支持情况以探测结果为准。
           </div>
         </div>
       </div>
@@ -383,7 +382,7 @@ function HarnessTab({ enabled }: { enabled: boolean }): JSX.Element {
           </div>
         </div>
         <div className="panel__hint">
-          env_template 只放非凭据类环境变量；需要认证请用 auth_binding 引用凭据，不要把密钥写进环境变量。
+          只放非凭据类环境变量。需要认证请在 auth_binding 里引用凭据。
         </div>
 
         {submit.error ? (
@@ -401,7 +400,7 @@ function HarnessTab({ enabled }: { enabled: boolean }): JSX.Element {
         ) : rows.length === 0 ? (
           <Empty
             title="尚未登记任何 harness"
-            hint="登记后需要运行一次探测，能力矩阵才有依据——在此之前所有能力都显示「未探测」。"
+            hint="登记后需要运行一次探测，在此之前所有功能都显示「未探测」。"
             action={
               <button type="button" className="btn btn--sm btn--primary" onClick={() => setFormOpen(true)}>
                 登记 harness
@@ -515,9 +514,9 @@ function HarnessTab({ enabled }: { enabled: boolean }): JSX.Element {
 
       {rows.length > 0 ? (
         <div className="panel">
-          <div className="panel__head">能力矩阵（HAR-02）</div>
+          <div className="panel__head">支持的功能</div>
           <div className="panel__hint">
-            <div className="text-xs">能力声明是接口支持情况，不是模型能力评级。</div>
+            <div className="text-xs">由适配器声明，表示接口支持哪些操作，不是对模型强弱的评价。</div>
             <div style={{ marginTop: 4 }}>
               <CapabilityLegend />
             </div>
@@ -590,7 +589,7 @@ function HarnessFormModal({
       return;
     }
     if (!adapterId.trim()) {
-      setFormError('adapter_id 必填——能力矩阵按适配器声明渲染。');
+      setFormError('adapter_id 必填。');
       return;
     }
     const parsed = parseEnvTemplate(envText);
@@ -723,9 +722,9 @@ function HarnessFormModal({
 }
 
 function sourceNote(source: string): string {
-  if (source === 'probe') return 'probe = 适配器实测：内核真的调用过适配器，结论来自这次调用。';
-  if (source === 'capabilities') return 'capabilities = 接口声明：来自适配器 manifest 的声明，未经实测。';
-  return `未知来源「${source}」：内核返回了未识别的来源标识，这里如实显示原值。`;
+  if (source === 'probe') return 'probe：内核实际调用过适配器，结论来自这次调用。';
+  if (source === 'capabilities') return 'capabilities：来自适配器声明，未经实测。';
+  return `未知来源 ${source}：内核返回了无法识别的值，按原文显示。`;
 }
 
 function ProbeResultModal({
@@ -783,7 +782,7 @@ function ProbeResultModal({
       </div>
       {capabilities === null ? (
         <div className="text-sm dim">
-          内核没有返回能力声明。界面不会替它补默认值——未知就是未知，能力矩阵里会保持「未探测」。
+          内核没有返回能力声明。界面不补默认值，各项功能保持「未探测」。
         </div>
       ) : entries.length === 0 ? (
         <div className="text-sm dim">内核返回了空的能力声明（没有任何键）。</div>
@@ -855,7 +854,7 @@ function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
           </div>
         </div>
         <div className="panel__hint">
-          本接口只登记<span className="text-warn">引用</span>；密钥本体只进 Secret Store，前端不收、不显示、不回显。
+          这里只登记引用。密钥本体存放在 Secret Store，界面不读取也不显示。
         </div>
 
         {submit.error && !revoking ? (
@@ -986,7 +985,7 @@ function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
           }
         >
           <Banner variant="warn" title="撤销的影响面">
-            撤销后，引用该凭据的节点在<strong>新的</strong>执行尝试中必须重新绑定有效凭据，不得以钉扎快照绕过；在途尝试允许完成当前请求；历史记录不被改写。
+            撤销后，引用该凭据的节点在下一次执行前需要重新绑定。正在进行的尝试会走完当前请求，历史记录不变。
           </Banner>
 
           {submit.error ? <SubmitError error={submit.error} what="撤销失败" /> : null}
@@ -1211,7 +1210,7 @@ function ImpactScan({ credentialId }: { credentialId: string }): JSX.Element {
       <Banner
         variant="danger"
         title="影响面无法计算"
-        hint="流程列表读不到，就无法判断还有谁在引用它。撤销前请先确认。"
+        hint="读不到流程列表，就无法判断还有谁在引用它。"
         actions={
           <button type="button" className="btn btn--sm" onClick={() => setNonce((n) => n + 1)}>
             重试
@@ -1229,7 +1228,7 @@ function ImpactScan({ credentialId }: { credentialId: string }): JSX.Element {
         <Banner
           variant="warn"
           title="部分流程未能读取，影响面可能不完整"
-          hint="下列流程的最新修订没有读到，它们是否引用该凭据未知——不要在未确认的情况下当成「没有引用」。"
+          hint="下列流程没有读到，无法确定它们是否引用该凭据。"
         >
           <span className="mono text-xs">{scan.failed.join('、')}</span>
         </Banner>
@@ -1238,7 +1237,7 @@ function ImpactScan({ credentialId }: { credentialId: string }): JSX.Element {
       {scan.entries.length === 0 ? (
         <Empty
           title="已读取的流程里没有节点引用该凭据"
-          hint={`已扫描 ${scan.total} 个流程的最新修订。这不代表运行中的会话没用到它——历史尝试的钉扎快照不在此列。`}
+          hint={`已扫描 ${scan.total} 个流程的最新修订。历史尝试里 pinned 的快照不在扫描范围内。`}
         />
       ) : (
         <div>
@@ -1260,8 +1259,7 @@ function ImpactScan({ credentialId }: { credentialId: string }): JSX.Element {
       )}
 
       <div className="text-xs dim" style={{ marginTop: 6 }}>
-        扫描范围：{scan.total} 个流程的最新修订（graph.nodes[].profiles[].credential_ref）。
-        在途任务的钉扎快照不在其中，撤销不会改写它们。
+        扫描范围：{scan.total} 个流程的最新修订。历史尝试里 pinned 的快照不在其中，撤销不会改写它们。
       </div>
     </div>
   );

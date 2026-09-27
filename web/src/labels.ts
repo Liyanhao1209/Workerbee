@@ -51,14 +51,14 @@ export interface StateLabel {
 }
 
 const TASK_LABELS: Record<TaskState, StateLabel> = {
-  queued: { text: '排队中', tone: 'pending', transitioning: false, terminal: false, hint: '已接受提交，等待调度领取' },
+  queued: { text: '排队中', tone: 'pending', transitioning: false, terminal: false, hint: '已提交，等待调度' },
   running: { text: '运行中', tone: 'running', transitioning: false, terminal: false },
   pausing: {
     text: '暂停中',
     tone: 'transition',
     transitioning: true,
     terminal: false,
-    hint: '已接受暂停意图，正在收敛在途执行',
+    hint: '正在停止进行中的阶段',
   },
   paused: { text: '已暂停', tone: 'idle', transitioning: false, terminal: false, hint: '不再派发新阶段，可恢复' },
   cancelling: {
@@ -66,9 +66,9 @@ const TASK_LABELS: Record<TaskState, StateLabel> = {
     tone: 'transition',
     transitioning: true,
     terminal: false,
-    hint: '已接受删除意图，正在停止并清理',
+    hint: '正在停止并清理',
   },
-  cancelled: { text: '已删除', tone: 'skipped', transitioning: false, terminal: true, hint: '已终止且无续跑入口' },
+  cancelled: { text: '已删除', tone: 'skipped', transitioning: false, terminal: true, hint: '已删除，无法恢复' },
   succeeded: { text: '已成功', tone: 'success', transitioning: false, terminal: true },
   failed: { text: '已失败', tone: 'danger', transitioning: false, terminal: true },
   blocked: { text: '受阻', tone: 'blocked', transitioning: false, terminal: false, hint: '依赖未满足或输入不足' },
@@ -77,36 +77,36 @@ const TASK_LABELS: Record<TaskState, StateLabel> = {
     tone: 'transition',
     transitioning: true,
     terminal: false,
-    hint: '系统无法确认真实状态，正在对账（不是运行中）',
+    hint: '正在核对实际状态，此时不能确定任务是否还在跑',
   },
 };
 
 const STAGE_LABELS: Record<StageState, StateLabel> = {
   waiting_deps: { text: '等待依赖', tone: 'idle', transitioning: false, terminal: false },
-  ready: { text: '就绪排队', tone: 'ready', transitioning: false, terminal: false, hint: '依赖已满足，等待节点槽位' },
-  dispatching: { text: '分派中', tone: 'transition', transitioning: true, terminal: false, hint: '已占执行槽，正在创建会话' },
+  ready: { text: '就绪排队', tone: 'ready', transitioning: false, terminal: false, hint: '依赖已满足，等待空出的执行位' },
+  dispatching: { text: '分派中', tone: 'transition', transitioning: true, terminal: false, hint: '正在创建会话' },
   running: { text: '运行中', tone: 'running', transitioning: false, terminal: false },
   awaiting_approval: {
     text: '等待审批',
     tone: 'approval',
     transitioning: true,
     terminal: false,
-    hint: '不占用执行槽，同节点后续任务可继续',
+    hint: '不占用执行位，同节点的后续任务可以继续',
   },
   pausing: { text: '暂停中', tone: 'transition', transitioning: true, terminal: false },
   paused: { text: '已暂停', tone: 'idle', transitioning: false, terminal: false },
-  retrying: { text: '退避重试中', tone: 'transition', transitioning: true, terminal: false, hint: '不占用执行槽' },
+  retrying: { text: '退避重试中', tone: 'transition', transitioning: true, terminal: false, hint: '等待重试，不占用执行位' },
   succeeded: { text: '已成功', tone: 'success', transitioning: false, terminal: true },
-  failed: { text: '已失败', tone: 'danger', transitioning: false, terminal: true, hint: '可显式恢复或重新启用' },
-  skipped: { text: '已跳过', tone: 'skipped', transitioning: false, terminal: true, hint: '节点停用撤回或显式跳过' },
+  failed: { text: '已失败', tone: 'danger', transitioning: false, terminal: true, hint: '可手动恢复或重新启用' },
+  skipped: { text: '已跳过', tone: 'skipped', transitioning: false, terminal: true, hint: '节点被停用或本次被跳过' },
   cancelled: { text: '已取消', tone: 'skipped', transitioning: false, terminal: true },
-  blocked: { text: '受阻', tone: 'blocked', transitioning: false, terminal: false, hint: '上游失败／被删除／输入不足' },
+  blocked: { text: '受阻', tone: 'blocked', transitioning: false, terminal: false, hint: '上游失败、被删除或输入不足' },
   lost: {
     text: '状态不明',
     tone: 'lost',
     transitioning: true,
     terminal: false,
-    hint: '无法确认真实状态，需人工核对，不得盲目重放',
+    hint: '无法确认是否还在运行，需要人工核对后再决定怎么办',
   },
   reconciling: { text: '核对中', tone: 'transition', transitioning: true, terminal: false },
 };
@@ -125,7 +125,7 @@ function unknownStateLabel(value: string): StateLabel {
     tone: 'idle',
     transitioning: false,
     terminal: false,
-    hint: '内核上报了本界面尚未认识的状态，已原样显示',
+    hint: '这个状态本界面还不认识，按原文显示',
   };
 }
 
@@ -170,8 +170,8 @@ export const STAGE_TONE_VAR: Record<StageState, string> = {
 
 export const DESIRED_LABELS: Record<DesiredState, string> = {
   active: '运行或继续运行',
-  paused: '用户已暂停',
-  cancelled: '用户已删除（不复活）',
+  paused: '已暂停',
+  cancelled: '已删除，不再运行',
 };
 
 export const APPROVAL_LABELS: Record<ApprovalStatus, { text: string; tone: Tone; action: boolean }> = {
@@ -268,7 +268,7 @@ export const CONTRACT_FORMAT_LABELS: Record<ContractFormat, string> = {
   any: '未指定',
 };
 
-/** 适配器能力的中文名（HAR-02 能力矩阵表头）。 */
+/** 适配器能力的中文名（「支持的功能」表头）。 */
 export const CAPABILITY_LABELS: Record<string, string> = {
   create_session: '创建会话',
   resume_session: '恢复会话',
@@ -381,13 +381,13 @@ export const SESSION_STATE_LABELS: Record<string, { text: string; tone: Tone }> 
   ended: { text: '已结束', tone: 'idle' },
 };
 
-/** ContextPackage 五个固定分区（§7.3）。顺序与组装器一致。 */
+/** 上下文包的五个分区。顺序与组装器一致。 */
 export const PARTITION_LABELS: Record<string, string> = {
   P1: '角色与任务',
   P2: '输入与上游材料',
   P3: '输出要求',
   P4: '工具与权限',
-  P5: '运行保留',
+  P5: '运行预留',
 };
 
 /** 生命周期操作来源的中文名。 */

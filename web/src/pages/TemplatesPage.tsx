@@ -35,7 +35,7 @@ function ReadError({ error, what, onRetry }: { error: ApiError; what: string; on
       title={error.unreachable ? '无法连接内核' : `无法读取${what}`}
       hint={
         error.unreachable
-          ? '这不是「没有模板」，而是读取失败——所以下面不会显示任何占位表格。'
+          ? '读取失败，不代表没有模板，下面不会显示占位内容。'
           : error.hint ?? undefined
       }
       actions={

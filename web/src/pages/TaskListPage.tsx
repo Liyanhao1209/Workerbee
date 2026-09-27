@@ -105,7 +105,7 @@ export function TaskListPage(): JSX.Element {
         <div className="page-head__titles">
           <h1>任务</h1>
           <div className="page-head__sub">
-            内核已接受的提交。每行都带它钉扎的图版本（规则版本）；失败或受阻的任务同时显示尚在运行的分支。
+            内核已接受的提交。每行显示任务 pinned 的图版本；失败或受阻的任务同时显示尚在运行的分支。
           </div>
         </div>
       </div>
@@ -210,7 +210,7 @@ export function TaskListPage(): JSX.Element {
                     <th className="table__num" title="提交时的流程修订号 revision_seq">
                       修订
                     </th>
-                    <th title="effective_graph_version：任务钉扎的图版本，决定它按哪一版规则运行（AC-07）">
+                    <th title="任务 pinned 的图版本，决定它按哪一版规则运行">
                       规则版本
                     </th>
                     <th>提交时间</th>
@@ -301,10 +301,7 @@ export function TaskListPage(): JSX.Element {
         ) : null}
 
         <div className="panel__hint">
-          规则版本 = <span className="mono">effective_graph_version</span>
-          ：任务钉扎的图版本，即「它按哪一版规则运行」。节点启停等后续修订不会改写这一列。
-          「运行中分支」来自 <span className="mono">failure_summary.running_branches</span>
-          ——缺失时不显示，因为那是「内核没说」，不是「一个都没有」。
+          规则版本指任务 pinned 的图版本，节点启停等后续修订不会改写它。运行中分支一栏为空可能是没有分支在跑，也可能是内核没有上报。
         </div>
       </div>
     </div>

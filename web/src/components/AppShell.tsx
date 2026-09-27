@@ -159,8 +159,7 @@ export function AppShell(): JSX.Element {
         {notes.length > 0 ? (
           <Banner
             variant="warn"
-            title={`内核降级声明 · ${notes.length} 项`}
-            hint="这些是内核如实上报的降级事实，不是可以被忽略的提示。"
+            title={`运行提示 · ${notes.length} 项`}
             actions={
               <button type="button" className="btn btn--sm" onClick={() => setNotesOpen((v) => !v)}>
                 {notesOpen ? '收起' : '展开'}

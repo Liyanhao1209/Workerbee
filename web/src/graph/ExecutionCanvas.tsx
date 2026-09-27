@@ -2,7 +2,7 @@
  * 实际执行图（OBS-02）。运维时看的是这一张，不是编辑器那张。
  *
  * 三条纪律：
- * 1. **画的是钉扎快照，不是当前定义。** 任务的依赖推进以发射时钉扎的
+ * 1. **画的是 pinned 快照，不是当前定义。** 任务的依赖推进以发射时 pinned 的
  *    effective_edges 为准，之后用户改了图也不影响它（WF-06、REC-03）。
  *    因此这里的边来自 `graph_snapshot.effective_edges`，不是 `graph.edges`。
  * 2. **节点着色按阶段状态**，过渡态（分派中／暂停中／退避中／等待审批／核对中／
@@ -125,9 +125,9 @@ function RuntimeNode({ data }: NodeProps<RtNode>): JSX.Element {
 const nodeTypes = { runtime: RuntimeNode };
 
 export interface ExecutionCanvasProps {
-  /** 钉扎的定义图（含节点名与 enabled 快照）。 */
+  /** pinned 的定义图（含节点名与 enabled 快照）。 */
   pinnedGraph: GraphSpec;
-  /** 钉扎的有效边集：真正决定依赖推进的那一份。 */
+  /** pinned 的有效边集：真正决定依赖推进的那一份。 */
   effectiveEdges: [string, string][];
   stages: TaskStage[];
   /** 任务当前失败时，仍在运行的分支（RUN-07 要求同时显示）。 */

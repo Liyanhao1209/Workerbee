@@ -189,7 +189,7 @@ function renderSubmitResult(
   return (
     <div>
       {result.created === false ? (
-        <Banner variant="info" title="命中幂等键——返回的是已存在的那次提交，没有产生新任务" />
+        <Banner variant="info" title="这个去重标识已经用过，返回的是原来那次提交，没有新建任务" />
       ) : result.created === true ? (
         <Banner variant="ok" title="已创建新任务" />
       ) : (
@@ -393,11 +393,10 @@ export function SubmitTaskPanel({
 
       <div className="field-row">
         <Field
-          label="幂等键（可选）"
+          label="去重标识（可选）"
           hint={
             <span>
-              同一次请求因网络重送或响应丢失时，用同一个键重发不会产生额外任务；两次<strong>有意</strong>
-              的相同提交仍然得到两个任务。
+              填了它，网络重试时用同一个值重发不会多出任务；换一个值再提交则会产生新任务。
             </span>
           }
         >
@@ -442,7 +441,7 @@ export function SubmitTaskPanel({
         ) : entries.length === 0 ? (
           <Banner
             variant="warn"
-            title="当前没有有效入口，内核会拒绝执行（WF-05）。"
+            title="当前没有可执行的入口节点，内核会拒绝这次提交。"
             hint="入口 = 已启用、且没有来自已启用节点的入边的节点；停用节点会被绕过，请检查节点启停状态。"
           />
         ) : (

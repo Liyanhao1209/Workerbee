@@ -120,7 +120,7 @@ export function layoutGraph(graph: GraphSpec): Map<string, { x: number; y: numbe
   return positions;
 }
 
-/** 渲染执行图时用：把钉扎的有效边集摊平成边列表。 */
+/** 渲染执行图时用：把 pinned 的有效边集摊平成边列表。 */
 export function effectiveEdgeList(graph: GraphSpec, effectiveEdges: [string, string][]): Edge[] {
   const declared = new Map<string, Edge>();
   for (const e of graph.edges) declared.set(`${e.from_node}->${e.to_node}`, e);

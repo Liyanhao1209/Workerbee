@@ -205,7 +205,7 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             self.startup_notes.append(
                 f"supervisor 不可达（{socket}）：{type(exc).__name__}。"
-                f"本轮不托管会话——core 重启会打断在跑的任务。"
+                f"本轮不托管会话，core 重启会打断在跑的任务。"
                 f"请先启动 workerbee-supervisor。"
             )
             return _UnavailableHarness(f"supervisor 不可达：{socket}")
@@ -404,8 +404,7 @@ class Engine:
             )
             if llm is None:
                 self.startup_notes.append(
-                    "摘要器不可用，已退化为截断式摘要；交接会显式标记为「摘要不完整」"
-                    "而不是假装成功（DATA-03）"
+                    "摘要器不可用，已退化为截断式摘要。交接会标记为摘要不完整。"
                 )
 
         if self.config.use_context_assembler:
@@ -529,8 +528,8 @@ class Engine:
         if n == 0 and locator_count:
             # 库里有凭据却一个都没登记——这正是那个静默失效的特征，必须报出来。
             self.startup_notes.append(
-                f"凭据库已解锁（{locator_count} 条）但脱敏器登记到 0 个密值；"
-                f"事件历史中的凭据可能不会被替换为掩码"
+                f"凭据库已解锁（{locator_count} 条），但脱敏器没有登记到任何密值，"
+                f"事件历史中的凭据可能不会被遮蔽"
             )
 
         await self.store.events.append(
@@ -602,7 +601,7 @@ class Engine:
             )
             if report.lost:
                 self.startup_notes.append(
-                    f"对账发现 {len(report.lost)} 个阶段状态不明，需人工核对（REC-04）"
+                    f"对账发现 {len(report.lost)} 个阶段状态不明，需人工核对"
                 )
             if report.reattached:
                 self.startup_notes.append(
@@ -714,7 +713,7 @@ class Engine:
                 results[reg.harness_id] = f"failed: {type(exc).__name__}"
                 self.startup_notes.append(
                     f"harness「{reg.name}」能力探测失败：{type(exc).__name__}。"
-                    f"未探测的能力无法参与兼容性判定，发射时会被如实提示（HAR-02）。"
+                    f"未探测的能力无法参与兼容性判定，提交任务时会被提示。"
                 )
         return results
 

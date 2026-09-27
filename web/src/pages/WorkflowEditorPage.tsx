@@ -5,7 +5,7 @@
  * - 画布上编辑的是**定义图 G₀**（用户保存的事实源）；
  * - 有效图 G_eff 由内核按启停派生，**不在这张画布上画可编辑的边**——
  *   要看有效边请走「启停预览」，那里是只读的差异视图；
- * - 本次执行记录是任务发射时钉扎的快照，编辑它不影响在途任务。
+ * - 本次执行记录是任务发射时 pinned 的快照，编辑它不影响在途任务。
  *
  * 保存走乐观并发：每次提交都带 `base_revision_seq`，冲突（409）时把
  * **服务端最新版 + 双方 diff** 摆给用户决定，而不是覆盖或悄悄重试。
@@ -194,7 +194,7 @@ export function WorkflowEditorPage(): JSX.Element {
       setBaseSeq(result.revision_seq);
       setSaveNote(
         publish
-          ? `已发布修订 #${result.revision_seq}（有效图版本 ${result.effective_graph_version}）。在途任务不受影响——它们钉扎的是发射时的快照。`
+          ? `已发布修订 #${result.revision_seq}（有效图版本 ${result.effective_graph_version}）。在途任务不受影响，它们用的是发射时 pinned 的快照。`
           : `已保存草稿修订 #${result.revision_seq}，尚未发布。`,
       );
       revisions.reload();
@@ -409,7 +409,7 @@ export function WorkflowEditorPage(): JSX.Element {
                 载入最新版覆盖画布
               </button>
             }
-            hint="画布不会自动跟随服务端——静默覆盖会丢掉你正在做的编辑。"
+            hint="画布不会自动跟随服务端，否则会丢掉正在做的编辑。"
           >
             你正在编辑的是修订 #{baseSeq}
             {serverNewer.note ? `（${serverNewer.note}）` : ''}，而服务端当前已到 #
@@ -421,7 +421,7 @@ export function WorkflowEditorPage(): JSX.Element {
           <Banner
             variant="danger"
             title={save.error.unreachable ? '无法连接内核' : '保存失败'}
-            hint={save.error.unreachable ? '改动仍在本地，但**没有写入内核**——不要关掉页面。' : undefined}
+            hint={save.error.unreachable ? '改动还在本地，没有写入内核。不要关掉页面。' : undefined}
           >
             {save.error.detail}
           </Banner>
@@ -612,7 +612,7 @@ export function WorkflowEditorPage(): JSX.Element {
               <DiagnosticsGrouped diagnostics={report.diagnostics} onLocate={locate} />
             ) : (
               <div className="empty text-sm">
-                尚未校验。点「校验」把当前草稿交给内核检查——结论里的每一条都能点，点了会在画布上定位。
+                尚未校验。点「校验」检查当前草稿，结论里的每一条都可以点击定位。
               </div>
             )}
           </div>
@@ -803,7 +803,7 @@ function RevisionList({
   return (
     <div className="col" style={{ gap: 6 }}>
       <div className="text-xs dim">
-        修订是不可变的：编辑产生新修订，在途任务仍按发射时钉扎的快照执行。
+        修订是不可变的：编辑产生新修订，在途任务仍按发射时 pinned 的快照执行。
         「载入」把某一版读进画布作为新的编辑起点（不改服务端）。
       </div>
       {revisions.map((rev) => (
@@ -974,8 +974,7 @@ function ConflictDialog({
       }
     >
       <Banner variant="danger" title={conflict.detail}>
-        你没有覆盖任何人的改动——这次保存被拒绝了。下面是双方相对于你编辑起点（修订 #{baseSeq}）的差异，
-        请据此决定保留哪一份。
+        这次保存被拒绝了，没有覆盖任何人的改动。下面是双方相对于你编辑起点（修订 #{baseSeq}）的差异。
         {conflict.hint ? <div className="banner__hint">{conflict.hint}</div> : null}
       </Banner>
 

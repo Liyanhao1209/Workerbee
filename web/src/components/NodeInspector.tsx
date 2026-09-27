@@ -140,7 +140,7 @@ export function NodeInspector({
         <div className="banner banner--warn">
           <div className="banner__body">
             <div className="banner__title">至少需要一组执行候选</div>
-            可运行节点必须至少配置一组候选；没有候选的节点在发布校验中会失败（WF-05、CFG-01）。
+            可运行节点至少要有一组执行候选，否则发布校验不会通过。
           </div>
         </div>
       ) : null}
@@ -172,7 +172,7 @@ export function NodeInspector({
       <div className="divider" />
       <RefPicker
         title="Skills"
-        hint="执行指导；框架未据此强制任何操作系统级限制（RES-04）。"
+        hint="写给模型的执行指导。框架不会据此限制系统资源。"
         refs={node.skill_refs}
         options={skills.filter((s) => s.enabled).map((s) => ({ id: s.skill_id, label: `${s.name} @v${s.version}` }))}
         onChange={(refs) => patch({ skill_refs: refs })}
@@ -322,7 +322,7 @@ function ProfileEditor({
 
           <Field
             label="Reasoning effort"
-            hint="以适配器验证的能力为准；不可用的取值会被拒绝，不会静默忽略（CFG-02）。留空表示 harness 没有这个概念。"
+            hint="可选项来自适配器的能力声明，填了不支持的取值会被拒绝。留空表示不指定。"
           >
             <input
               className="input input--mono"
@@ -336,9 +336,9 @@ function ProfileEditor({
             label="Compact 阈值（token）"
             hint={
               supportsCompact === false
-                ? '该 harness 的能力声明里没有上下文整理，填了也不会生效——不支持就是不会整理（CFG-05）。'
+                ? '该 harness 不支持上下文整理，填了也不会生效。'
                 : supportsCompact === null
-                  ? 'harness 尚未探测，上限未知。实际触发点 = min(用户阈值, harness 实际上限) − 安全余量。'
+                  ? 'harness 尚未探测，上限未知。实际触发点取用户阈值与 harness 上限中较小的那个，再留一点余量。'
                   : '期望触发整理的阈值，不是模型最大窗口。留空表示不主动整理。'
             }
           >
@@ -583,7 +583,7 @@ function RefPicker({
             ))
           )}
           <div className="text-xs dim">
-            版本留空表示「跟随最新」。要满足 CFG-07 的可追溯要求，应钉扎到具体版本。
+            版本留空表示跟随最新。填写具体版本可以保证每次执行用的是同一份。
           </div>
         </div>
       ) : null}

@@ -234,7 +234,7 @@ export function ToggleFlow({
 
           {noEntry ? (
             <Banner variant="danger" title="停用后没有有效入口">
-              全部停用或无可执行节点时，内核会拒绝执行提交（WF-05、ACT-02）。这个操作被阻止。
+              全部停用或没有可执行节点时，内核会拒绝提交，所以这个操作被阻止。
             </Banner>
           ) : null}
 
