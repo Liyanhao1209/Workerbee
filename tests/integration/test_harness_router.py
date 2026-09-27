@@ -283,6 +283,34 @@ async def test_capabilities_mirror_the_adapter_manifest(mock_router):
     assert caps.reasoning_efforts == ["low", "medium", "high"]
 
 
+async def test_real_adapter_capabilities_pass_through_honestly(store, tmp_path):
+    """注册表里写连字符也认得（manifest 自述就是连字符），且「宁可声明 False」
+    的诚实性要原样传到内核看到的 ``SessionCaps``——路由层不许替适配器美化（D-09）。
+    """
+    await register_harness(
+        store,
+        harness_id="claude",
+        name="Claude Code",
+        adapter_id="claude-code",
+        cwd=str(tmp_path),
+    )
+    rec = Recorder()
+    router = HarnessRouter(store, on_event=rec.on_event, log=rec.log)
+    try:
+        await router.start()
+        caps = await router.capabilities("claude")
+        assert caps.create_session is True
+        assert caps.resume_session is True
+        assert caps.stop is True
+        # claude code 做不到的三件事（autocompact 是启动参数、没有外部权限钩子）
+        assert caps.compact is False
+        assert caps.permission_hook is False
+        assert caps.background_tasks is False
+        assert caps.pause_support() == "restart"
+    finally:
+        await router.stop()
+
+
 async def test_capabilities_conservative_when_unknown(store):
     """没有 manifest 的 harness：返回保守默认，不做乐观猜测（D-09）。"""
     router = HarnessRouter(store, adapter_commands={"mock": MOCK_MAIN})
@@ -349,7 +377,9 @@ async def test_terminate_flips_session_alive_within_bound(mock_router):
         await asyncio.sleep(0.05)
     assert alive is False, "取消链必须在有界时间内让 session_alive 变成 False"
     assert time.monotonic() - started < 5.0, "取消链必须是有界的"
-    assert rec.ended_ok(handle.session_ref) == [True]
+    # 被终止不是正常完成：结束回调必须报 ok=False（RUN-06 的「结束 ≠ 成功」）
+    assert rec.ended_ok(handle.session_ref) == [False]
+    assert any("terminate" in (detail or "") or "终止" in (detail or "") for _, _, detail in rec.session_ended)
 
 
 async def test_session_alive_is_false_for_unknown_session(mock_router):

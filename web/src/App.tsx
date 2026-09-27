@@ -1,0 +1,35 @@
+import { Navigate, Route, Routes } from 'react-router-dom';
+import { AppShell } from './components/AppShell';
+import { TokenGate } from './components/TokenGate';
+import { WorkflowListPage } from './pages/WorkflowListPage';
+import { WorkflowEditorPage } from './pages/WorkflowEditorPage';
+import { TaskListPage } from './pages/TaskListPage';
+import { TaskDetailPage } from './pages/TaskDetailPage';
+import { ExecutionGraphPage } from './pages/ExecutionGraphPage';
+import { RegistryPage } from './pages/RegistryPage';
+import { TemplatesPage } from './pages/TemplatesPage';
+import { StoragePage } from './pages/StoragePage';
+import { NotFoundPage } from './pages/NotFoundPage';
+
+export function App(): JSX.Element {
+  return (
+    <TokenGate>
+      <Routes>
+        <Route element={<AppShell />}>
+          <Route index element={<Navigate to="/workflows" replace />} />
+          <Route path="/workflows" element={<WorkflowListPage />} />
+          <Route path="/workflows/:workflowId" element={<WorkflowEditorPage />} />
+          <Route path="/tasks" element={<TaskListPage />} />
+          <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+          {/* 执行图是运维时最常看的视图，单独给它一级入口。 */}
+          <Route path="/execution" element={<ExecutionGraphPage />} />
+          <Route path="/execution/:taskId" element={<ExecutionGraphPage />} />
+          <Route path="/registry" element={<RegistryPage />} />
+          <Route path="/templates" element={<TemplatesPage />} />
+          <Route path="/storage" element={<StoragePage />} />
+          <Route path="*" element={<NotFoundPage />} />
+        </Route>
+      </Routes>
+    </TokenGate>
+  );
+}

@@ -45,6 +45,21 @@ class EngineConfig(DomainModel):
     adapter_commands: dict[str, list[str]] = Field(default_factory=dict)
     """adapter_id → 启动命令。留空用内置映射。"""
 
+    use_supervisor: bool = False
+    """是否把 harness 子进程交给独立的 supervisor 进程托管。
+
+    开启后 core 重启不会打断在跑的会话——这是产品的核心承诺（§3）。
+    默认关闭是为了让单进程开发与测试简单；生产部署应开启。
+    """
+
+    supervisor_socket: Path | None = None
+    """supervisor 的 Unix socket。留空则取 ``<data-dir>/supervisor.sock``。"""
+
+    def resolved_supervisor_socket(self) -> Path:
+        return Path(self.supervisor_socket) if self.supervisor_socket else (
+            self.data_dir / "supervisor.sock"
+        )
+
     poll_interval: float = 1.0
     reaper_interval: float = 300.0
     approval_timeout: float = 900.0
@@ -126,6 +141,9 @@ class Engine:
         return engine
 
     async def _build_harness(self) -> Any:
+        if self.config.use_supervisor:
+            return await self._build_supervisor_client()
+
         try:
             from .adapters.host.router import HarnessRouter
         except ImportError as exc:  # pragma: no cover - 适配层缺失时的显式降级
@@ -143,6 +161,58 @@ class Engine:
             on_permission=self.on_permission_request,
             on_exit=self._on_adapter_exit,
             log=self._log_adapter,
+        )
+
+    async def _build_supervisor_client(self) -> Any:
+        """接上独立的 session 托管进程。
+
+        连不上时**如实报出并继续以不可用状态运行**，而不是悄悄退回本地拉起子进程——
+        静默降级会让用户以为「core 重启不会丢会话」，而实际上会。
+        """
+        from .adapters.host.remote import SupervisorClient
+
+        socket = self.config.resolved_supervisor_socket()
+        client = SupervisorClient(
+            socket,
+            on_event=self._on_adapter_event,
+            on_session_died=self._on_session_died,
+            on_log=self._log_adapter,
+            registration_provider=self._harness_registration,
+        )
+        try:
+            await client.ensure_connected(attempts=3, delay=0.5)
+        except Exception as exc:  # noqa: BLE001
+            self.startup_notes.append(
+                f"supervisor 不可达（{socket}）：{type(exc).__name__}。"
+                f"本轮不托管会话——core 重启会打断在跑的任务。"
+                f"请先启动 workerbee-supervisor。"
+            )
+            return _UnavailableHarness(f"supervisor 不可达：{socket}")
+
+        self.startup_notes.append(f"session 由 supervisor 托管（{socket}）")
+        return client
+
+    async def _harness_registration(self, harness_id: str) -> Any:
+        return await self.store.registry.get_harness(harness_id)
+
+    async def _on_session_died(self, session_ref: str, reason: str) -> None:
+        """会话非正常终止 → 走 REC-02 的恢复路径，而不是直接判失败。"""
+        await self.store.db.execute(
+            "UPDATE session_handle SET state='lost', updated_at=datetime('now') "
+            "WHERE session_ref=?",
+            (session_ref,),
+        )
+        await self.store.events.append(
+            scope=_scope("session"),
+            type=_event("SESSION_LOST"),
+            actor=_actor("adapter"),
+            scope_id=session_ref,
+            payload={"reason": reason, "note": "会话非正常终止，等待对账"},
+        )
+        await self.notifier.attention_required(
+            kind="session_died",
+            task_id=None,
+            payload={"session_ref": session_ref, "reason": reason},
         )
 
     def _wire_security(self) -> None:

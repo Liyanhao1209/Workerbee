@@ -64,6 +64,7 @@ __all__ = [
     "ToggleRequest",
     "ReorderRequest",
     "ReorderResponse",
+    "NodeQueueResponse",
     "SystemStatusResponse",
     "EventRecord",
     "EventPage",
@@ -264,6 +265,21 @@ class ReorderResponse(ApiResponse):
     """**实际生效**的顺序。与请求不符时前端显示这个，而不是自己的乐观假设（AC-03）。"""
     rejected: list[dict[str, str]] = Field(default_factory=list)
     reason: str | None = None
+
+
+class NodeQueueResponse(ApiResponse):
+    """节点队列投影（RUN-04）：**只读视图**。
+
+    权威队列始终是任务／阶段表，这里是它此刻的投影——前端不得据它反推状态，
+    有变化以推送或重新拉取为准。
+    """
+
+    node_id: str
+    pending: list[TaskStage] = Field(default_factory=list)
+    """等待依赖与就绪的阶段，按实际派发次序排列（与调序端的 effective_order 同源）。"""
+    running: list[TaskStage] = Field(default_factory=list)
+    """占用执行槽的阶段（D-03）。等待审批的阶段不在此列——它不占槽。"""
+    history: list[TaskStage] = Field(default_factory=list)
 
 
 # ===========================================================================

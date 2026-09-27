@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ...core.domain.registry import HarnessRegistration
@@ -339,9 +339,11 @@ class HarnessRouter:
         rec = self._sessions.get(session_ref)
         proc = self._proc_for(rec)
         if proc is None:
-            # 进程都没了，没有可释放的远端资源；本地状态如实收束。
+            # 进程都没了，没有可释放的远端资源；本地状态如实收束——
+            # 若此前已经报过「丢失」，就不要在这里改口说「正常结束」。
+            already_lost = rec is not None and rec.state == "lost"
             await self._mark_ended(
-                session_ref, ok=rec.state != "lost" if rec else True, detail="适配器进程已退出"
+                session_ref, ok=not already_lost, detail="适配器进程已退出"
             )
             return
         try:
@@ -557,8 +559,9 @@ class HarnessRouter:
 
         if kind == EventKind.SESSION_ENDED:
             # 会话结束不走 on_event：内核要的是 session_ended 专用回调（RUN-06）。
-            detail = str(event.data.get("detail") or "") or None
-            await self._mark_ended(session_ref or "", ok=True, detail=detail)
+            await self._mark_ended(
+                session_ref or "", **self._ended_verdict(event.data or {})
+            )
             return
 
         if not session_ref:
@@ -574,6 +577,25 @@ class HarnessRouter:
         if self._on_event is None:
             return
         await self._on_event(session_ref, kind, self._to_payload(event))
+
+    @staticmethod
+    def _ended_verdict(data: dict[str, Any]) -> dict[str, Any]:
+        """把「会话怎么结束的」翻译成内核的 ``ok`` 判据（RUN-06：结束 ≠ 成功）。
+
+        - 被终止（``reason=terminate`` / 带 ``signal``）：不是正常完成；
+        - harness 进程非零退出：不是正常完成（适配器随后还会补一条 ERROR）；
+        - 其余（正常收尾、dispose）：按正常结束报。
+        """
+        exit_code = data.get("exit_code")
+        reason = data.get("reason")
+        if reason == "terminate" or data.get("signal"):
+            return {
+                "ok": False,
+                "detail": f"会话被终止（{data.get('signal') or 'terminate'}），不是正常完成",
+            }
+        if exit_code not in (0, None):
+            return {"ok": False, "detail": f"harness 进程非零退出（code={exit_code}）"}
+        return {"ok": True, "detail": str(data.get("detail") or reason or "") or None}
 
     @staticmethod
     def _to_payload(event: AdapterEvent) -> dict[str, Any]:
