@@ -74,6 +74,17 @@ class ExecutionProfile(DomainModel):
     """以适配器验证的能力为准。不可用的取值必须提示，不能静默忽略（CFG-02）。
     仅在 harness 未声明该维度（harness 无此概念）时允许为 None。"""
 
+    permission_mode: str | None = None
+    """该候选运行的权限模式（如 ``default`` / ``acceptEdits`` / ``bypassPermissions``）。
+
+    这个字段存在的理由（HUM-03、§8.1）：**harness 是否会向用户请求授权**取决于它，
+    而不是取决于框架。当 harness 没有权限钩子（框架无法代你拦截审批）时，
+    必须由用户**显式**选定一个不询问的模式，框架才允许执行——而不是替用户
+    默认成「自动放行」。权限相关的事不做隐式默认。
+
+    None 表示未指定。适配器会如实拒绝，而不是替用户挑一个。
+    """
+
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
 
     compact_threshold: int | None = None

@@ -183,6 +183,20 @@ export interface WorkflowRevision {
   updated_at: string | null;
 }
 
+/** 保存修订的结果（`RevisionSaveResponse`）。修订不可变：每次保存产生新序号。 */
+export interface RevisionSaveResult {
+  accepted: boolean;
+  workflow_id: string;
+  revision_seq: number;
+  published: boolean;
+  /** 有效图版本。草稿不推进它——只有发布才改有效图。 */
+  effective_graph_version: number;
+  note: string | null;
+  /** 本次是否真的做了 CAS 检查（无 base_revision_seq 时为 false）。 */
+  cas_checked: boolean;
+  base_revision_seq: number | null;
+}
+
 // ===========================================================================
 // 校验（WF-05 / ACT-03）
 // ===========================================================================
@@ -475,7 +489,12 @@ export interface HarnessRegistration {
   updated_at?: string;
 }
 
-/** 适配器六组契约里需要逐项如实显示的能力名（HAR-02）。 */
+/**
+ * 能力矩阵里逐项如实显示的布尔能力名（HAR-02）。
+ * 取自适配器契约 `AdapterCapabilities`（`adapters/sdk/contract.py`，字段名与架构设计 §5.3 对齐）：
+ * 每项都可能是 true / false / 缺失 / 非布尔四种情况，界面必须**分开呈现**——
+ * 「显式 false」是「不支持」，「缺失」是「未声明」，两者不能都画成空白。
+ */
 export const HARNESS_CAPABILITY_KEYS = [
   'create_session',
   'resume_session',
@@ -486,7 +505,17 @@ export const HARNESS_CAPABILITY_KEYS = [
   'compact',
   'permission_hook',
   'background_tasks',
+  // 暂停能力（D-07 四档：in_place / checkpoint / restart / none 的判定依据）
+  'pause_in_place',
+  'checkpoint_resume',
+  'keep_checkpoint_on_stop',
+  // 用量与输出（OBS-04：token_usage=false 时用量是「未知」而不是 0）
+  'token_usage',
+  'structured_output',
 ] as const;
+
+/** 列表型能力：值不是布尔而是列表，单独渲染（空列表 = 该维度不适用）。 */
+export const HARNESS_LIST_CAPABILITY_KEYS = ['reasoning_efforts', 'models', 'auth_modes'] as const;
 
 // ===========================================================================
 // 模板（TPL-01/02/03）
@@ -578,6 +607,7 @@ export interface EventPage {
 export interface SchedulerStats {
   /** 未装配时任务不会自动推进——界面必须如实显示。 */
   enabled: boolean;
+  /** 调度循环的空转间隔，**单位秒**（内核里作为 asyncio 超时使用，默认 1.0）。 */
   poll_interval: number;
 }
 
@@ -602,9 +632,22 @@ export interface StorageReport {
   last_run: Record<string, unknown> | null;
 }
 
+/**
+ * 会话托管形态。
+ *
+ * `supervisor`：harness 子进程由独立的 supervisor 进程持有，内核重启不会打断在途任务。
+ * `in_process`：harness 子进程由内核自己持有——**内核重启会打断正在跑的任务**。
+ * 用户必须知道自己处在哪一种形态下，否则会默认「重启不丢任务」而实际上会丢。
+ */
+export type SessionHosting = 'supervisor' | 'in_process';
+
 export interface SystemStatus {
   version: string;
+  /** 降级声明（如「supervisor 不可达」「摘要器不可用，已退化为截断式摘要」）。必须显著呈现。 */
   startup_notes: string[];
+  session_hosting: SessionHosting;
+  /** supervisor 是否连通。in_process 形态下该值无意义，不应据此显示故障。 */
+  supervisor_connected: boolean;
   data_dir: string;
   workspace_dir: string;
   /** 凭据库是否已解锁。未解锁时引用凭据的节点会明确报错。 */
@@ -627,6 +670,7 @@ export interface AttentionResponse {
   failed_tasks: Task[];
   lost_stages: TaskStage[];
   unresolved_resources: Record<string, unknown>[];
+  /** 与 SystemStatus.startup_notes 同源，一并如实呈现（不折叠成小图标）。 */
   startup_notes: string[];
 }
 
@@ -749,6 +793,36 @@ export interface ReorderResult {
   reason: string | null;
 }
 
+/**
+ * 会话台账的一条记录（`GET /api/sessions`，只读）。
+ *
+ * 排障时最常问的两个问题都由它回答：这次任务还连着哪个 session、那个 session 还活着吗。
+ * `state` 是台账里的自由文本列（`session_handle.state`），代码里出现过
+ * alive / lost / disposed / ended；**不认识的取值原样显示英文**，不猜含义。
+ */
+export interface SessionRecord {
+  session_ref: string;
+  harness_id: string;
+  owner_task_id: string | null;
+  owner_stage_id: string | null;
+  owner_attempt_id: string | null;
+  state: string;
+  created_at: string | null;
+  /** 最近一次心跳。与当前时间的差距是判断「是不是卡住了」的依据。 */
+  last_heartbeat: string | null;
+}
+
+/** `GET /api/nodes/{node_id}/queue`（RUN-04）：只读投影，权威队列在任务／阶段表里。 */
+export interface NodeQueueResponse {
+  node_id: string;
+  /** 等待依赖与就绪的阶段，**按实际派发次序**排列（与调序端的 effective_order 同源）。 */
+  pending: TaskStage[];
+  /** 占用执行槽的阶段（D-03）。等待审批的阶段**不在此列**——它不占槽。 */
+  running: TaskStage[];
+  /** 回看用的最近记录。 */
+  history: TaskStage[];
+}
+
 // ===========================================================================
 // 提交
 // ===========================================================================
@@ -770,9 +844,17 @@ export interface TaskDetail {
   approvals: Approval[];
 }
 
+/**
+ * 产物记录。
+ *
+ * 注意：任务详情端点（`TaskDetailResponse.artifacts`）**只投影一部分字段**——
+ * `artifact_id / kind / summary / summary_ok / covered_fields / size_bytes /
+ * sensitivity / producer`（见 `workerbee/app.py` 的 `task_detail`）。其余字段在
+ * 领域对象 `Artifact` 上存在、但不会出现在这个响应里，所以标成可选：
+ * 界面读到 undefined 就显示「未知」，**不要**当成 0 或 false。
+ */
 export interface ArtifactRecord {
   artifact_id: string;
-  digest: string;
   producer: {
     task_id: string;
     stage_id: string;
@@ -785,14 +867,16 @@ export interface ArtifactRecord {
   /** 摘要是否覆盖了边输出契约的必填要点。false 时下游必须显式受阻。 */
   summary_ok: boolean;
   covered_fields: string[];
-  token_estimate: number | null;
   size_bytes: number | null;
-  media_type: string | null;
   sensitivity: Sensitivity;
-  lineage: string[];
-  ref_count: number;
-  tombstoned: boolean;
-  storage_path: string | null;
+  // ---- 以下字段不在任务详情的投影里（领域对象有，响应里未必有） ----
+  digest?: string;
+  token_estimate?: number | null;
+  media_type?: string | null;
+  lineage?: string[];
+  ref_count?: number;
+  tombstoned?: boolean;
+  storage_path?: string | null;
   created_at?: string;
   updated_at?: string;
 }

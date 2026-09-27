@@ -388,6 +388,11 @@ class Scheduler:
                     model_name=profile.model_name,
                     reasoning_effort=profile.reasoning_effort,
                     system_prompt=context.system_prompt,
+                    # 首轮输入随建会话给出：一次性 `-p` 型 harness 只能这样拿到输入。
+                    initial_input=context.user_input,
+                    # 权限模式由用户在候选上显式指定；无钩子的 harness 靠它保证
+                    # 不会中途停下来等人（HUM-03）。未指定时由适配器如实拒绝。
+                    permission_mode=profile.permission_mode,
                     cwd=self.node_cwd,
                 ),
                 timeout=self.config.dispatch_timeout,
@@ -455,21 +460,28 @@ class Scheduler:
         )
         attempt.session_ref = session.session_ref
 
-        try:
-            accepted = await asyncio.wait_for(
-                self.harness.send_input(session.session_ref, context.user_input),
-                timeout=self.config.dispatch_timeout,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # 会话已经产生，必须回收——直接放弃会留下一个没人管的进程
-            await self._abort_attempt(
-                fresh_task, fresh_stage, attempt, f"发送输入失败：{exc}"
-            )
-            return True
+        if session.accepted_initial_input:
+            # 输入已随建会话交付（一次性 `-p` 型 harness 只能这样）。
+            # 绝不能再 send_input 一次——同一指令执行两遍会把结果搞坏。
+            pass
+        else:
+            try:
+                accepted = await asyncio.wait_for(
+                    self.harness.send_input(session.session_ref, context.user_input),
+                    timeout=self.config.dispatch_timeout,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 会话已经产生，必须回收——直接放弃会留下一个没人管的进程
+                await self._abort_attempt(
+                    fresh_task, fresh_stage, attempt, f"发送输入失败：{exc}"
+                )
+                return True
 
-        if not accepted:
-            await self._abort_attempt(fresh_task, fresh_stage, attempt, "适配器拒绝了输入")
-            return True
+            if not accepted:
+                await self._abort_attempt(
+                    fresh_task, fresh_stage, attempt, "适配器拒绝了输入"
+                )
+                return True
 
         self._runtimes[attempt.attempt_id] = runtime
 

@@ -5,8 +5,13 @@
  * 1. **推送是加速器，不是事实源。** 任何一次推送到达后，页面仍然从 REST 拉真实状态；
  *    断连期间发生的事由 `resume` 补齐，而不是靠「我猜它没变」。
  * 2. **重连必须补齐水位。** 重连后发 `{"type":"resume","after_event_id":N}`，
- *    N 是客户端见过的最大 event_id。服务端据此回放断连期间的事件（AC-12）。
+ *    N 是客户端见过的最大 event_id。服务端据此回放断连期间的事件（AC-12），
+ *    一页不够（`has_more`）就按新水位继续拉，直到追平。
  * 3. **令牌只走查询参数**——浏览器的 WebSocket API 不能自定义请求头（见后端 auth.py）。
+ *
+ * 帧类型（`workerbee/server/ws.py`）：`hello` / `event` / `resume_complete` /
+ * `notification` / `pong` / `error`。只有 `notification` 会变成界面上的「推送」，
+ * 其余帧用于推进水位与记录补齐条数；不认识的帧一律忽略，不猜。
  */
 
 import { readToken } from './client';
@@ -18,8 +23,21 @@ export type WsStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed
 export interface WsHandlers {
   onPush: (push: WsPush) => void;
   onStatus: (status: WsStatus, detail?: string) => void;
+  /** 见到一条事件（至少一次投递，会与补拉重叠）：调用方只推进水位即可。 */
+  onEvent: (eventId: number) => void;
+  /** 一次补拉结束。`hasMore` 由通道自己继续拉，这里只报告结果。 */
+  onResume: (info: { returned: number; hasMore: boolean }) => void;
   /** 重连成功后要补齐的水位（客户端已见过的最大 event_id）。 */
   watermark: () => number;
+}
+
+function asEventId(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
 }
 
 const MAX_BACKOFF_MS = 15_000;
@@ -63,6 +81,17 @@ export class KernelSocket {
     this.handlers.onStatus('closed');
   }
 
+  /** 按当前水位请求补拉（REC-01）。连接不在 OPEN 时静默跳过，由重连路径负责。 */
+  private sendResume(): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: 'resume', after_event_id: this.handlers.watermark() }));
+    } catch {
+      /* 发送失败会在 onclose 里走重连路径 */
+    }
+  }
+
   private scheduleReconnect(): void {
     if (this.stopped) return;
     this.attempt += 1;
@@ -88,14 +117,9 @@ export class KernelSocket {
       this.attempt = 0;
       this.handlers.onStatus('open');
       if (isReconnect) {
-        const after = this.handlers.watermark();
         // 补齐断连期间的事件（AC-12）。水位为 0 表示本地没有见过任何事件，
         // 此时也要发一次，让服务端决定回放多少。
-        try {
-          ws.send(JSON.stringify({ type: 'resume', after_event_id: after }));
-        } catch {
-          /* 发送失败会在 onclose 里走重连路径 */
-        }
+        this.sendResume();
       }
     };
 
@@ -108,6 +132,29 @@ export class KernelSocket {
         return;
       }
       if (!isRecord(parsed)) return;
+
+      const type = asString(parsed['type']);
+      if (type === 'event') {
+        const row = parsed['event'];
+        const eventId = isRecord(row) ? asEventId(row['event_id']) : null;
+        if (eventId !== null) this.handlers.onEvent(eventId);
+        return;
+      }
+      if (type === 'hello' || type === 'resume_complete') {
+        // 服务端给的水位：比我们见过的靠前也没关系——事件只是「该刷新了」的提醒，
+        // 权威状态始终从 REST 拉，这里只用来决定下一次补拉的起点。
+        const latest = asEventId(parsed['latest_event_id']);
+        if (latest !== null) this.handlers.onEvent(latest);
+        if (type === 'resume_complete') {
+          const returned = asEventId(parsed['returned']) ?? 0;
+          const hasMore = parsed['has_more'] === true;
+          this.handlers.onResume({ returned, hasMore });
+          if (hasMore) this.sendResume(); // 一页没拉完：按新水位继续，直到追平
+        }
+        return;
+      }
+
+      // notification：唯一会变成界面推送的帧。其余帧（pong / error）忽略。
       const kind = asString(parsed['kind']);
       if (kind !== 'state_changed' && kind !== 'attention') return;
       this.handlers.onPush({

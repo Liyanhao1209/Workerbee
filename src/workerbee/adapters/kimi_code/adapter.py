@@ -30,6 +30,10 @@ stdout 是 NDJSON，已实测到的行类型（``role`` 字段）：
 ``permission_hook=False``、``background_tasks=False``、
 ``interact/interrupt=False``（``-p`` 没有输入通道；``kimi acp`` 是另一套
 ACP 协议，本适配器未实现，也不据此声明能力）。
+
+权限模式（HUM-03）：``-p`` 下唯一可选的取值是「不给任何开关」，实测它既不会
+向用户提问、也不会因为权限受阻（见 ``NON_INTERACTIVE_PERMISSION_MODES``）；
+用户选了它就等于把权限决定交给 harness 自己，校验管线会给出对应告警。
 """
 
 from __future__ import annotations
@@ -56,7 +60,11 @@ from ..sdk.protocol import (
     NOTIFICATIONS,
 )
 
-__all__ = ["KimiCodeAdapter", "SUPPORTED_PERMISSION_MODES"]
+__all__ = [
+    "KimiCodeAdapter",
+    "SUPPORTED_PERMISSION_MODES",
+    "NON_INTERACTIVE_PERMISSION_MODES",
+]
 
 ADAPTER_ID = "kimi-code"
 HARNESS_FAMILY = "kimi-code"
@@ -67,6 +75,17 @@ SUPPORTED_HARNESS_MAJOR = "2"
 #: 非交互 prompt 模式下唯一可用的权限策略：不给任何开关（kimi 的 -y/--auto/--plan
 #: 都与 -p 互斥）。列在这里是为了让「不支持」这件事有明确的可读原因。
 SUPPORTED_PERMISSION_MODES = ("default",)
+
+#: 其中不会向用户请求授权的取值。
+#:
+#: ``-p`` 模式没有可提问的通道，实测（cd 到临时目录后让它用 Bash 执行 rm）：
+#: 那条删除**被直接执行**，全程没有任何询问，也没有等 stdin。本机 --help 也写明
+#: ``-y/--yolo`` 是「Ask When Needed：risky actions… still ask」、
+#: ``--auto`` 是「Never Ask」——两者都与 ``-p`` 互斥（CLI 直接报
+#: ``Cannot combine --prompt with --auto``），因此 ``-p`` 下不存在会提问的取值。
+#: 注意这只说明「不会停下来等用户」，不说明权限被框架拦住了：框架没有钩子，
+#: 权限决定完全由 harness 自己做（HUM-03 的告警会如实讲清这一点）。
+NON_INTERACTIVE_PERMISSION_MODES = ("default",)
 
 
 class KimiCodeAdapter(CliHarnessAdapter):
@@ -355,6 +374,8 @@ def _build_manifest() -> AdapterManifest:
             checkpoint_resume=False,
             keep_checkpoint_on_stop=False,
             reasoning_efforts=[],     # kimi 没有 effort 参数；空 = 此维度不适用
+            permission_modes=list(SUPPORTED_PERMISSION_MODES),
+            non_interactive_modes=list(NON_INTERACTIVE_PERMISSION_MODES),
             models=[],                # -m 取 config.toml 里的模型别名，集合开放
             auth_modes=["native_login"],
             token_usage=False,        # stream-json 里没有 usage / 费用信息
@@ -371,6 +392,12 @@ def _build_manifest() -> AdapterManifest:
             "（OBS-04 的上报纪律），不会用 0 冒充。",
             "permission_hook=False：没有权限钩子；且 -p 与 -y/--auto/--plan 互斥，"
             "非交互模式下连权限策略都无法配置（实测），因此本 harness 只在自动权限模式下可用。",
+            "permission_modes=[default]，non_interactive_modes=[default]：-p 模式下"
+            "实测既不提问也不受阻（用 Bash 删文件的动作为 harness 自己放行了）。"
+            "这是一条**如实的能力边界**：框架拦不住审批，用户选了 default 就等于把权限决定"
+            "交给 harness 自己（HUM-03 会给出对应的告警）。",
+            "kimi acp（ACP over stdio）未实现：那是另一套协议（需要客户端侧实现 fs/permission "
+            "回调与 session/update 流），本适配器不据此声明 interact=True。",
             "compact=False：没有运行时的上下文整理操作。",
             "background_tasks=False：流里没有后台工作状态，不满足 RUN-06 的完成判据。",
             "system_prompt 无原生参数：以显式分隔的形式前置到 prompt（有损降级），"

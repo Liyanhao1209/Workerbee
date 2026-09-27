@@ -5,7 +5,8 @@
  * `client.ApiError` 承载，调用方按 kind 分支。
  */
 
-import { request } from './client';
+import { ApiError, request } from './client';
+import { isRecord } from './guards';
 import type {
   Approval,
   AttentionResponse,
@@ -18,13 +19,16 @@ import type {
   HarnessRegistration,
   HealthResponse,
   NodeDefinition,
+  NodeQueueResponse,
   NodeToggleResponse,
   PauseResponse,
   ProbeResult,
   PruneResult,
   ReorderResult,
   ResumeResponse,
+  RevisionSaveResult,
   RevisionSource,
+  SessionRecord,
   SkillDoc,
   SkillScope,
   StageResumeResponse,
@@ -54,7 +58,8 @@ import type {
 export const system = {
   health: (signal?: AbortSignal) => request<HealthResponse>('/api/health', { noAuth: true, signal }),
   status: () => request<SystemStatus>('/api/system/status'),
-  events: (params: { after_id?: number; limit?: number; task_id?: string } = {}) =>
+  /** 全局事件流。按任务看事件用 `/api/tasks/{task_id}/events`（后者支持 task_id 维度）。 */
+  events: (params: { after_id?: number; limit?: number } = {}) =>
     request<EventPage>('/api/system/events', { query: params }),
   attention: () => request<AttentionResponse>('/api/attention'),
   storage: () => request<StorageReport>('/api/storage'),
@@ -113,16 +118,10 @@ export const workflows = {
       source?: RevisionSource;
     },
   ) =>
-    request<{
-      accepted: boolean;
-      workflow_id: string;
-      revision_seq: number;
-      published: boolean;
-      effective_graph_version: number;
-      note: string | null;
-      cas_checked: boolean;
-      base_revision_seq: number | null;
-    }>(`/api/workflows/${encodeURIComponent(id)}/revisions`, { method: 'POST', body }),
+    request<RevisionSaveResult>(`/api/workflows/${encodeURIComponent(id)}/revisions`, {
+      method: 'POST',
+      body,
+    }),
 
   validate: (id: string, body: { graph?: GraphSpec | null; mode: ValidationMode }) =>
     request<ValidationReport>(`/api/workflows/${encodeURIComponent(id)}/validate`, {
@@ -144,9 +143,9 @@ export const workflows = {
       { query: { preview: false }, method: 'POST', body },
     ),
 
-  /** 某节点的 pending 队列（RUN-04）。 */
+  /** 某节点的队列投影（RUN-04）：pending / running / history。 */
   nodeQueue: (nodeId: string) =>
-    request<{ node_id: string; stages: unknown[] }>(`/api/nodes/${encodeURIComponent(nodeId)}/queue`),
+    request<NodeQueueResponse>(`/api/nodes/${encodeURIComponent(nodeId)}/queue`),
 
   reorder: (nodeId: string, stageIds: string[]) =>
     request<ReorderResult>(`/api/nodes/${encodeURIComponent(nodeId)}/reorder`, {
@@ -204,11 +203,49 @@ export const tasks = {
 };
 
 // ---------------------------------------------------------------------------
+// 会话台账（REC-03）
+// ---------------------------------------------------------------------------
+
+export const sessions = {
+  /**
+   * supervisor / 内核持有的 harness 会话（只读）。
+   *
+   * 不带查询参数地取全量，由界面自己筛选：会话量级很小（并发任务数级别），
+   * 而「按任务看它的会话」是排障主路径，客户端筛选能保证切筛选不重新请求。
+   */
+  list: () => listRequest<SessionRecord>('/api/sessions', 'sessions'),
+};
+
+// ---------------------------------------------------------------------------
 // 注册表
 // ---------------------------------------------------------------------------
 
+/**
+ * 列表端点统一成数组：内核的列表路由直接返回 `[...]`（如 `/api/harnesses`），
+ * 这里也接受 `{<key>: [...]}` / `{items: [...]}` 的信封写法。三种都不是就抛错——
+ * **不把没读懂的响应当空列表**（那会把「读不到」画成「本来就是空的」）。
+ */
+async function listRequest<T>(path: string, key: string): Promise<T[]> {
+  const body = await request<unknown>(path);
+  if (Array.isArray(body)) return body as T[];
+  if (isRecord(body)) {
+    const direct = body[key];
+    if (Array.isArray(direct)) return direct as T[];
+    const items = body['items'];
+    if (Array.isArray(items)) return items as T[];
+  }
+  throw new ApiError({
+    kind: 'parse',
+    status: 200,
+    detail: `内核返回的列表形状无法识别（期望数组，或 {${key}: [...]} 这样的信封）`,
+    hint: '多半是内核与前端版本不一致，请对照 workerbee/server 的响应模型',
+  });
+}
+
+// 注册表四类资源的路径已唯一化：/api/harnesses、/api/credentials、/api/skills、/api/tools
+// （早期用过的 /api/registry/* 前缀已废弃，客户端不保留回退——两套并存本身就是困惑源）。
 export const registry = {
-  harnesses: () => request<{ harnesses: HarnessRegistration[]; returned: number }>('/api/registry/harnesses'),
+  harnesses: () => listRequest<HarnessRegistration>('/api/harnesses', 'harnesses'),
 
   createHarness: (body: {
     name: string;
@@ -220,7 +257,7 @@ export const registry = {
     auth_binding?: string | null;
     auth_mode?: string;
     enabled?: boolean;
-  }) => request<HarnessRegistration>('/api/registry/harnesses', { method: 'POST', body }),
+  }) => request<HarnessRegistration>('/api/harnesses', { method: 'POST', body }),
 
   patchHarness: (
     id: string,
@@ -236,31 +273,31 @@ export const registry = {
       enabled?: boolean;
     },
   ) =>
-    request<HarnessRegistration>(`/api/registry/harnesses/${encodeURIComponent(id)}`, {
+    request<HarnessRegistration>(`/api/harnesses/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       body,
     }),
 
   /** 能力探测（HAR-02）。失败如实上报，不伪造 capabilities。 */
   probeHarness: (id: string) =>
-    request<ProbeResult>(`/api/registry/harnesses/${encodeURIComponent(id)}/probe`, { method: 'POST' }),
+    request<ProbeResult>(`/api/harnesses/${encodeURIComponent(id)}/probe`, { method: 'POST' }),
 
-  credentials: () => request<{ credentials: CredentialRef[]; returned: number }>('/api/registry/credentials'),
+  credentials: () => listRequest<CredentialRef>('/api/credentials', 'credentials'),
 
   createCredential: (body: {
     label: string;
     kind: CredentialKind;
     secret_locator?: string | null;
     base_url?: string | null;
-  }) => request<CredentialRef>('/api/registry/credentials', { method: 'POST', body }),
+  }) => request<CredentialRef>('/api/credentials', { method: 'POST', body }),
 
   revokeCredential: (id: string, revoked: boolean) =>
-    request<CredentialRef>(`/api/registry/credentials/${encodeURIComponent(id)}/revoke`, {
+    request<CredentialRef>(`/api/credentials/${encodeURIComponent(id)}/revoke`, {
       method: 'POST',
       body: { revoked },
     }),
 
-  skills: () => request<{ skills: SkillDoc[]; returned: number }>('/api/registry/skills'),
+  skills: () => listRequest<SkillDoc>('/api/skills', 'skills'),
 
   createSkill: (body: {
     name: string;
@@ -268,9 +305,9 @@ export const registry = {
     version?: number;
     scope?: SkillScope;
     enabled?: boolean;
-  }) => request<SkillDoc>('/api/registry/skills', { method: 'POST', body }),
+  }) => request<SkillDoc>('/api/skills', { method: 'POST', body }),
 
-  tools: () => request<{ tools: ToolSpec[]; returned: number }>('/api/registry/tools'),
+  tools: () => listRequest<ToolSpec>('/api/tools', 'tools'),
 
   createTool: (body: {
     name: string;
@@ -282,7 +319,7 @@ export const registry = {
     version?: number;
     health_check?: boolean;
     enabled?: boolean;
-  }) => request<ToolSpec>('/api/registry/tools', { method: 'POST', body }),
+  }) => request<ToolSpec>('/api/tools', { method: 'POST', body }),
 };
 
 // ---------------------------------------------------------------------------

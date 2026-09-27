@@ -85,14 +85,27 @@ class SupervisorClient:
         self._reader, self._writer = await asyncio.open_unix_connection(
             str(self.socket_path)
         )
-        hello = await self.call(METHODS.HELLO, {"client": "workerbee-core"})
+        # 先起读循环再发 hello：回包是读循环喂给 pending future 的，
+        # 顺序反了就永远等不到回包——连接看着是通的，实际什么都收不到。
+        self._reader_task = asyncio.create_task(self._read_loop())
+        try:
+            hello = await self.call(METHODS.HELLO, {"client": "workerbee-core"})
+        except Exception:
+            # 握手没成：把这条半开的通道收干净，否则 connected 会一直为真，
+            # ensure_connected 重试时会直接「成功」返回（假连接比连不上更糟）。
+            task, self._reader_task = self._reader_task, None
+            if task is not None:
+                task.cancel()
+            with contextlib.suppress(Exception):
+                self._writer.close()
+            self._reader = None
+            self._writer = None
+            raise
         self._log(f"已连接 supervisor (pid={hello.get('pid')})")
 
         # 重连：把断连期间的事件补回来。补不上就把会话标为需核对。
         for session_ref in hello.get("sessions", []) or []:
             await self._catch_up(session_ref)
-
-        self._reader_task = asyncio.create_task(self._read_loop())
 
     async def ensure_connected(self, *, attempts: int = 5, delay: float = 0.5) -> None:
         """带退避的连接尝试。连不上就如实抛出——不静默降级成本地拉进程。"""
@@ -289,6 +302,8 @@ class SupervisorClient:
     async def create_session(
         self, *, harness_id: str, attempt: Any, stage: Any, model_name: str,
         reasoning_effort: str | None, system_prompt: str | None,
+        initial_input: str | None = None,
+        permission_mode: str | None = None,
         cwd: str | None = None, extra: dict | None = None,
     ) -> SessionHandle:
         await self._ensure_harness_ready(harness_id)
@@ -306,6 +321,8 @@ class SupervisorClient:
                 "model_name": model_name,
                 "reasoning_effort": reasoning_effort,
                 "system_prompt": system_prompt,
+                "initial_input": initial_input,
+                "permission_mode": permission_mode,
                 "cwd": cwd,
                 "extra": extra,
             },
@@ -319,6 +336,7 @@ class SupervisorClient:
             pid=result.get("pid"),
             model_name=result.get("model_name"),
             used_resume=bool(result.get("used_resume")),
+            accepted_initial_input=bool(result.get("accepted_initial_input")),
             detail=result.get("detail"),
         )
 
@@ -426,6 +444,15 @@ class SupervisorClient:
 
     async def status(self) -> dict[str, Any]:
         return await self.call(METHODS.STATUS, {})
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        """会话台账（session.list）。supervisor 才是会话的持有者，因此它才是权威。
+
+        查不到时**不返回空列表**：空列表会被读成「没有会话」，而事实是「不知道」。
+        异常如实上抛，由调用方决定怎么呈现（本项目的纪律：不把不知道伪装成没有）。
+        """
+        result = await self.call(METHODS.SESSION_LIST, {})
+        return list(result.get("sessions", []) or [])
 
     async def _ensure_harness_ready(self, harness_id: str) -> None:
         """按需让 supervisor 拉起该 harness 的适配器。

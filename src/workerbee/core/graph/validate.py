@@ -605,20 +605,18 @@ def _check_harness(
             requirement="CFG-05",
         )
 
-    # HUM-03：不支持权限钩子的适配器不得声称支持非自动权限模式。
+    # HUM-03：不支持权限钩子的适配器不得声称支持**非自动权限模式**。
+    #
+    # 这里刻意不是「一律拒绝」。清单的原话是「不得声称支持该权限模式」——
+    # 也就是说：没有钩子的 harness 仍然可用，但用户必须**显式**选一个不会询问的
+    # 权限模式。框架绝不替用户把它默认成「自动放行」：权限相关的事不做隐式默认。
     if caps.get("permission_hook") is False:
-        _add(
-            report,
-            structural_only,
-            code="capability_missing",
-            message=f"harness「{reg.name}」不支持权限钩子，该组合无法接入人工审批",
-            node=node,
-            slot=slot,
-            hint="改用支持审批的 harness；或明确接受该节点上的人工审批不可用",
-            requirement="HUM-03",
-        )
+        _check_permission_mode(profile, node, idx, slot, reg, caps, report, structural_only)
 
     # CFG-02：不可用的 effort 取值必须提示，不能接受后静默忽略。
+    #
+    # 注意这两段**不属于**权限模式检查：它们对每个候选都要跑，不能被上面
+    # 权限分支的提前 return 带走（那会让 CFG-02 与 HAR-01 悄悄失效）。
     efforts = caps.get("reasoning_efforts")
     if profile.reasoning_effort and isinstance(efforts, list) and efforts:
         if profile.reasoning_effort not in efforts:
@@ -645,6 +643,96 @@ def _check_harness(
             hint="先修复该 harness 的接入配置，或改选其他候选",
             requirement="HAR-01",
         )
+
+
+def _check_permission_mode(
+    profile,
+    node: NodeDefinition,
+    idx: int,
+    slot: str,
+    reg,
+    caps: dict,
+    report: ValidationReport,
+    structural_only: bool,
+) -> None:
+    mode = profile.permission_mode
+    non_interactive = list(caps.get("non_interactive_modes") or [])
+    supported = list(caps.get("permission_modes") or [])
+
+    if mode is None:
+        _add(
+            report,
+            structural_only,
+            code="permission_mode_unset",
+            message=(
+                f"harness「{reg.name}」没有权限钩子，框架无法代你拦截审批；"
+                f"未指定权限模式时无法确定它会不会中途停下来等人"
+            ),
+            node=node,
+            slot=slot,
+            hint=(
+                f"为该候选显式指定一个不会询问的模式（可选："
+                f"{'、'.join(non_interactive) if non_interactive else '该 harness 未声明任何不询问的模式'}）；"
+                f"框架不会替你默认放行"
+            ),
+            requirement="HUM-03",
+        )
+        return
+
+    if supported and mode not in supported:
+        _add(
+            report,
+            structural_only,
+            code="permission_mode_unsupported",
+            message=(
+                f"harness「{reg.name}」不支持权限模式 {mode}"
+                f"（可选：{'、'.join(supported)}）"
+            ),
+            node=node,
+            slot=slot,
+            hint="改选受支持的模式",
+            requirement="HUM-03",
+        )
+        return
+
+    if mode not in non_interactive:
+        _add(
+            report,
+            structural_only,
+            code="permission_mode_needs_hook",
+            message=(
+                f"权限模式 {mode} 会向用户请求授权，但 harness「{reg.name}」"
+                f"没有权限钩子，框架无法接收并转达该请求"
+            ),
+            node=node,
+            slot=slot,
+            hint=(
+                f"改用不会询问的模式（{'、'.join(non_interactive) if non_interactive else '该 harness 未声明'}），"
+                f"或改用支持权限钩子的 harness"
+            ),
+            requirement="HUM-03",
+        )
+        return
+
+    # 显式选了自动模式：允许执行，但「不支持审批」这件事必须对用户可见（HAR-02）。
+    report.diagnostics.append(
+        Diagnostic(
+            code="approval_unavailable",
+            severity=Severity.WARNING,
+            message=(
+                f"harness「{reg.name}」没有权限钩子，本节点上的人工审批不可用；"
+                f"所有权限决定将由 harness 自身按模式 {mode} 处理"
+            ),
+            node_id=node.node_id,
+            node_name=node.name,
+            slot=slot,
+            hint="这是如实声明的能力边界，不是错误；如需人工审批请改用支持权限钩子的 harness",
+            requirement="HUM-03",
+        )
+    )
+
+    # CFG-02 / HAR-01 的检查在 _check_harness 里，对每个候选无条件执行；
+    # 本函数只负责 HUM-03 的权限模式分档。
 
 
 def _check_credential(

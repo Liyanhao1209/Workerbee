@@ -38,11 +38,14 @@ class FakeHarness:
         caps: SessionCaps | None = None,
         fail_create_for: set[str] | None = None,
         fail_send_for: set[str] | None = None,
+        accepts_initial_input: bool = False,
     ) -> None:
         self.sessions: dict[str, FakeSession] = {}
         self.created: list[dict[str, Any]] = []
         self.disposed: list[str] = []
         self.terminated: list[tuple[str, str]] = []
+        #: True 表示该 harness 只在建会话时接受首轮输入（一次性 `-p` 形态）。
+        self.accepts_initial_input = accepts_initial_input
         self._seq = 0
         self._caps = caps or SessionCaps(
             resume_session=True, interrupt=True, compact=True, token_usage=True,
@@ -60,6 +63,8 @@ class FakeHarness:
     async def create_session(
         self, *, harness_id: str, attempt: Any, stage: Any, model_name: str,
         reasoning_effort: str | None, system_prompt: str | None,
+        initial_input: str | None = None,
+        permission_mode: str | None = None,
         cwd: str | None = None, extra: dict | None = None,
     ) -> SessionHandle:
         self.created.append(
@@ -68,6 +73,8 @@ class FakeHarness:
                 "model_name": model_name,
                 "reasoning_effort": reasoning_effort,
                 "system_prompt": system_prompt,
+                "initial_input": initial_input,
+                "permission_mode": permission_mode,
                 "stage_id": stage.stage_id,
                 "node_id": stage.node_id,
             }
@@ -81,7 +88,13 @@ class FakeHarness:
 
         self._seq += 1
         ref = f"sess-{self._seq}"
-        self.sessions[ref] = FakeSession(session_ref=ref, harness_id=harness_id)
+        #: ``accepts_initial_input`` 模拟一次性 `-p` 型 harness：首轮输入随建会话交付，
+        #: 之后不再需要 send_input。设成 False 就是「交互式」形态。
+        accepted = bool(initial_input) and self.accepts_initial_input
+        session = FakeSession(session_ref=ref, harness_id=harness_id)
+        if accepted and initial_input:
+            session.inputs.append(initial_input)
+        self.sessions[ref] = session
         return SessionHandle(
             session_ref=ref,
             harness_id=harness_id,
@@ -89,6 +102,7 @@ class FakeHarness:
             persist_locator=ref,
             pid=None,
             model_name=model_name,
+            accepted_initial_input=accepted,
         )
 
     async def resume_session(

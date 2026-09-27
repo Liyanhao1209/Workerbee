@@ -48,6 +48,15 @@ class SessionCaps:
     checkpoint_resume: bool = False
     token_usage: bool = False
     reasoning_efforts: list[str] = field(default_factory=list)
+    permission_modes: list[str] = field(default_factory=list)
+    """该 harness 支持的权限模式取值。"""
+
+    non_interactive_modes: list[str] = field(default_factory=list)
+    """其中不会向用户请求授权的模式。
+
+    与 ``permission_hook=False`` 配对使用：没有钩子时框架拦不住审批，
+    因此只有用户显式选定的模式落在这里，执行才被允许（HUM-03）。
+    """
 
     def pause_support(self) -> str:
         """D-07 的四档之一：in_place / checkpoint / restart / none。"""
@@ -80,6 +89,13 @@ class SessionHandle:
     used_resume: bool = False
     """本次是复用原 session 还是新开 session——两条路径都必须在历史中留痕（§8.2）。"""
 
+    accepted_initial_input: bool = False
+    """首轮输入是否已在建会话时交付。
+
+    为 True 时内核**不得**再用 ``send_input`` 投递同一个输入，否则同一条指令会被
+    执行两次——对会改文件的 agent 来说那是数据损坏，不是小毛病。
+    """
+
     detail: str | None = None
 
     def is_alive(self) -> bool:
@@ -98,9 +114,19 @@ class HarnessPort(Protocol):
         model_name: str,
         reasoning_effort: str | None,
         system_prompt: str | None,
+        initial_input: str | None = None,
+        permission_mode: str | None = None,
         cwd: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> SessionHandle: ...
+    """建会话。
+
+    ``initial_input`` 是本次阶段要交给 agent 的首轮输入（即 ContextPackage 的
+    用户侧内容）。**必须支持在建会话时给出**：相当一部分 harness 的无头模式是
+    「一次性执行一条 prompt 然后退出」（如 ``claude -p``），它们没有「先建空会话
+    再注入」这种形态。若适配器确实支持运行中注入（``interact=True``），
+    内核在首轮之后还会继续用 ``send_input`` 投递 BTW 等消息。
+    """
 
     async def resume_session(
         self, *, harness_id: str, persist_locator: str, attempt: Attempt, stage: TaskStage

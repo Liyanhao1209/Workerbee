@@ -297,12 +297,27 @@ class Engine:
         from .data.llm import LLMRouter
 
         backends: list[Any] = []
-        try:
-            from .data.llm import HarnessCLIBackend
+        # 默认后端走本机已登录的 harness CLI：零额外配置。
+        # 挑一个**实际存在**的，而不是假定名为 claude——
+        # 在没有 claude 的机器上，假定会导致「摘要器不可用」这种本可避免的降级。
+        import shutil as _shutil
 
-            backends.append(HarnessCLIBackend(harness=self.config.llm_model))
-        except Exception as exc:  # noqa: BLE001
-            self.startup_notes.append(f"本机 harness CLI 后端不可用：{exc}")
+        chosen = next(
+            (c for c in ("claude", "kimi") if _shutil.which(c) is not None), None
+        )
+        if chosen is None:
+            self.startup_notes.append(
+                "本机既没有 claude 也没有 kimi，无法使用 CLI 后端做摘要／AI 建图"
+            )
+        else:
+            try:
+                from .data.llm import HarnessCLIBackend
+
+                backends.append(
+                    HarnessCLIBackend(harness=chosen, model=self.config.llm_model)
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.startup_notes.append(f"本机 harness CLI 后端不可用：{exc}")
 
         if self.config.llm_base_url and self.config.llm_api_key_locator:
             key = await self._load_secret_value(self.config.llm_api_key_locator)

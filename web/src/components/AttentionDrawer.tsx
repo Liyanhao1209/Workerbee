@@ -138,10 +138,32 @@ export function AttentionDrawer({ onClose }: { onClose: () => void }): JSX.Eleme
           <div className="empty text-sm">台账中没有待处理的资源。</div>
         ) : (
           <ul className="list-reset">
+            {/* 台账字段由 `ResourceLedger.teardown_failed()` 固定：
+                resource_id / kind / state / last_error / owner_task_id。 */}
             {state.unresolvedResources.map((res, i) => (
-              <li key={i} className="text-xs mono" style={{ padding: '4px 0' }}>
-                {String(res['kind'] ?? '未知类型')} · {String(res['state'] ?? '未知状态')} ·{' '}
-                {String(res['resource_id'] ?? '').slice(0, 8)}
+              <li key={String(res['resource_id'] ?? i)} style={{ padding: '4px 0' }}>
+                <div className="text-xs">
+                  <span className="mono">{String(res['kind'] ?? '未知类型')}</span>
+                  {' · '}
+                  <span className="mono">{String(res['state'] ?? '未知状态')}</span>
+                  {' · '}
+                  <span className="mono dim" title={String(res['resource_id'] ?? '')}>
+                    {String(res['resource_id'] ?? '').slice(0, 8) || '无 id'}
+                  </span>
+                  {typeof res['owner_task_id'] === 'string' && res['owner_task_id'] ? (
+                    <>
+                      {' · 归属 '}
+                      <a href={`#/tasks/${res['owner_task_id']}`} className="mono">
+                        {res['owner_task_id'].slice(0, 8)}
+                      </a>
+                    </>
+                  ) : (
+                    <span className="dim"> · 无归属任务</span>
+                  )}
+                </div>
+                {typeof res['last_error'] === 'string' && res['last_error'] ? (
+                  <div className="text-xs text-warn">上次失败原因：{res['last_error']}</div>
+                ) : null}
               </li>
             ))}
           </ul>

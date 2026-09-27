@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 from ..app import Engine, EngineConfig
+from ..security.secret_store import SecretStore
 from .app import create_app
 from .auth import TokenAuth
 
@@ -51,6 +52,17 @@ def build_parser() -> argparse.ArgumentParser:
         "而不是静默匿名运行",
     )
     p.add_argument("--poll-interval", type=float, default=1.0, help="调度轮询间隔（秒）")
+    p.add_argument(
+        "--use-supervisor",
+        action="store_true",
+        help="把 harness 子进程交给独立的 workerbee-supervisor 进程托管（生产建议开启）："
+        "core 重启不打断在跑的会话。默认关闭，便于单进程开发",
+    )
+    p.add_argument(
+        "--supervisor-socket",
+        default=None,
+        help="supervisor 的 Unix socket 路径，默认 <data-dir>/supervisor.sock",
+    )
     p.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     p.add_argument(
         "--no-reconcile",
@@ -58,6 +70,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="启动时不与既有状态对账（仅在明确知道残留会话可忽略时使用）",
     )
     return p
+
+
+async def _bind_secrets_for_redaction(engine: Engine) -> int:
+    """把凭据库里的全部密值登记进脱敏器，返回登记条数。
+
+    组合根在解锁时**应当**已经做过这件事；这里再登记一次是幂等的，目的是让
+    「凭据不进事件历史与产物」（AUTH-02）这条保证不依赖于上游那一步有没有做到。
+    登记的对象沿用内核自己的脱敏器实例，产物侧的守卫因此同样受益。
+    """
+    redactor = getattr(engine, "_redactor", None)
+    store = engine.secret_store
+    if redactor is None or store is None or not hasattr(redactor, "bind_store"):
+        return 0
+    return int(await redactor.bind_store(store))
 
 
 def _request_shutdown(server: object) -> None:
@@ -96,19 +122,41 @@ async def run(args: argparse.Namespace) -> int:
         workspace_dir=Path(args.workspace_dir) if args.workspace_dir else None,
         passphrase=args.passphrase,
         poll_interval=args.poll_interval,
+        use_supervisor=args.use_supervisor,
+        supervisor_socket=Path(args.supervisor_socket) if args.supervisor_socket else None,
     )
 
     engine = await Engine.create(config)
     if args.passphrase:
+        # 首次启动还没有库文件：显式建一个空库，而不是让「文件不存在」以异常形态冒出来
+        vault = data_dir / "secrets.vault"
+        if not vault.exists():
+            await SecretStore.create(args.passphrase, vault)
+            print(f"[security] 已新建空的凭据库：{vault}")
+
         # 口令错等失败如实上抛——带着未解锁的凭据库继续跑会让节点在派发时才失败
-        unlocked = await engine.unlock_secrets(args.passphrase)
-        print(f"[security] 凭据库已解锁，登记 {unlocked} 条密值用于脱敏")
+        await engine.unlock_secrets(args.passphrase)
+        registered = await _bind_secrets_for_redaction(engine)
+        locators = await engine.secret_store.list_locators()
+        print(
+            f"[security] 凭据库已解锁：{len(locators)} 条引用，"
+            f"{registered} 条密值已登记用于脱敏"
+        )
     else:
         engine.startup_notes.append(
             "未提供 --passphrase：本次不加载凭据库，引用凭据的节点会在派发时明确报错"
         )
 
     await engine.start(reconcile=not args.no_reconcile)
+
+    # 会话托管方式决定「core 重启会不会打断在跑的任务」，值得在启动时说清楚（§3）
+    if args.use_supervisor:
+        print("[session] 会话由 supervisor 托管：core 重启不打断在跑的会话")
+    else:
+        print(
+            "[session] 会话由 core 自身托管：core 重启会打断在跑的任务；"
+            "生产部署请加 --use-supervisor"
+        )
     for note in engine.startup_notes:
         print(f"[startup] {note}")
 

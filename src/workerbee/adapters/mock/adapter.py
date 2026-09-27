@@ -121,6 +121,14 @@ class MockScript(BaseModel):
     steps: list[dict[str, Any]] = Field(default_factory=list)
     on_input: list[dict[str, Any]] = Field(default_factory=list)
 
+    accepted_initial_input: bool | None = None
+    """``session.create`` 回包里如实报告的 accepted_initial_input。
+
+    None = 按剧本实际情形推断：本次请求带了本轮输入（extra.prompt）→ True，
+    没带 → False。显式给 True/False 可以把两种情形都测到——内核据这个字段
+    决定要不要再投一次输入，猜错的两个方向都有代价（见 SessionHandle 的说明）。
+    """
+
 
 def load_script_from_env(env: dict[str, str] | None = None) -> MockScript:
     """从环境变量装载剧本；两者皆无则得到一份空剧本（会话起来后什么都不做）。"""
@@ -309,7 +317,27 @@ class MockAdapter(AdapterBase):
             },
         )
         await self._start_script(session, self.script.steps, start_index=0)
-        return {"session": session.to_info().model_dump(mode="json"), "created": True}
+        return {
+            "session": session.to_info().model_dump(mode="json"),
+            "accepted_initial_input": self._accepted_initial_input(request, extras),
+            "created": True,
+        }
+
+    def _accepted_initial_input(self, request: CreateSessionRequest, extras: dict) -> bool:
+        """本次建会话是否已交付首轮输入：剧本说了算，没说就按请求里有没有 prompt 推断。"""
+        if self.script.accepted_initial_input is not None:
+            return bool(self.script.accepted_initial_input)
+        prompt = None
+        for key in ("prompt", "input", "user_input"):
+            if extras.get(key) is not None:
+                prompt = extras[key]
+                break
+        if prompt is None:
+            for key in ("prompt", "input", "user_input"):
+                if (request.extra or {}).get(key) is not None:
+                    prompt = request.extra[key]
+                    break
+        return prompt is not None
 
     async def on_session_resume(self, params: dict) -> dict:
         request, extras = _parse_request(params)
@@ -339,7 +367,11 @@ class MockAdapter(AdapterBase):
         )
         # 从 checkpoint 恢复：续跑未完成的步骤，而不是从头发一遍。
         await self._start_script(session, self.script.steps, start_index=start_index)
-        return {"session": session.to_info().model_dump(mode="json"), "resumed": True}
+        return {
+            "session": session.to_info().model_dump(mode="json"),
+            "accepted_initial_input": self._accepted_initial_input(request, extras),
+            "resumed": True,
+        }
 
     async def on_session_list(self, params: dict) -> dict:
         infos = [s.to_info().model_dump(mode="json") for s in self._sessions.values()]
@@ -933,6 +965,10 @@ def _build_manifest(overrides: dict | None) -> AdapterManifest:
             checkpoint_resume=True,
             keep_checkpoint_on_stop=True,
             reasoning_efforts=["low", "medium", "high"],
+            # 权限模式：给一组「不询问 / 会询问 / 不受支持」都齐全的取值，
+            # 供校验管线的两种分支测试（脚本还能用 manifest 覆盖改掉它）。
+            permission_modes=["default", "auto", "manual"],
+            non_interactive_modes=["default", "auto"],
             models=["mock-model"],
             auth_modes=["native_login"],
             token_usage=True,

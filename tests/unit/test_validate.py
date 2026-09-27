@@ -284,13 +284,20 @@ def test_compact_threshold_with_capability_passes():
 
 
 def test_permission_hook_unsupported_rejected():
-    """HUM-03：不支持权限钩子的适配器不得声称支持非自动权限模式。"""
+    """HUM-03：没有权限钩子时，未显式指定权限模式必须被拒。
+
+    这里只钉「未指定 → 拒绝」这一种；三种分档（未指定 / 会询问 / 不询问）
+    的完整结论在 ``tests/unit/test_permission_mode.py``。规则的原意不是
+    「没有钩子就一律拒绝」——那会让 claude、kimi 这两个唯一可用的本地
+    harness 全都被框架自己否掉。
+    """
     g = GraphSpec(nodes=[node("A")], edges=[])
     report = validate(
         g, registry_with(harness_capabilities={"h1": {"permission_hook": False}})
     )
     assert not report.ok()
-    assert report.has_code("capability_missing")
+    assert report.has_code("permission_mode_unset")
+    assert not report.has_code("capability_missing")
 
 
 def test_unsupported_reasoning_effort_rejected():

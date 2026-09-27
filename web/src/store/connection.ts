@@ -8,8 +8,8 @@
 
 import { create } from 'zustand';
 import { ApiError, pingHealth, readToken, writeToken } from '../api/client';
-import type { WsPush, WsStatus } from '../api/types';
-import { KernelSocket } from '../api/ws';
+import type { WsPush } from '../api/types';
+import { KernelSocket, type WsStatus } from '../api/ws';
 
 export type KernelState = 'unknown' | 'checking' | 'ok' | 'unreachable' | 'unauthorized';
 
@@ -42,6 +42,24 @@ const pushListeners = new Set<PushListener>();
 export function onKernelPush(listener: PushListener): () => void {
   pushListeners.add(listener);
   return () => pushListeners.delete(listener);
+}
+
+/** 重连成功（含首次连上）后的订阅者：断连期间的变化必须靠 REST 重新拉，而不是等推送。 */
+const reconnectListeners = new Set<() => void>();
+
+export function onKernelReconnect(listener: () => void): () => void {
+  reconnectListeners.add(listener);
+  return () => reconnectListeners.delete(listener);
+}
+
+function fireReconnect(): void {
+  for (const listener of reconnectListeners) {
+    try {
+      listener();
+    } catch {
+      /* 单个订阅者出错不影响其他订阅者 */
+    }
+  }
 }
 
 export const useConnection = create<ConnectionStore>((set, get) => ({
@@ -90,7 +108,15 @@ function ensureSocket(): void {
   if (socket) return;
   socket = new KernelSocket({
     watermark: () => useConnection.getState().watermark,
-    onStatus: (status, detail) => useConnection.setState({ ws: status, wsDetail: detail ?? null }),
+    onStatus: (status, detail) => {
+      const previous = useConnection.getState().ws;
+      useConnection.setState({ ws: status, wsDetail: detail ?? null });
+      // 每次进入 open（首次连上或重连成功）都让订阅者重新对账：
+      // 断连期间审批、任务状态可能已经变了，徽标不能停在旧数字上。
+      if (status === 'open' && previous !== 'open') fireReconnect();
+    },
+    onEvent: (eventId) => useConnection.getState().bumpWatermark(eventId),
+    onResume: (info) => useConnection.getState().noteResume(info.returned),
     onPush: (push) => {
       useConnection.setState({ lastPushAt: Date.now() });
       for (const listener of pushListeners) {

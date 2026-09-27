@@ -261,6 +261,115 @@ export const CAPABILITY_LABELS: Record<string, string> = {
   compact: '上下文整理',
   permission_hook: '审批钩子',
   background_tasks: '后台工作',
+  pause_in_place: '原地暂停',
+  checkpoint_resume: '断点续跑',
+  keep_checkpoint_on_stop: '停止后保留断点',
+  token_usage: '上报用量',
+  structured_output: '结构化输出',
+  reasoning_efforts: '可用 effort',
+  models: '已知模型',
+  auth_modes: '认证方式',
+};
+
+/**
+ * 事件类型中文名（`workerbee/data/event_log.py` 的 `EventType`）。
+ * 未列出的类型**原样显示英文**，不猜含义。
+ */
+export const EVENT_TYPE_LABELS: Record<string, string> = {
+  'workflow.created': '流程已创建',
+  'workflow.updated': '流程已更新',
+  'workflow.deleted': '流程已删除',
+  'revision.saved': '修订已保存',
+  'revision.published': '修订已发布',
+  'node.activation_requested': '节点启停已请求',
+  'node.activation_applied': '节点启停已生效',
+  'validation.failed': '校验未通过',
+  'task.submitted': '任务已提交',
+  'task.state_changed': '任务状态变化',
+  'task.control': '任务控制操作',
+  'task.completed': '任务结束',
+  'stage.state_changed': '阶段状态变化',
+  'stage.dispatched': '阶段已派发',
+  'stage.retry': '阶段退避重试',
+  'stage.candidate_switched': '阶段切换执行候选',
+  'stage.reordered': '阶段调序',
+  'stage.contract_violation': '输出契约违反',
+  'attempt.started': '尝试开始',
+  'attempt.ended': '尝试结束',
+  'attempt.compact': '上下文整理',
+  'attempt.usage': '用量记录',
+  'attempt.discarded_late': '迟到回调已丢弃',
+  'context.assembled': '上下文已组装',
+  'handoff.failed': '交接失败',
+  'data.ready': '数据已就绪',
+  'feedback.raised': '反馈已提出',
+  'session.created': '会话已创建',
+  'session.resumed': '会话已恢复',
+  'session.ended': '会话已结束',
+  'session.lost': '会话失联',
+  'resource.registered': '资源已登记',
+  'resource.closed': '资源已关闭',
+  'resource.teardown_failed': '资源清理失败',
+  'resource.orphaned': '资源归属不明',
+  'reaper.run': '清理器运行',
+  'approval.requested': '审批已发起',
+  'approval.decided': '审批已决定',
+  'approval.invalidated': '审批已作废',
+  'approval.undeliverable': '审批回注失败',
+  'ai.draft_proposed': 'AI 草案已提出',
+  'ai.draft_accepted': 'AI 草案已接受',
+  'secret.bound': '凭据已绑定',
+  'secret.revoked': '凭据已撤销',
+  'reconcile.started': '开始对账',
+  'reconcile.result': '对账结论',
+  'resume.requested': '已请求恢复',
+  'system.start': '系统启动',
+  'system.stop': '系统停止',
+  'storage.pruned': '存储已清理',
+};
+
+/** 事件作用域。 */
+export const EVENT_SCOPE_LABELS: Record<string, string> = {
+  workflow: '流程',
+  task: '任务',
+  stage: '阶段',
+  attempt: '尝试',
+  session: '会话',
+  resource: '资源',
+  approval: '审批',
+  system: '系统',
+};
+
+/** 事件发起者。 */
+export const EVENT_ACTOR_LABELS: Record<string, string> = {
+  user: '用户',
+  system: '系统',
+  adapter: '适配器',
+  ai: 'AI',
+};
+
+/**
+ * 会话台账状态（`session_handle.state`）。
+ *
+ * 这是台账里的自由文本列，不是类型化枚举；这里只收录代码里实际出现过的取值
+ * （supervisor 与适配器写入 alive / lost / disposed / ended）。
+ * **未列出的取值原样显示英文**——看到一个不认识的会话状态时，用户需要的是原文，
+ * 而不是一个猜出来的中文词。
+ */
+export const SESSION_STATE_LABELS: Record<string, { text: string; tone: Tone }> = {
+  alive: { text: '存活', tone: 'success' },
+  lost: { text: '已失联', tone: 'danger' },
+  disposed: { text: '已释放', tone: 'idle' },
+  ended: { text: '已结束', tone: 'idle' },
+};
+
+/** ContextPackage 五个固定分区（§7.3）。顺序与组装器一致。 */
+export const PARTITION_LABELS: Record<string, string> = {
+  P1: '角色与任务',
+  P2: '输入与上游材料',
+  P3: '输出要求',
+  P4: '工具与权限',
+  P5: '运行保留',
 };
 
 /** 生命周期操作来源的中文名。 */

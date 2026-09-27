@@ -9,7 +9,7 @@ import { create } from 'zustand';
 import type { Approval, Task, TaskStage } from '../api/types';
 import { system } from '../api/endpoints';
 import { ApiError } from '../api/client';
-import { onKernelPush } from './connection';
+import { onKernelPush, onKernelReconnect } from './connection';
 
 interface AttentionStore {
   approvals: Approval[];
@@ -75,12 +75,16 @@ export function attentionCount(state: {
 
 let wired = false;
 
-/** 订阅推送：审批出现时刷新徽标；重连成功后补齐（AC-12）。 */
+/** 订阅推送：审批出现时刷新徽标；重连成功后重新对账（AC-12）。 */
 export function wireAttention(): void {
   if (wired) return;
   wired = true;
   onKernelPush((push) => {
     if (push.kind === 'attention') void useAttention.getState().refresh();
+  });
+  // 断连期间出现的审批不会有推送补给我们（推送是尽力而为的），重连后必须重拉一次。
+  onKernelReconnect(() => {
+    void useAttention.getState().refresh();
   });
   void useAttention.getState().refresh();
 }

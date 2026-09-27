@@ -95,6 +95,18 @@ class AdapterCapabilities(_Model):
     """该 harness 实际支持的 effort 取值。空列表表示此维度不适用。
     CFG-02：用户填了不受支持的取值必须提示，不能静默忽略。"""
 
+    permission_modes: list[str] = Field(default_factory=list)
+    """该 harness 支持的权限模式取值。空列表表示该维度不适用。"""
+
+    non_interactive_modes: list[str] = Field(default_factory=list)
+    """其中**不会向用户请求授权**的模式。
+
+    与 `permission_hook=False` 配对使用：没有钩子时框架拦不住审批，
+    因此只有当用户选定的模式落在这一组里，执行才被允许（HUM-03）。
+    空列表意味着「无法保证任何模式不询问」——此时没有钩子的 harness
+    不应被用于无人值守的执行。
+    """
+
     models: list[str] = Field(default_factory=list)
     """已知可用的模型名。空表示不限定（由用户自行填写）。"""
 

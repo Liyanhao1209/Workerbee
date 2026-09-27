@@ -70,6 +70,8 @@ __all__ = [
     "EventPage",
     "AttentionResponse",
     "StorageReportResponse",
+    "SessionRecord",
+    "SessionListResponse",
     "PruneRequest",
     "PruneAction",
     "PruneResponse",
@@ -347,6 +349,14 @@ class SystemStatusResponse(ApiResponse):
     scheduler: SchedulerStats
     reaper: ReaperStats
     counts: CountsResponse
+    session_hosting: str = "in_process"
+    """会话托管方式：``supervisor``（独立进程托管，core 重启不打断在跑的任务）
+    或 ``in_process``（子进程由 core 自己持有，core 重启即失去它们）。
+
+    **必须与 ``supervisor_connected`` 一起看**：前者是配置的托管方式，
+    后者才说明它此刻是否真的立起来了。
+    """
+    supervisor_connected: bool = False
     notifier_subscribers: int = 0
     notifier_dropped: int = 0
     """被丢弃的推送条数。>0 说明有客户端跟不上——它重连后靠 REST 拉真实状态。"""
@@ -371,6 +381,36 @@ class StorageReportResponse(ApiResponse):
     artifacts: dict[str, Any] = Field(default_factory=dict)
     unresolved_resources: int = 0
     last_run: dict[str, Any] | None = None
+
+
+class SessionRecord(ApiResponse):
+    """一条会话台账记录（REC-03）。
+
+    字段与 supervisor 的 ``session_ledger``、内核的 ``session_handle`` 同源——
+    排障时最要紧的问题是「我的任务还连着哪个会话、它还活着吗」。
+    """
+
+    session_ref: str
+    harness_id: str
+    owner_task_id: str | None = None
+    owner_stage_id: str | None = None
+    owner_attempt_id: str | None = None
+    state: str = "unknown"
+    created_at: str | None = None
+    last_heartbeat: str | None = None
+
+
+class SessionListResponse(ApiResponse):
+    """会话台账视图。**如实反映当前部署形态**，不伪造。"""
+
+    sessions: list[SessionRecord] = Field(default_factory=list)
+    returned: int = 0
+    source: str = "none"
+    """台账来源：``supervisor``（独立进程持有会话）或 ``session_handle``（内核本地表）。"""
+    reachable: bool = True
+    """来源此刻是否真的可读。**为 False 时空列表不能读成「没有会话」**——
+    它表示「问不到」，与「确实没有」是两件事。"""
+    note: str | None = None
 
 
 class PruneRequest(ApiRequest):

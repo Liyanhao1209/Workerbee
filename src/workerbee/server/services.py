@@ -23,6 +23,7 @@ from typing import Any, Iterable, Sequence
 
 from ..app import Engine
 from ..core.domain import (
+    ApprovalStatus,
     CredentialRef,
     HarnessRegistration,
     InstantiationReport,
@@ -230,8 +231,9 @@ class SystemService(_Service):
             workflows=len(await store.workflows.list()),
         )
 
+        hosting, connected = _session_hosting(engine)
         reaper = engine.reaper
-        last = reaper.last_report() if reaper is not None else None
+        last = reaper.last_report if reaper is not None else None
         storage = S.StorageReportResponse.model_validate(await engine.storage_report())
 
         return S.SystemStatusResponse(
@@ -253,6 +255,8 @@ class SystemService(_Service):
                 last_run=last.model_dump(mode="json") if last is not None else None,
             ),
             counts=counts,
+            session_hosting=hosting,
+            supervisor_connected=connected,
             notifier_subscribers=engine.notifier.subscriber_count,
             notifier_dropped=engine.notifier.dropped,
             latest_event_id=await store.events.latest_id(),
@@ -280,6 +284,61 @@ class SystemService(_Service):
 
     async def storage(self) -> S.StorageReportResponse:
         return S.StorageReportResponse.model_validate(await self.engine.storage_report())
+
+    async def sessions(self) -> S.SessionListResponse:
+        """会话台账（REC-03）。
+
+        按部署形态取数据，且**如实反映取到了没有**：
+
+        - ``supervisor`` 托管：会话的持有者是 supervisor，向它要（``session.list``）。
+          问不到时返回 ``reachable=False`` 与一句说明，而不是空列表——空列表会被
+          读成「没有会话」，而事实是「不知道」（这两件事在本项目里必须分开）。
+        - ``in_process``：读内核本地的 ``session_handle`` 表。该表在 in-process 模式下
+          内核并不单独维护（会话就是进程里的对象），查不到时要说明这一点。
+        """
+        hosting, connected = _session_hosting(self.engine)
+        if hosting == "supervisor":
+            client = self.engine.harness
+            if not connected or not hasattr(client, "list_sessions"):
+                return S.SessionListResponse(
+                    source="supervisor",
+                    reachable=False,
+                    note="会话由 supervisor 托管，但此刻未连上它：查不到会话台账。"
+                    "这不等于「没有会话」——supervisor 起来后重新查询即可",
+                )
+            try:
+                rows = await client.list_sessions()
+            except Exception as exc:  # noqa: BLE001 - 查不到就如实说查不到
+                return S.SessionListResponse(
+                    source="supervisor",
+                    reachable=False,
+                    note=f"向 supervisor 查询会话失败（{type(exc).__name__}）：{exc}",
+                )
+            sessions = [_session_record(r) for r in rows]
+            return S.SessionListResponse(
+                sessions=sessions,
+                returned=len(sessions),
+                source="supervisor",
+                reachable=True,
+            )
+
+        rows = await self.store.db.fetch_all(
+            "SELECT * FROM session_handle ORDER BY created_at"
+        )
+        sessions = [_session_record(dict(r)) for r in rows]
+        note = None
+        if not sessions:
+            note = (
+                "in_process 模式下内核不单独维护会话台账；"
+                "会话生命周期与内核进程绑定"
+            )
+        return S.SessionListResponse(
+            sessions=sessions,
+            returned=len(sessions),
+            source="session_handle",
+            reachable=True,
+            note=note,
+        )
 
     # ---- 手动清理（RES-03） ----
 
@@ -1065,11 +1124,19 @@ class ApprovalService(_Service):
             )
         except KeyError as exc:
             raise NotFound(f"审批不存在: {approval_id}") from exc
+
+        # 决定已产生但没送达时，库里存的是 undeliverable；返回的 status 必须与之一致，
+        # 否则前端会以为这条已经不欠处理，而它其实还挂在「需处理」列表里（HUM-04）。
+        stored = await self.store.approvals.get(approval_id)
+        status = stored.status if stored is not None else result.status
+        detail = result.detail
+        if not result.delivered and status == ApprovalStatus.UNDELIVERABLE:
+            detail = detail or "决定已记录，但未送达原会话；该审批已标记为 undeliverable，可重试回注"
         return S.DeliveryResponse(
             approval_id=approval_id,
             delivered=result.delivered,
-            status=result.status.value,
-            detail=result.detail,
+            status=status.value,
+            detail=detail,
         )
 
     async def retry_delivery(self, approval_id: str) -> S.DeliveryResponse:
@@ -1113,6 +1180,55 @@ class Services:
 
 def _iso(value: Any) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _session_hosting(engine: Engine) -> tuple[str, bool]:
+    """会话托管方式与 supervisor 连接状态（§3 的核心承诺要能被看见）。
+
+    ``session_hosting`` 是**配置的运行方式**：``supervisor`` 表示 harness 子进程由
+    独立进程托管，core 重启不打断在跑的任务；``in_process`` 表示子进程由 core 自己
+    持有，core 一重启它们就没了。
+
+    ``supervisor_connected`` 才说明它此刻是否真的立起来了——请求了 supervisor 却
+    连不上时，配置说「能扛重启」而事实是不能，两个字段必须一起看（界面同理）。
+    """
+    if not engine.config.use_supervisor:
+        return "in_process", False
+    try:
+        from ..adapters.host.remote import SupervisorClient
+    except ImportError:  # pragma: no cover - 适配层缺失时的显式降级
+        return "supervisor", False
+    client = engine.harness
+    if isinstance(client, SupervisorClient):
+        return "supervisor", bool(client.connected)
+    return "supervisor", False
+
+
+def _session_record(row: Any) -> S.SessionRecord:
+    """把一行会话台账（supervisor 的 session_ledger 或本地 session_handle）映射成响应。
+
+    只取台账字段：多出来的列（``pid`` / ``generation`` / 能力快照）不进响应，
+    免得把内部记账细节当成对外契约。
+    """
+    data = _as_dict(row) or {}
+
+    def pick(*names: str) -> Any:
+        for name in names:
+            value = data.get(name)
+            if value is not None:
+                return value
+        return None
+
+    return S.SessionRecord(
+        session_ref=str(pick("session_ref") or ""),
+        harness_id=str(pick("harness_id") or ""),
+        owner_task_id=pick("owner_task_id"),
+        owner_stage_id=pick("owner_stage_id"),
+        owner_attempt_id=pick("owner_attempt_id"),
+        state=str(pick("state") or "unknown"),
+        created_at=pick("created_at"),
+        last_heartbeat=pick("last_heartbeat"),
+    )
 
 
 def _workflow_out(wf: WorkflowDefinition) -> S.WorkflowResponse:

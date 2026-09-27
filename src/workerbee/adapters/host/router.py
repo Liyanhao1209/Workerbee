@@ -42,16 +42,53 @@ JSON-RPC 的六组契约。两边对「一次会话」的想象并不完全一�
 ``auth_binding`` → ``CredentialRef`` → SecretStore 取出明文，**只**放进
 ``HarnessConfig.credential`` 随 ``session.create`` 传给子进程。本模块的任何日志、
 异常消息、事件 payload 都不含凭据值；需要指代时只用 locator。
+standalone 模式没有 core 的凭据注册表：绑定到凭据的 harness 在那里会明确失败，
+而不是悄悄用「本机登录态」顶上（那等于换了一份身份，AUTH-02 不允许猜）。
+
+独立进程（standalone）
+----------------------
+
+``supervisor`` 持有 harness 进程却**没有** core 的数据库，所以它要 ``store=None`` +
+``standalone=True``：注册信息改从构造参数 ``registrations``（``harness_id`` →
+``HarnessRegistration``）取。除了注册信息的来源，其余行为完全一致——同一个路由器、
+同一套会话定位表、同一套降级与存活判据。
+``standalone=False`` 却没给 ``store`` 会**当场抛错**：静默降级成 standalone 会让
+「注册表里查不到」这种事故伪装成「配置没问题」，是最难查的一类错。
+
+子进程环境（注入优先级）
+------------------------
+
+``{**os.environ, **adapter_env, **registration.env_template}``——系统环境打底（PATH、
+HOME 等必须留着），``adapter_env`` 是组合根的全局注入（supervisor 用它给 mock 适配器
+下发剧本文件路径），注册表里的显式配置优先级最高。
+
+建会话时的四处翻译（``create_session``）
+---------------------------------------
+
+======================  ==========================================================
+``HarnessPort`` 参数    适配器侧的位置
+======================  ==========================================================
+``initial_input``       ``CreateSessionRequest.extra["prompt"]``（claude/kimi/mock 都读它）
+``permission_mode``     ``CreateSessionRequest.permission_mode`` → ``--permission-mode`` 等
+``system_prompt``       ``CreateSessionRequest.system_prompt``
+``cwd``                 ``HarnessConfig.cwd``（未给时取注册表里的值）
+======================  ==========================================================
+
+``accepted_initial_input`` 的结论来自适配器回包；老适配器不带该字段时，只在
+「给了首轮输入」且「该适配器自述 ``interact=False``」时判 True，其余一律 False
+（不猜：猜 True 而实际没交付，阶段会永远等一个不会开始的任务）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
+import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from ...core.domain.registry import HarnessRegistration
+from ...core.domain.registry import AuthMode, HarnessRegistration
 from ...core.domain.task import Attempt, TaskStage
 from ...core.runtime.ports import InputKind, SessionCaps, SessionHandle
 from ..sdk.contract import (
@@ -74,6 +111,7 @@ __all__ = [
     "HarnessRouter",
     "BUILTIN_ADAPTERS",
     "ADAPTER_ALIASES",
+    "child_env",
     "EventCallback",
     "PermissionCallback",
     "ExitCallback",
@@ -81,8 +119,18 @@ __all__ = [
     "LogCallback",
 ]
 
-EventCallback = Callable[[str, str, dict[str, Any]], Awaitable[None]]
-"""``(session_ref, kind, payload)`` → 组合根转给 ``Scheduler.on_event``。"""
+EventCallback = Callable[..., Awaitable[None]]
+"""事件回调。两种形态都支持，按回调声明的参数个数分派：
+
+- ``(event: AdapterEvent)``——**原始事件**。``host/remote.py`` 的 ``EventCallback``、
+  ``app.py`` 与 ``supervisor/server.py`` 的回调都是这个形态，它们自己翻译字段；
+- ``(session_ref, kind, payload)``——**内核形态**，``payload`` 已按模块文档的翻译表
+  补好别名，可直接交给 ``Scheduler.on_event``。
+
+两种都留是因为两边的消费者都已经存在：只认一种就会让另一条路径静默收不到事件
+（「看起来在工作」的静默失败）。参数个数判不出来时（``*args``、内省失败）按
+**原始事件**处理——那是本项目里更保守的一种约定（不替调用方翻译字段）。
+"""
 
 PermissionCallback = Callable[[PermissionRequest], Awaitable[None]]
 ExitCallback = Callable[[str, int | None, str], Awaitable[None]]
@@ -121,6 +169,59 @@ def _normalize_adapter_id(adapter_id: str) -> str:
     return ADAPTER_ALIASES.get(key.replace("_", "-"), key.replace("-", "_"))
 
 
+def child_env(
+    adapter_env: dict[str, str] | None = None,
+    registration_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """合成适配器子进程的环境变量（优先级见模块文档）。
+
+    ``os.environ`` 打底 → ``adapter_env``（组合根全局注入）→ ``registration_env``
+    （注册表里针对这个 harness 的显式配置，优先级最高）。
+    """
+    return {**os.environ, **(adapter_env or {}), **(registration_env or {})}
+
+
+def _callback_shape(callback: Callable[..., Any] | None) -> str:
+    """``"raw"``（``(event)``）还是 ``"kernel"``（``(session_ref, kind, payload)``）。"""
+    if callback is None:
+        return "raw"
+    try:
+        params = list(inspect.signature(callback).parameters.values())
+    except (TypeError, ValueError):  # pragma: no cover - 内建/无法内省的可调用对象
+        return "raw"
+    positional = 0
+    for param in params:
+        if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+            positional += 1
+        elif param.kind is param.VAR_POSITIONAL:
+            # *args：判不出个数。按原始事件处理，不做猜测性的翻译。
+            return "raw"
+    return "kernel" if positional >= 3 else "raw"
+
+
+def _looks_like_credential(name: str, value: str | None) -> bool:
+    """环境变量名像凭据、值又是字面量（不是 ``$`` 占位符）时给出告警（AUTH-02）。"""
+    if not value or value.startswith("$"):
+        return False
+    return any(marker in name.upper() for marker in _SECRETISH_ENV_MARKERS)
+
+
+def _with_initial_input(
+    extra: dict[str, Any] | None, initial_input: str | None
+) -> dict[str, Any] | None:
+    """把首轮输入放进 ``extra["prompt"]``。
+
+    键名是**协议约定**：``extra_prompt()``（sdk/cli.py）与各适配器的 build_argv
+    都按 ``prompt | input | user_input`` 读取本轮输入，其中 claude 只认 prompt。
+    调用方显式给了同名键时以调用方为准（不覆盖），避免把上层精心准备的内容顶掉。
+    """
+    if initial_input is None:
+        return extra
+    merged = dict(extra or {})
+    merged.setdefault("prompt", initial_input)
+    return merged
+
+
 @dataclass
 class _SessionRecord:
     """路由器的会话定位表。状态以适配器回报为准，这里不做推断。"""
@@ -142,9 +243,11 @@ class HarnessRouter:
 
     def __init__(
         self,
-        store: Any,
+        store: Any | None,
         *,
         adapter_commands: dict[str, list[str]] | None = None,
+        registrations: dict[str, HarnessRegistration] | None = None,
+        adapter_env: dict[str, str] | None = None,
         secret_store: Any | None = None,
         on_event: EventCallback | None = None,
         on_permission: PermissionCallback | None = None,
@@ -154,16 +257,42 @@ class HarnessRouter:
         call_timeout: float = 60.0,
         alive_timeout: float = 5.0,
         close_grace: float = 5.0,
+        standalone: bool = False,
     ) -> None:
+        if store is None and not standalone:
+            # 静默把 store=None 当成 standalone，会让「注册表里查不到」伪装成
+            # 「配置没问题」——错在装配，就该在装配时报错。
+            raise ValueError(
+                "HarnessRouter 需要 store（core 的数据库）才能查 harness 注册信息；"
+                "独立进程（如 supervisor）请显式传 standalone=True，"
+                "并用 registrations 参数提供注册表"
+            )
         self.store = store
         """需要 ``store.registry.list_harnesses()`` / ``get_harness()`` /
-        ``get_credential()``。这里不 import 数据层，由组合根注入。"""
+        ``get_credential()``。这里不 import 数据层，由组合根注入。
+        ``None`` 只在 ``standalone=True`` 时合法。"""
+
+        self.standalone = standalone
+        # 保留传入的那个 dict 对象本身（而不是拷一份）：组合根会在后面往里加
+        # harness（supervisor 的 harness.ensure 就是这么做的），拷贝会让那些新增的
+        # 注册信息永远到不了这里。
+        self.registrations: dict[str, HarnessRegistration] = (
+            registrations if registrations is not None else {}
+        )
+        """standalone 模式下的 harness 注册表（``harness_id`` → 注册信息），
+        与 ``adapter_commands`` 并列：supervisor 把 core 带来的注册信息放在这里。
+        可以改（同一个 dict 对象被组合根持有），查找时按需读取。"""
+
+        self.adapter_env: dict[str, str] = dict(adapter_env or {})
+        """额外注入给**所有**适配器子进程的环境变量，优先级见模块文档。"""
 
         self.secret_store = secret_store
         """``await get(locator) -> dict | None``。None 表示本机登录态，不需要凭据。"""
 
         self._commands = {**BUILTIN_ADAPTERS, **(adapter_commands or {})}
         self._on_event = on_event
+        self._event_shape = _callback_shape(on_event)
+        """``on_event`` 要原始事件还是内核三元组——见 ``EventCallback``。"""
         self._on_permission = on_permission
         self._on_exit = on_exit
         self._on_session_ended = on_session_ended
@@ -182,6 +311,31 @@ class HarnessRouter:
         self._start_errors: dict[str, str] = {}
         self._stopped = False
 
+    @classmethod
+    async def create(
+        cls,
+        store: Any | None = None,
+        *,
+        standalone: bool = False,
+        registrations: dict[str, HarnessRegistration] | None = None,
+        adapter_env: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> "HarnessRouter":
+        """构造并启动。组合根统一走这个入口（签名与 ``HarnessPort`` 的装配对齐）。
+
+        ``store=None`` 只在 ``standalone=True`` 时合法；``standalone=False`` 且
+        ``store is None`` 会**明确抛错**，不会静默降级成 standalone。
+        """
+        router = cls(
+            store,
+            standalone=standalone,
+            registrations=registrations,
+            adapter_env=adapter_env,
+            **kwargs,
+        )
+        await router.start()
+        return router
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
@@ -194,7 +348,12 @@ class HarnessRouter:
         「一个坏适配器拖垮整机」比「一个坏适配器不可用」危险得多。
         """
         self._stopped = False
-        for reg in await self.store.registry.list_harnesses():
+        if self._on_event is not None:
+            self._emit_log(
+                f"[router] on_event 回调形态："
+                f"{'原始 AdapterEvent' if self._event_shape == 'raw' else '内核三元组 (session_ref, kind, payload)'}"
+            )
+        for reg in await self._registered_harnesses():
             self._registrations[reg.harness_id] = reg
             if not reg.enabled:
                 self._emit_log(f"[router] harness {reg.harness_id} 已停用，跳过启动")
@@ -207,6 +366,12 @@ class HarnessRouter:
                 self._emit_log(
                     f"[router] harness {reg.harness_id} 启动失败（该 harness 暂不可用）：{detail}"
                 )
+
+    async def _registered_harnesses(self) -> list[HarnessRegistration]:
+        """启动时该看的那份注册表：常规模式查 store，standalone 用显式映射。"""
+        if self.standalone:
+            return list(self.registrations.values())
+        return await self.store.registry.list_harnesses()
 
     async def stop(self) -> None:
         """关闭全部适配器子进程。
@@ -226,6 +391,133 @@ class HarnessRouter:
         self._sessions.clear()
         self._checkpoints.clear()
 
+    async def ensure_harness(
+        self,
+        harness_id: str,
+        *,
+        adapter_id: str | None = None,
+        exec_path: str | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> bool:
+        """按需拉起某个 harness 的适配器进程（幂等）。
+
+        返回值：``True`` = 这次调用**之前**它就已经在跑（幂等命中，什么都没做）；
+        ``False`` = 这次真的把进程拉起来了。两种都表示「现在可用」——
+        真的起不来会抛 ``HARNESS_UNAVAILABLE``，不用 ``False`` 冒充失败
+        （那会让调用方把「不可用」和「刚启动」混为一谈）。
+
+        显式传入的 ``adapter_id``/``exec_path``/``env``/``cwd`` 覆盖注册表里的同名字段：
+        core 通过 supervisor 的 ``harness.ensure`` 把注册信息带过来时走的就是这条路
+        （supervisor 不读 core 的库）。覆盖后的注册信息留在本进程内，
+        随后的 ``create_session`` 不必再查一次数据库。
+        """
+        proc = self._procs.get(harness_id)
+        if proc is not None and proc.alive:
+            return True
+
+        reg = await self._ensure_registration(
+            harness_id, adapter_id=adapter_id, exec_path=exec_path, env=env, cwd=cwd
+        )
+        try:
+            await self._ensure_process(harness_id)
+        except Exception as exc:  # noqa: BLE001 - 如实记下并让调用方看见
+            detail = f"{type(exc).__name__}: {exc}"
+            self._start_errors[harness_id] = detail
+            self._emit_log(f"[router] 按需拉起 harness {harness_id} 失败：{detail}")
+            raise
+        self._emit_log(f"[router] 按需拉起 harness {harness_id}（adapter={reg.adapter_id}）")
+        return False
+
+    async def _ensure_registration(
+        self,
+        harness_id: str,
+        *,
+        adapter_id: str | None,
+        exec_path: str | None,
+        env: dict[str, str] | None,
+        cwd: str | None,
+    ) -> HarnessRegistration:
+        """取（或按显式参数补出）注册信息，并叠加显式覆盖。"""
+        if not harness_id:
+            raise AdapterError(ErrorCode.HARNESS_UNAVAILABLE, "未指定 harness_id")
+        reg = await self._registration_or_none(harness_id)
+        if reg is None:
+            if not adapter_id:
+                raise AdapterError(
+                    ErrorCode.HARNESS_UNAVAILABLE,
+                    f"ensure_harness 拿不到 {harness_id} 的注册信息：注册表里没有它，"
+                    f"调用时也没带 adapter_id"
+                    + (
+                        "（standalone 模式的注册表由构造参数 registrations 提供）"
+                        if self.standalone
+                        else ""
+                    ),
+                    {"harness_id": harness_id},
+                )
+            reg = HarnessRegistration(
+                harness_id=harness_id,
+                name=harness_id,
+                adapter_id=adapter_id,
+                auth_mode=AuthMode.NATIVE_LOGIN,
+                enabled=True,
+            )
+        elif not reg.enabled:
+            raise AdapterError(
+                ErrorCode.HARNESS_UNAVAILABLE,
+                f"harness 已停用：{harness_id}",
+                {"harness_id": harness_id},
+            )
+
+        overrides: dict[str, Any] = {}
+        if adapter_id:
+            overrides["adapter_id"] = adapter_id
+        if exec_path is not None:
+            overrides["exec_path"] = exec_path
+        if env is not None:
+            overrides["env_template"] = dict(env)
+        if cwd is not None:
+            overrides["cwd"] = cwd
+        if overrides:
+            reg = reg.model_copy(update=overrides)
+        self._registrations[harness_id] = reg
+        return reg
+
+    @property
+    def harness_ids(self) -> list[str]:
+        """已经拉起适配器进程、且进程还活着的 harness（按 id 排序）。
+
+        只报活着的进程：进程死了就不再算「已启动」——把「以为还在跑」报给运维，
+        比报一个空的列表危险得多（LIFE-02）。
+        """
+        return sorted(hid for hid, proc in self._procs.items() if proc.alive)
+
+    async def stop_harness(self, harness_id: str) -> None:
+        """停掉一个 harness 的适配器进程，并把它名下的会话如实标成 lost。
+
+        与 ``stop()`` 的区别只在范围：这里只动一个 harness。与崩溃的区别在归因：
+        这是主动停机，所以**不**触发 ``on_exit``（REC-02：停机不是崩溃）；但那些会话
+        确实没有进程在替它们干活了，必须走 ``on_session_ended(ok=False)``，
+        否则内核会一直等一个永远不来的结束事件（LIFE-02）。
+        """
+        proc = self._procs.pop(harness_id, None)
+        if proc is None:
+            self._emit_log(f"[router] harness {harness_id} 没有在跑的适配器进程")
+        else:
+            try:
+                await proc.close(grace=self._close_grace)
+            except Exception as exc:  # noqa: BLE001
+                self._emit_log(
+                    f"[router] 关闭适配器 {harness_id} 时出错：{type(exc).__name__}: {exc}"
+                )
+            self._emit_log(f"[router] 已停止 harness {harness_id} 的适配器进程")
+
+        for ref, rec in list(self._sessions.items()):
+            if rec.harness_id == harness_id and rec.state not in _TERMINAL_STATES:
+                await self._mark_ended(
+                    ref, ok=False, detail=f"harness {harness_id} 的适配器已被主动停止"
+                )
+
     # ------------------------------------------------------------------
     # 2. 会话生命周期
     # ------------------------------------------------------------------
@@ -239,6 +531,8 @@ class HarnessRouter:
         model_name: str,
         reasoning_effort: str | None,
         system_prompt: str | None,
+        initial_input: str | None = None,
+        permission_mode: str | None = None,
         cwd: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> SessionHandle:
@@ -256,6 +550,8 @@ class HarnessRouter:
                 model_name=model_name,
                 reasoning_effort=reasoning_effort,
                 system_prompt=system_prompt,
+                initial_input=initial_input,
+                permission_mode=permission_mode,
                 cwd=cwd,
                 extra=extra,
             )
@@ -268,13 +564,19 @@ class HarnessRouter:
             model_name=model_name,
             reasoning_effort=reasoning_effort,
             system_prompt=system_prompt,
+            permission_mode=permission_mode,
             cwd=cwd,
             credential=credential,
-            extra=extra,
+            extra=_with_initial_input(extra, initial_input),
         )
         result = await self._call(proc, METHODS.SESSION_CREATE, self._session_params(request))
         return await self._adopt(
-            reg, result, used_resume=False, attempt_id=attempt.attempt_id
+            reg,
+            result,
+            used_resume=False,
+            attempt_id=attempt.attempt_id,
+            initial_input=initial_input,
+            proc=proc,
         )
 
     async def resume_session(
@@ -302,6 +604,8 @@ class HarnessRouter:
         model_name: str | None = None,
         reasoning_effort: str | None = None,
         system_prompt: str | None = None,
+        initial_input: str | None = None,
+        permission_mode: str | None = None,
         cwd: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> SessionHandle:
@@ -313,9 +617,10 @@ class HarnessRouter:
             model_name=model_name or "",
             reasoning_effort=reasoning_effort,
             system_prompt=system_prompt,
+            permission_mode=permission_mode,
             cwd=cwd,
             credential=credential,
-            extra=extra,
+            extra=_with_initial_input(extra, initial_input),
         )
 
         params = self._session_params(request)
@@ -332,7 +637,13 @@ class HarnessRouter:
             )
         result = await self._call(proc, METHODS.SESSION_RESUME, params)
         return await self._adopt(
-            reg, result, used_resume=True, attempt_id=attempt.attempt_id, cwd=request.harness.cwd
+            reg,
+            result,
+            used_resume=True,
+            attempt_id=attempt.attempt_id,
+            cwd=request.harness.cwd,
+            initial_input=initial_input,
+            proc=proc,
         )
 
     async def dispose(self, session_ref: str) -> None:
@@ -503,12 +814,28 @@ class HarnessRouter:
     # ------------------------------------------------------------------
 
     async def capabilities(self, harness_id: str) -> SessionCaps:
-        """映射适配器自述的能力。没有 manifest 时返回保守默认值。
+        """映射适配器自述的能力。
+
+        没起来就**按需拉起**再问：能力必须来自适配器自己的自述（HAR-02），
+        而「还没启动」不等于「不支持任何东西」——返回一份全 False 的默认值
+        会被校验管线当成「该 harness 未声明任何不询问的权限模式」，于是
+        claude / kimi 这类没有权限钩子的 harness 会永久不可用。拉不起来
+        （未注册、可执行文件缺失……）才退回保守默认值，并如实记一笔。
 
         保守默认值不是「猜一个」，而是「尚未验证的都不算数」（D-09、HAR-03）。
         """
         proc = self._procs.get(harness_id)
-        if proc is None or proc.manifest is None:
+        if proc is None or not proc.alive or proc.manifest is None:
+            try:
+                await self.ensure_harness(harness_id)
+            except AdapterError as exc:
+                self._emit_log(
+                    f"[router] 查询 {harness_id} 的能力前需要拉起适配器，但未能拉起："
+                    f"{exc.code}: {exc}；按「尚未验证」返回保守默认值"
+                )
+                return SessionCaps()
+            proc = self._procs.get(harness_id)
+        if proc is None or proc.manifest is None:  # pragma: no cover - 上面已兜住
             return SessionCaps()
         return SessionCaps.from_mapping(
             proc.manifest.capabilities.model_dump(mode="json")
@@ -558,10 +885,14 @@ class HarnessRouter:
         kind = str(event.kind)
 
         if kind == EventKind.SESSION_ENDED:
-            # 会话结束不走 on_event：内核要的是 session_ended 专用回调（RUN-06）。
+            # 会话结束先走专用回调：内核的完成判据（RUN-06）认的是它。
             await self._mark_ended(
                 session_ref or "", **self._ended_verdict(event.data or {})
             )
+            if session_ref and self._event_shape == "raw" and self._on_event is not None:
+                # 原始事件流的消费者（app.py、supervisor）自己从 data["ok"] 翻译结束语义，
+                # 不给它这一条，它就会永远等一个不来的结束事件。
+                await self._on_event(event)
             return
 
         if not session_ref:
@@ -576,7 +907,10 @@ class HarnessRouter:
 
         if self._on_event is None:
             return
-        await self._on_event(session_ref, kind, self._to_payload(event))
+        if self._event_shape == "raw":
+            await self._on_event(event)
+        else:
+            await self._on_event(session_ref, kind, self._to_payload(event))
 
     @staticmethod
     def _ended_verdict(data: dict[str, Any]) -> dict[str, Any]:
@@ -712,21 +1046,22 @@ class HarnessRouter:
 
     async def _spawn(self, reg: HarnessRegistration) -> AdapterProcess:
         command = self._adapter_command(reg.adapter_id, reg.harness_id)
-        env = dict(reg.env_template or {})
-        for name, value in env.items():
-            if value and not value.startswith("$") and any(
-                marker in name.upper() for marker in _SECRETISH_ENV_MARKERS
-            ):
-                # 与注册表的 ToolLaunch 校验同一条纪律（AUTH-02）：凭据走 credential_ref，
-                # 不写进环境变量模板。这里只告警不阻断——env_template 的治理归配置层。
-                self._emit_log(
-                    f"[router] harness {reg.harness_id} 的环境变量 {name} 看起来包含凭据，"
-                    f"建议改用 auth_binding 引用 Secret Store"
-                )
+        reg_env = dict(reg.env_template or {})
+        for source, values in (("adapter_env", self.adapter_env), ("env_template", reg_env)):
+            for name, value in values.items():
+                if _looks_like_credential(name, value):
+                    # 与注册表的 ToolLaunch 校验同一条纪律（AUTH-02）：凭据走 credential_ref，
+                    # 不写进环境变量。这里只告警不阻断——env_template 的治理归配置层。
+                    self._emit_log(
+                        f"[router] harness {reg.harness_id} 的环境变量 {name}"
+                        f"（来自 {source}）看起来包含凭据，"
+                        f"建议改用 auth_binding 引用 Secret Store"
+                    )
         try:
             proc = await AdapterProcess.start(
                 command,
-                env=env,
+                # 优先级：注册表显式配置 > adapter_env > 系统环境（见模块文档）
+                env=child_env(self.adapter_env, reg_env),
                 cwd=reg.cwd,
                 label=f"{reg.adapter_id}:{reg.harness_id}",
             )
@@ -761,14 +1096,29 @@ class HarnessRouter:
             )
         return list(command)
 
+    async def _registration_or_none(self, harness_id: str) -> HarnessRegistration | None:
+        """查注册信息。常规模式以 store 为准（配置改了要立刻生效），
+        standalone 模式没有 store，取显式注册表或本进程内补出的那份。"""
+        if self.store is not None:
+            reg = await self.store.registry.get_harness(harness_id)
+            if reg is not None:
+                return reg
+        return self._registrations.get(harness_id) or self.registrations.get(harness_id)
+
     async def _registration(self, harness_id: str) -> HarnessRegistration:
         if not harness_id:
             raise AdapterError(ErrorCode.HARNESS_UNAVAILABLE, "未指定 harness_id")
-        reg = await self.store.registry.get_harness(harness_id)
+        reg = await self._registration_or_none(harness_id)
         if reg is None:
+            hint = (
+                "（standalone 模式：注册表来自构造参数 registrations，"
+                "或先用 ensure_harness 把注册信息带进来）"
+                if self.standalone
+                else ""
+            )
             raise AdapterError(
                 ErrorCode.HARNESS_UNAVAILABLE,
-                f"harness 未登记：{harness_id}",
+                f"harness 未登记：{harness_id}{hint}",
                 {"harness_id": harness_id},
             )
         if not reg.enabled:
@@ -796,6 +1146,7 @@ class HarnessRouter:
         cwd: str | None,
         credential: dict[str, str] | None,
         extra: dict[str, Any] | None,
+        permission_mode: str | None = None,
     ) -> CreateSessionRequest:
         return CreateSessionRequest(
             harness=HarnessConfig(
@@ -811,6 +1162,7 @@ class HarnessRouter:
             model_name=model_name or "",
             reasoning_effort=reasoning_effort,
             system_prompt=system_prompt,
+            permission_mode=permission_mode,
             attempt_id=attempt.attempt_id,
             extra=dict(extra or {}),
         )
@@ -831,6 +1183,15 @@ class HarnessRouter:
         """
         if not reg.auth_binding:
             return None  # 依赖本机登录态
+        if self.store is None:
+            # standalone（supervisor）没有 core 的凭据注册表。明确失败，不要拿
+            # 「本机登录态」顶上——那等于换了一份身份（AUTH-02）。
+            raise AdapterError(
+                ErrorCode.HARNESS_UNAVAILABLE,
+                f"harness {reg.harness_id} 绑定了凭据引用 {reg.auth_binding}，"
+                f"但当前是 standalone 模式（没有 core 的凭据注册表），无法解析",
+                {"harness_id": reg.harness_id, "credential_id": reg.auth_binding},
+            )
         ref = await self.store.registry.get_credential(reg.auth_binding)
         if ref is None:
             raise AdapterError(
@@ -888,6 +1249,8 @@ class HarnessRouter:
         used_resume: bool,
         attempt_id: str | None,
         cwd: str | None = None,
+        initial_input: str | None = None,
+        proc: AdapterProcess | None = None,
     ) -> SessionHandle:
         """把适配器回报的 ``SessionInfo`` 映射成内核的 ``SessionHandle``。"""
         if not isinstance(result, dict) or not result.get("session"):
@@ -926,8 +1289,41 @@ class HarnessRouter:
             pid=info.pid,
             model_name=info.model_name or None,
             used_resume=used_resume,
+            accepted_initial_input=self._accepted_initial_input(
+                result, initial_input=initial_input, proc=proc
+            ),
             detail=info.transcript_path,
         )
+
+    def _accepted_initial_input(
+        self,
+        result: dict[str, Any],
+        *,
+        initial_input: str | None,
+        proc: AdapterProcess | None,
+    ) -> bool:
+        """首轮输入是否已随建会话交付：**如实**判定，不猜。
+
+        顺序（HAR-02 的同一条纪律——先说清楚依据，再给结论）：
+
+        1. 适配器回包里显式带了 ``accepted_initial_input`` → 用它。适配器是
+           唯一知道自己真的把输入写进去了没有的一方。
+        2. 没带（老适配器）→ 只在「本次确实给了首轮输入」且「该适配器自述
+           ``interact=False``」时才判 True：交互不支持的 harness 只有建会话
+           这一次机会，prompt 必然随 argv 给出。
+        3. 其余情况一律 False（保守）——False 的代价是内核会再投一次输入，
+           会被适配器以 NOT_SUPPORTED 拒绝并如实报错；True 猜错的代价是
+           内核以为已交付而实际没交付，阶段会永远等一个不会开始的任务。
+        """
+        reported = result.get("accepted_initial_input") if isinstance(result, dict) else None
+        if isinstance(reported, bool):
+            return reported
+        if initial_input is None:
+            return False
+        caps = proc.manifest.capabilities if (proc is not None and proc.manifest) else None
+        if caps is None:
+            return False
+        return not bool(caps.interact)
 
     def _proc_for(self, rec: _SessionRecord | None) -> AdapterProcess | None:
         if rec is None:

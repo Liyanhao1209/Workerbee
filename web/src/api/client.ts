@@ -117,7 +117,7 @@ function kindForStatus(status: number): ApiErrorKind {
   return 'http';
 }
 
-interface RequestOptions {
+export interface RequestOptions {
   method?: string;
   body?: unknown;
   /** 查询参数。值为 undefined / null 的键会被跳过。 */

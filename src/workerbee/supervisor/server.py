@@ -470,14 +470,21 @@ class Supervisor:
                 {"harness_id": harness_id},
             )
 
-        ok = await self.harness.ensure_harness(
+        # ``ensure_harness`` 的返回值是「之前就已拉起」而不是「成功与否」：
+        # 起不来会抛异常。这里把两个含义拆成两个 JSON 字段，避免调用方误读
+        # ——把「新拉起来了」当成失败会让 core 拒绝一次本来成功的派发。
+        already_running = await self.harness.ensure_harness(
             harness_id,
             adapter_id=registration.adapter_id,
             exec_path=registration.exec_path,
             env=dict(registration.env_template or {}),
             cwd=registration.cwd,
         )
-        return {"ok": ok, "harness_id": harness_id}
+        return {
+            "ok": True,
+            "harness_id": harness_id,
+            "already_running": bool(already_running),
+        }
 
     async def _m_harness_capabilities(self, params: dict) -> dict:
         caps = await self.harness.capabilities(params["harness_id"])
@@ -518,6 +525,8 @@ class Supervisor:
             model_name=params["model_name"],
             reasoning_effort=params.get("reasoning_effort"),
             system_prompt=params.get("system_prompt"),
+            initial_input=params.get("initial_input"),
+            permission_mode=params.get("permission_mode"),
             cwd=params.get("cwd"),
             extra=params.get("extra"),
         )
@@ -697,5 +706,6 @@ def _handle_to_dict(handle: Any) -> dict[str, Any]:
         "pid": handle.pid,
         "model_name": handle.model_name,
         "used_resume": handle.used_resume,
+        "accepted_initial_input": handle.accepted_initial_input,
         "detail": handle.detail,
     }

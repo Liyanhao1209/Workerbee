@@ -1,14 +1,19 @@
 /**
- * 应用外壳：顶栏 + 「需处理」徽标 + 内核连通性指示。
+ * 应用外壳：顶栏 + 「需处理」徽标 + 内核连通性 + 部署形态 + 降级声明。
  *
- * 内核不可达时**不渲染空白页**，而是在内容区顶部挂一条持续的横幅，
- * 并保留「重试」入口。所有子页面照常挂载，它们各自的错误态会显示细节。
+ * 三件必须显眼、不许折叠的事：
+ * 1. 内核不可达时挂持续横幅，**不渲染空白页**（REC-01：服务端离线时显示不可达，不编造实时状态）。
+ * 2. 部署形态（`session_hosting`）：`in_process` 意味着内核重启会打断在途任务，
+ *    用户必须知道，否则会默认「重启不丢任务」。
+ * 3. 降级声明（`startup_notes`）：supervisor 不可达、摘要器退化这类事实要如实呈现，
+ *    不做成一个小图标——用户有权知道当前跑在降级模式下。
  */
 
 import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { useConnection } from '../store/connection';
 import { attentionCount, useAttention, wireAttention } from '../store/attention';
+import { hostingDescription, useSystem, wireSystem } from '../store/system';
 import { AttentionDrawer } from './AttentionDrawer';
 import { Banner } from './common';
 
@@ -16,6 +21,7 @@ const NAV = [
   { to: '/workflows', label: '流程' },
   { to: '/tasks', label: '任务' },
   { to: '/execution', label: '执行图' },
+  { to: '/sessions', label: '会话' },
   { to: '/registry', label: '注册表' },
   { to: '/templates', label: '模板' },
   { to: '/storage', label: '存储' },
@@ -27,24 +33,31 @@ export function AppShell(): JSX.Element {
   const lastError = useConnection((s) => s.lastError);
   const ws = useConnection((s) => s.ws);
   const wsDetail = useConnection((s) => s.wsDetail);
+  const resumedCount = useConnection((s) => s.resumedCount);
   const check = useConnection((s) => s.check);
   const attention = useAttention();
+  const systemStatus = useSystem((s) => s.status);
+  const refreshSystem = useSystem((s) => s.refresh);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [notesOpen, setNotesOpen] = useState(true);
   const location = useLocation();
 
   useEffect(() => {
     wireAttention();
+    wireSystem();
     void check();
     const timer = window.setInterval(() => {
       if (useConnection.getState().kernel !== 'ok') void check();
     }, 10_000);
     return () => window.clearInterval(timer);
-    // check 是 zustand 上的稳定引用
   }, [check]);
 
-  // 断连期间出现的审批要在重连后找回（AC-12）：WS 一旦重新打开就拉一次。
+  // 断连期间出现的审批要在重连后找回（AC-12）：推送通道一重新打开就拉一次。
   useEffect(() => {
-    if (ws === 'open') void attention.refresh();
+    if (ws === 'open') {
+      void attention.refresh();
+      void refreshSystem();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
 
@@ -53,6 +66,12 @@ export function AppShell(): JSX.Element {
   }, [location.pathname]);
 
   const count = attentionCount(attention);
+  const hosting = hostingDescription(systemStatus);
+
+  // 两处的降级声明可能同源但也可能不同（status 读的是启动期快照，attention 是实时的）；
+  // 合并去重后统一呈现，避免同一条话术出现两遍。
+  const notes = Array.from(new Set([...(systemStatus?.startup_notes ?? []), ...attention.startupNotes]));
+  const schedulerOff = systemStatus !== null && !systemStatus.scheduler.enabled;
 
   return (
     <div className="app-shell">
@@ -73,7 +92,22 @@ export function AppShell(): JSX.Element {
           ))}
         </nav>
         <div className="topbar__right">
-          <KernelIndicator kernel={kernel} version={version} ws={ws} wsDetail={wsDetail} />
+          {systemStatus ? (
+            <span
+              className={hosting.variant === 'ok' ? 'pill pill--success' : 'pill pill--warn'}
+              title={hosting.detail}
+            >
+              <span className="pill__dot" />
+              {hosting.label}
+            </span>
+          ) : null}
+          <KernelIndicator
+            kernel={kernel}
+            version={version}
+            ws={ws}
+            wsDetail={wsDetail}
+            resumedCount={resumedCount}
+          />
           <button
             type="button"
             className={count > 0 ? 'btn btn--sm attention-btn' : 'btn btn--sm'}
@@ -86,15 +120,16 @@ export function AppShell(): JSX.Element {
         </div>
       </header>
 
-      {kernel === 'unreachable' ? (
-        <div style={{ padding: 'var(--sp-3) var(--sp-4) 0' }}>
+      <div style={{ padding: 'var(--sp-3) var(--sp-4) 0' }}>
+        {kernel === 'unreachable' ? (
           <Banner
             variant="danger"
             title="无法连接内核"
             hint={
               <>
                 网页会继续重试。请确认 <span className="mono">workerbee-core</span> 已启动并监听
-                127.0.0.1:8787；开发模式下由 Vite 代理转发（可改 WORKERBEE_KERNEL 环境变量）。
+                127.0.0.1:8765；开发模式下由 Vite 代理转发（可改 WORKERBEE_KERNEL 环境变量）。
+                在内核恢复之前，下面显示的都不是实时状态。
               </>
             }
             actions={
@@ -105,8 +140,45 @@ export function AppShell(): JSX.Element {
           >
             {lastError ? <span className="mono text-xs">{lastError}</span> : null}
           </Banner>
-        </div>
-      ) : null}
+        ) : null}
+
+        {/* 部署形态：只在有风险时展开成横幅。supervisor 正常时不占版面（顶栏已有一枚徽标）。 */}
+        {systemStatus && hosting.variant === 'warn' ? (
+          <Banner variant="warn" title={hosting.label}>
+            {hosting.detail}
+          </Banner>
+        ) : null}
+
+        {schedulerOff ? (
+          <Banner variant="warn" title="调度循环未装配">
+            内核的调度循环没有启用，任务不会自动推进——你看到的排队与就绪阶段会一直停在那里。
+            这通常是启动配置问题，不是任务失败。
+          </Banner>
+        ) : null}
+
+        {notes.length > 0 ? (
+          <Banner
+            variant="warn"
+            title={`内核降级声明 · ${notes.length} 项`}
+            hint="这些是内核如实上报的降级事实，不是可以被忽略的提示。"
+            actions={
+              <button type="button" className="btn btn--sm" onClick={() => setNotesOpen((v) => !v)}>
+                {notesOpen ? '收起' : '展开'}
+              </button>
+            }
+          >
+            {notesOpen ? (
+              <ul className="list-reset">
+                {notes.map((note, i) => (
+                  <li key={i}>· {note}</li>
+                ))}
+              </ul>
+            ) : (
+              <div className="text-xs">{notes[0]}</div>
+            )}
+          </Banner>
+        ) : null}
+      </div>
 
       <main className="main">
         <Outlet />
@@ -122,11 +194,14 @@ function KernelIndicator({
   version,
   ws,
   wsDetail,
+  resumedCount,
 }: {
   kernel: string;
   version: string | null;
   ws: string;
   wsDetail: string | null;
+  /** 上一次重连按 after_event_id 补齐的事件条数（0 表示没有断档）。 */
+  resumedCount: number;
 }): JSX.Element {
   const kernelText =
     kernel === 'ok' ? '内核在线' : kernel === 'unreachable' ? '内核离线' : kernel === 'unauthorized' ? '未授权' : '检测中';
@@ -152,8 +227,16 @@ function KernelIndicator({
       <span className={kernelCls} title={version ? `内核版本 ${version}` : undefined}>
         {kernelText}
       </span>
-      <span className={wsCls} title={wsDetail ?? undefined}>
+      <span
+        className={wsCls}
+        title={
+          resumedCount > 0
+            ? `${wsDetail ? `${wsDetail}\n` : ''}重连后已按 after_event_id 补齐 ${resumedCount} 条事件；推送仍是提醒，权威状态以各页面的 REST 拉取为准。`
+            : (wsDetail ?? undefined)
+        }
+      >
         {wsText}
+        {resumedCount > 0 ? <span className="dim"> · 补齐 {resumedCount}</span> : null}
       </span>
     </div>
   );

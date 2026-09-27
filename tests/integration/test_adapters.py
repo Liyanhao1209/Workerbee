@@ -814,3 +814,95 @@ def test_credential_map_only_exposes_declared_keys():
     assert credential_env(
         HarnessConfig(harness_id="h2", credential={"api_key": "sk"}), KimiCodeAdapter().credential_env_map()
     ) == {}
+
+
+# ----------------------------------------------------------------------
+# 5. 首轮输入的交付与权限模式声明
+# ----------------------------------------------------------------------
+
+
+async def test_mock_infers_accepted_initial_input_from_the_request(mock_harness):
+    """脚本没指定时按实际情形推断：带了本轮输入 → True，没带 → False。
+
+    这个字段内核会照着做决定（True 就不再 send_input），所以它必须是事实。
+    """
+    ap, _ = await mock_harness({"steps": [{"do": "output", "text": "ok"}]})
+
+    with_prompt = await ap.call(METHODS.SESSION_CREATE, create_params(prompt="跑起来"))
+    assert with_prompt["accepted_initial_input"] is True
+
+    without_prompt = await ap.call(METHODS.SESSION_CREATE, create_params(prompt=None))
+    assert without_prompt["accepted_initial_input"] is False
+
+
+@pytest.mark.parametrize("forced", [True, False])
+async def test_mock_accepted_initial_input_is_script_controlled(mock_harness, forced):
+    """两种取值都要能测到：内核的两条分支（自己投 / 不投）都得有覆盖。"""
+    ap, _ = await mock_harness(
+        {"accepted_initial_input": forced, "steps": [{"do": "output", "text": "ok"}]}
+    )
+    # 故意与推断结果反着来：剧本说了算，而不是「有 prompt 就 True」
+    created = await ap.call(
+        METHODS.SESSION_CREATE, create_params(prompt=None if forced else "投给我")
+    )
+    assert created["accepted_initial_input"] is forced
+
+
+def test_claude_classifies_permission_modes_from_measurements():
+    """HUM-03：哪些模式会向用户提问，必须按实测分类，不能想当然。
+
+    实测环境：claude 2.1.283，无 SDK 宿主，逐个模式跑「用 Bash 删除文件」。
+    """
+    caps = ClaudeCodeAdapter().manifest.capabilities
+    assert caps.permission_modes == list(SUPPORTED_PERMISSION_MODES)
+    # auto 直接执行；dontAsk 明确回「被拒绝」；plan 拒绝一切非只读操作且不提问；
+    # bypassPermissions 语义即跳过全部检查。
+    assert set(caps.non_interactive_modes) == {"auto", "bypassPermissions", "dontAsk", "plan"}
+    # manual 回「需要您批准」，acceptEdits 只实测了一种动作、无法排除别的动作仍会问
+    # ——两者按「会询问」处理：错放进「不询问」等于替用户放行。
+    assert "manual" not in caps.non_interactive_modes
+    assert "acceptEdits" not in caps.non_interactive_modes
+
+
+def test_claude_maps_permission_mode_to_the_cli_flag():
+    """session.create 里的 permission_mode 必须变成 --permission-mode，不静默丢弃。"""
+    argv = ClaudeCodeAdapter().build_argv(
+        request=_request(permission_mode="bypassPermissions"),
+        prompt="x",
+        resume_locator=None,
+        checkpoint=None,
+    )
+    assert "--permission-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_claude_stream_json_takes_the_prompt_from_stdin_not_argv():
+    """流式通道下 prompt 不进命令行：既避免泄漏，也避免同一条指令被送两遍。"""
+    argv = ClaudeCodeAdapter(input_format="stream-json").build_argv(
+        request=_request(prompt="机密任务内容"), prompt="机密任务内容",
+        resume_locator=None, checkpoint=None,
+    )
+    assert "--input-format" in argv and argv[argv.index("--input-format") + 1] == "stream-json"
+    assert "-p" in argv
+    assert argv[argv.index("-p") + 1].startswith("--"), "`-p` 是裸标志，后面不能跟 prompt"
+    assert "机密任务内容" not in " ".join(argv)
+
+
+def test_kimi_declares_the_only_mode_it_can_honour():
+    """-p 下唯一可用的是「不给任何开关」，且它不会向用户提问（实测）。"""
+    caps = KimiCodeAdapter().manifest.capabilities
+    assert caps.permission_modes == ["default"]
+    assert caps.non_interactive_modes == ["default"]
+    # 没有钩子这件事不能省略：框架拦不住审批，用户必须知道（HUM-03 的告警据此产生）
+    assert caps.permission_hook is False
+
+
+@pytest.mark.parametrize("mode", ["default", ""])
+def test_kimi_default_permission_mode_adds_no_flag(mode):
+    """default 的语义就是「不加任何策略开关」——三个策略 flag 与 -p 互斥（实测）。"""
+    argv = KimiCodeAdapter().build_argv(
+        request=_request(permission_mode=mode or None), prompt="x",
+        resume_locator=None, checkpoint=None,
+    )
+    assert "-y" not in argv and "--yolo" not in argv
+    assert "--auto" not in argv and "--plan" not in argv

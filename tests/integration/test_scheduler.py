@@ -424,6 +424,52 @@ class TestCompletionCriteria:
             "摘要失败必须留下可见记录"
         )
 
+    async def test_initial_input_is_delivered_exactly_once(
+        self, store, sm, ledger, context_builder, summarizer, make_workflow, tick
+    ):
+        """首轮输入只能交付一次。
+
+        两条路径互斥：随建会话交付（一次性 `-p` 型 harness）**或** 事后 send_input。
+        两条都走会让同一条指令执行两遍——对会改文件的 agent 来说那是数据损坏，
+        不是「多一点冗余」。
+        """
+        from tests.fakes import FakeHarness
+        from workerbee.core.runtime.scheduler import Scheduler, SchedulerConfig
+
+        await _setup_harness(store)
+        g = graph({"A": []})
+        wf, _ = await make_workflow(g)
+
+        # 形态一：交互式 harness（建会话后仍需 send_input）
+        interactive = FakeHarness(accepts_initial_input=False)
+        s1 = Scheduler(store=store, sm=sm, harness=interactive, ledger=ledger,
+                       context_builder=context_builder, summarizer=summarizer)
+        r1 = await launch_task(store=store, workflow_id=wf.workflow_id)
+        await tick(s1)
+        sess = interactive.last_session()
+        assert interactive.created[-1]["initial_input"], "首轮输入必须随建会话传下去"
+        assert len(sess.inputs) == 1, "交互式形态：应恰好投递一次"
+
+        # 收尾第一个任务，否则节点串行会让第二个任务排不上槽
+        # ——那是对的行为（R §5.2.2），不是 bug。
+        await s1.on_event(
+            session_ref=sess.session_ref, kind="output", payload={"text": "完成"}
+        )
+        await s1.on_session_ended(session_ref=sess.session_ref, ok=True)
+        await tick(s1)
+        assert (await store.tasks.get_task(r1.task.task_id)).observed_state == TaskState.SUCCEEDED
+
+        # 形态二：一次性 `-p` 型 harness（建会话时已消费）
+        onepass = FakeHarness(accepts_initial_input=True)
+        s2 = Scheduler(store=store, sm=sm, harness=onepass, ledger=ledger,
+                       context_builder=context_builder, summarizer=summarizer)
+        await launch_task(store=store, workflow_id=wf.workflow_id)
+        await tick(s2)
+        sess2 = onepass.last_session()
+        assert len(sess2.inputs) == 1, (
+            "一次性形态：建会话时已交付，绝不能再 send_input 一次"
+        )
+
     async def test_no_output_fails(self, store, sm, harness, scheduler, make_workflow, tick):
         """会话正常结束但什么都没产出 → 阶段失败。
 

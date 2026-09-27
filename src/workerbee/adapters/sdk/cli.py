@@ -205,6 +205,25 @@ class CliSession:
     received_inputs: list[dict] = field(default_factory=list)
     """收到的 io.send_input，供 HUM-01/02 断言「到达了所选的那个会话」。"""
 
+    accepted_initial_input: bool = False
+    """建会话时是否**真的**把本轮首轮输入交付给了 harness。
+
+    回包里的同名字段就是它。内核据此决定要不要再 ``send_input`` 一次：
+    说 True 而实际没送到，阶段会永远等一个不会开始的任务；说 False 而其实
+    已经送了，同一条指令会被执行两遍。两种都要求这里是实测事实，不是猜测。
+    """
+
+    started_reported: bool = False
+    """是否已上报过 ``session_started``。
+
+    流式输入通道下 harness 每轮都会重发 init（实测 claude 2.1.283 如此），
+    重复上报会让上游以为开了好几个会话。
+    """
+
+    end_reason: str | None = None
+    """会话结束的可读原因（如 ``idle_eof`` / ``terminate``）。
+    只用于让「为什么结束」在事件里可见，不改变结束本身的判定。"""
+
     def alive(self) -> bool:
         return self.proc.returncode is None and self.state in ("starting", "alive")
 
@@ -278,7 +297,11 @@ class CliHarnessAdapter(AdapterBase):
         session = await self._spawn_session(
             request, extras, resume_locator=None, checkpoint=None
         )
-        return {"session": session.to_info().model_dump(mode="json")}
+        return {
+            "session": session.to_info().model_dump(mode="json"),
+            # 显式回包，不让内核去猜（猜错的两种后果都不小，见 SessionHandle）。
+            "accepted_initial_input": session.accepted_initial_input,
+        }
 
     async def on_session_resume(self, params: dict) -> dict:
         request, extras = parse_session_request(params)
@@ -295,7 +318,11 @@ class CliHarnessAdapter(AdapterBase):
             resume_locator=str(locator),
             checkpoint=extras.get("checkpoint"),
         )
-        return {"session": session.to_info().model_dump(mode="json"), "resumed": True}
+        return {
+            "session": session.to_info().model_dump(mode="json"),
+            "accepted_initial_input": session.accepted_initial_input,
+            "resumed": True,
+        }
 
     async def on_session_list(self, params: dict) -> dict:
         harness_id = params.get("harness_id")
@@ -404,6 +431,24 @@ class CliHarnessAdapter(AdapterBase):
             self._drain_stderr(session), name=f"{session.label}:stderr"
         )
 
+        if prompt is not None:
+            try:
+                if self.input_channel:
+                    # 流式输入通道下首轮输入必须走 stdin：与 argv 同时给出会让
+                    # harness 收到两遍同一条指令（claude 实测 -p <prompt> 与 stdin
+                    # 帧都会被当成用户消息）。写完才算「已交付」。
+                    await self.deliver_initial_input(session, prompt)
+                # text 模式下 prompt 已经在 argv 里（build_argv 负责给出或报错），
+                # 因此走到这里就是真的交付了。
+                session.accepted_initial_input = True
+            except Exception:
+                # 交付失败就不能留一个没人管的子进程（RES-01）：先收掉再抛。
+                with contextlib.suppress(Exception):
+                    await self._terminate_session(
+                        session, signal="TERM", grace_ms=None, emit=False
+                    )
+                raise
+
         await self.notify(
             NOTIFICATIONS.LOG,
             {
@@ -412,7 +457,12 @@ class CliHarnessAdapter(AdapterBase):
                 "level": "info",
             },
         )
+        await self.on_session_spawned(session)
         return session
+
+    async def on_session_spawned(self, session: "CliSession") -> None:
+        """子类钩子：子进程与台账都就绪后调用（watchdog 之类的会话级巡检在此起）。"""
+        return None
 
     # ------------------------------------------------------------------
     # 子类钩子
@@ -469,6 +519,8 @@ class CliHarnessAdapter(AdapterBase):
                 "exit_code": returncode,
                 "persist_locator": session.persist_locator,
                 "lines_read": session.lines_read,
+                # 只解释「为什么结束」，不改变结束本身：结束的判据始终是进程真的退了。
+                "reason": session.end_reason or "process_exit",
             },
         )
         if returncode not in (0, None):
@@ -519,6 +571,15 @@ class CliHarnessAdapter(AdapterBase):
     async def send_input(self, session: CliSession, *, kind: str, text: str) -> None:
         """子类覆盖：把输入写进 harness 的输入通道。"""
         raise NotImplementedError
+
+    async def deliver_initial_input(self, session: CliSession, prompt: str) -> None:
+        """把**首轮**输入交给已经起来的 harness（仅流式输入通道下调用）。
+
+        默认就是普通用户输入；需要区分「首轮」的适配器（例如首轮要带
+        session_id 之类的元数据）可以覆盖。与 ``send_input`` 一样，抛异常
+        就意味着**没送到**——调用方会据此不声明 accepted_initial_input。
+        """
+        await self.send_input(session, kind=InputKind.USER, text=prompt)
 
     async def on_interrupt(self, params: dict) -> dict:
         session = self._get_session(params)
@@ -684,6 +745,8 @@ class CliHarnessAdapter(AdapterBase):
         session.exit_code = proc.returncode
         session.state = "ended" if reclaimed else "lost"
         session.ended_at = _now_iso()
+        if session.end_reason is None:
+            session.end_reason = "terminate"
 
         if emit:
             await self.emit_event(

@@ -338,10 +338,20 @@ def task_delete(task_id: str, from_node: Optional[str] = typer.Option(None, "--f
 def registry_harnesses(
     api: str = typer.Option(DEFAULT_API, "--api"),
     token: Optional[str] = typer.Option(None, "--token"),
+    probe: Optional[str] = typer.Option(
+        None, "--probe", help="探测指定 harness 的能力（HAR-02：实测优先）"
+    ),
     as_json: bool = typer.Option(True, "--json/--no-json"),
 ) -> None:
-    """列出已登记的 harness 及其能力。"""
-    _print(_client(api, token).get("/api/registry/harnesses"), as_json=as_json)
+    """列出已登记的 harness 及其能力。
+
+    路径与网关的实际挂载一致（扁平前缀 ``/api/harnesses``）。
+    """
+    client = _client(api, token)
+    if probe:
+        _print(client.post(f"/api/harnesses/{probe}/probe"), as_json=True)
+        return
+    _print(client.get("/api/harnesses"), as_json=as_json)
 
 
 @app.command()

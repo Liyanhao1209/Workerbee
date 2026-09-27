@@ -37,12 +37,28 @@ stdout 是 NDJSON，已实测到的行类型（``type`` 字段）：
   不足以支撑 RUN-06 的「后台工作是否结束」判据。
 - ``interrupt`` / ``interact``：仅当以 stream-json 输入通道启动时为 True
   （见 ``input_format``）。text 模式下运行中无法注入输入，如实返回 NOT_SUPPORTED。
+
+**stream-json 输入通道（实测 2.1.283）**：``-p --input-format stream-json`` 下
+stdin 的每一帧都是一条用户消息，会话常驻多轮；首轮输入由 stdin 的第一帧给出
+（``-p`` 不带 prompt 值即可，正是官方 SDK 的做法）。要盯住的四件事：
+
+1. 每轮都会重发 ``system/init``（同一个 session_id）——只上报一次 session_started；
+2. ``--replay-user-messages`` 会把我们投进去的输入原样回显（``isReplay``）——
+   那是我们自己发出去的，不能当成 harness 输出；
+3. 打断帧 ``control_request{interrupt}`` 有回执（``control_response.success``），
+   本轮以 ``result/error_during_execution`` 收尾，进程继续存活——如实报成
+   用户取消而不是 harness 故障；
+4. 会话不会自己结束（RUN-06 需要 session_ended）：静默一段时间后关掉 stdin
+  让它退出，结束事件仍由进程退出触发，不谎报。
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
+import time
 import uuid
 from typing import Any
 
@@ -65,7 +81,12 @@ from ..sdk.protocol import (
     NOTIFICATIONS,
 )
 
-__all__ = ["ClaudeCodeAdapter", "SUPPORTED_PERMISSION_MODES", "SUPPORTED_EFFORTS"]
+__all__ = [
+    "ClaudeCodeAdapter",
+    "SUPPORTED_PERMISSION_MODES",
+    "NON_INTERACTIVE_PERMISSION_MODES",
+    "SUPPORTED_EFFORTS",
+]
 
 ADAPTER_ID = "claude-code"
 HARNESS_FAMILY = "claude-code"
@@ -91,6 +112,39 @@ SUPPORTED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 #: stream-json（开启流式输入通道，运行中可注入输入/打断）。
 INPUT_FORMAT_ENV = "WORKERBEE_CLAUDE_CODE_INPUT_FORMAT"
 
+#: 流式输入通道下「一轮跑完后的静默多久算结束」。
+#: 0 或负数 = 不自动结束（会话常驻到显式 control.terminate）。
+IDLE_END_SECONDS_ENV = "WORKERBEE_CLAUDE_CODE_IDLE_END_SECONDS"
+DEFAULT_IDLE_END_SECONDS = 30.0
+
+#: ``--permission-mode`` 里**不会向用户请求授权**的取值（依据见各条目注释，均为实测）。
+NON_INTERACTIVE_PERMISSION_MODES = (
+    # 实测：直接删掉了目标文件，全程没有任何询问。
+    "auto",
+    # 语义就是跳过全部权限检查（--help：--dangerously-skip-permissions 等价物）。
+    "bypassPermissions",
+    # 实测：明确回「Bash 权限在当前「don't ask」模式下被拒绝」——是拒绝，不是询问。
+    "dontAsk",
+    # 实测：处于 plan mode 时拒绝任何非只读操作，也没有向用户提问。
+    # 它不会自动放行任何写操作（比「会询问」更严格），因此归入「不询问」；
+    # 代价是用在需要写产物的节点上会因拿不到产物而失败，而不是卡住等人。
+    "plan",
+)
+
+
+def _idle_end_seconds() -> float:
+    raw = os.environ.get(IDLE_END_SECONDS_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_IDLE_END_SECONDS
+    try:
+        return float(raw)
+    except ValueError as exc:
+        # CFG-02：配置值非法必须显式失败，不能悄悄退回默认值。
+        raise AdapterError(
+            ErrorCode.INVALID_PARAMS,
+            f"{IDLE_END_SECONDS_ENV} 必须是数字（秒），收到 {raw!r}",
+        ) from exc
+
 
 class ClaudeCodeAdapter(CliHarnessAdapter):
     """Claude Code 的无头（``-p``）适配器。"""
@@ -110,7 +164,15 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
         # 流式输入通道下才存在运行中交互与打断；manifest 必须与之一致，
         # 不能声明一个当前配置下做不到的能力。
         self.input_channel = self.input_format == "stream-json"
-        self.manifest = _build_manifest(self.input_channel)
+        self.idle_end_seconds = _idle_end_seconds()
+        self._activity: dict[str, float] = {}
+        """session_ref → 最近一次收到 harness 输出行的时刻（单调秒）。"""
+        self._turns_ended: dict[str, int] = {}
+        """session_ref → 已看到的 result 行数；>0 才谈得上「一轮跑完后静默」。"""
+        self._interrupted: dict[str, float] = {}
+        """session_ref → 最近一次由我们发出打断的时刻，用于如实解释 result 的报错。"""
+        self._watchdogs: dict[str, asyncio.Task] = {}
+        self.manifest = _build_manifest(self.input_channel, idle_end_seconds=self.idle_end_seconds)
 
     # ------------------------------------------------------------------
     # 探测 / 兼容性
@@ -212,9 +274,11 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
             argv += ["--session-id", _session_uuid(request)]
 
         if self.input_channel:
-            argv += ["--input-format", "stream-json"]
-            if prompt:
-                argv += ["-p", prompt]
+            # 实测 2.1.283：``-p`` 可以不带 prompt 值，首轮用户消息由 stdin 的
+            # 第一帧给出（正是官方 SDK 的做法）。prompt 放 stdin 而不是 argv，
+            # 既避免进程命令行泄漏任务内容，也避免「argv 与 stdin 各送一遍」
+            # 导致同一条指令被执行两次。
+            argv += ["-p", "--input-format", "stream-json"]
         else:
             if prompt is None:
                 raise AdapterError(
@@ -290,6 +354,8 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
     # ------------------------------------------------------------------
 
     async def handle_json_line(self, session: CliSession, obj: dict) -> None:
+        # 任何一行都算「有动静」：静默判定的依据是真实输出，不是猜测。
+        self._activity[session.session_ref] = time.monotonic()
         kind = obj.get("type")
         if kind == "system":
             await self._handle_system(session, obj)
@@ -311,6 +377,12 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
                 # persist_locator = harness 自己的会话 id（恢复会话时用它）。
                 session.persist_locator = sid
             session.state = "alive"
+            if session.started_reported:
+                # 实测：流式输入通道下**每一轮**都会重发一条 init（同一个
+                # session_id）。重复上报会让上游以为开了好几个会话，所以只在
+                # 第一条 init 上报一次。
+                return
+            session.started_reported = True
             tools = obj.get("tools")
             await self.emit_event(
                 EventKind.SESSION_STARTED,
@@ -395,6 +467,11 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
                 await self.note_unknown_type(session, f"assistant/{btype}")
 
     async def _handle_user(self, session: CliSession, obj: dict) -> None:
+        if obj.get("isReplay"):
+            # --replay-user-messages 会把我们投进去的输入原样回显（实测）。
+            # 那是**我们自己发出去的东西**，当成 harness 输出会让产物里出现
+            # 用户指令的副本——只记账，不上报。
+            return
         message = obj.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
@@ -432,6 +509,10 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
         subtype = str(obj.get("subtype") or "")
         is_error = bool(obj.get("is_error"))
         succeeded = subtype == "success" and not is_error
+        # 打进过断的标记沿用一次：被打断的那一轮 result 是 error_during_execution
+        # （实测），不能把它当成 harness 自己出错。
+        interrupted = self._interrupted.pop(session.session_ref, None) is not None
+        self._turns_ended[session.session_ref] = self._turns_ended.get(session.session_ref, 0) + 1
 
         # usage：只上报真实拿到的字段。取不到就**不上报**，由内核记「未知」，
         # 绝不用 0 冒充（OBS-04）。
@@ -489,7 +570,12 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
         )
 
         if not succeeded:
-            error_class, error_kind = _classify_result_error(obj)
+            if interrupted:
+                # 这一轮是我们请求打断才结束的：如实说是「用户取消」，
+                # 而不是报成 harness 故障（那会触发一次毫无意义的重试）。
+                error_class, error_kind = "user_cancelled", "interrupted_by_user"
+            else:
+                error_class, error_kind = _classify_result_error(obj)
             await self.emit_event(
                 EventKind.ERROR,
                 session_ref=session.session_ref,
@@ -526,6 +612,71 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
     # 输入通道（仅 stream-json 模式）
     # ------------------------------------------------------------------
 
+    async def on_session_spawned(self, session: CliSession) -> None:
+        """流式输入通道下给会话挂一个静默巡检（见 ``_idle_watchdog``）。"""
+        if not self.input_channel:
+            return
+        self._activity[session.session_ref] = time.monotonic()
+        self._watchdogs[session.session_ref] = asyncio.create_task(
+            self._idle_watchdog(session, self.idle_end_seconds),
+            name=f"{session.label}:idle",
+        )
+
+    async def _idle_watchdog(self, session: CliSession, seconds: float) -> None:
+        """一轮跑完后静默超过 N 秒就关掉输入通道，让 harness 自己退出。
+
+        为什么需要它：流式输入通道是**常驻**的，harness 跑完一轮不会退出；
+        而内核按「会话已结束」判定阶段完成（RUN-06）。所以必须有人把常驻会话
+        真正结束掉——这里选择关 stdin（实测 2.1.283 在 stdin EOF 后跑完当轮、
+        以 0 退出），结束事件仍然由**进程真的退出**触发，不谎报 ended。
+
+        静默窗口内到达的任何输入（HUM-01 的 BTW、内核的补投）都会重置计时。
+        ``seconds <= 0`` 表示不自动结束：会话常驻到显式 terminate 为止。
+        """
+        if seconds <= 0:
+            return
+        ref = session.session_ref
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                await asyncio.sleep(min(1.0, seconds))
+                if not session.alive():
+                    return
+                if not self._turns_ended.get(ref):
+                    continue  # 还没跑完任何一轮，谈不上静默
+                quiet = loop.time() - self._activity.get(ref, loop.time())
+                if quiet < seconds:
+                    continue
+                proc = session.proc
+                if proc.stdin is None or proc.stdin.is_closing():
+                    return
+                session.end_reason = "idle_eof"
+                await self.notify(
+                    NOTIFICATIONS.LOG,
+                    {
+                        "message": (
+                            f"会话静默 {quiet:.0f}s（>{seconds:.0f}s）无输出且没有新输入，"
+                            f"关闭输入通道让 harness 结束；结束以进程退出为准"
+                        ),
+                        "session_ref": ref,
+                        "level": "info",
+                    },
+                )
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+                    proc.stdin.close()
+                return
+        finally:
+            self._activity.pop(ref, None)
+            self._turns_ended.pop(ref, None)
+            self._watchdogs.pop(ref, None)
+
+    async def on_shutdown(self) -> None:
+        for task in self._watchdogs.values():
+            if not task.done():
+                task.cancel()
+        self._watchdogs.clear()
+        await super().on_shutdown()
+
     async def send_input(self, session: CliSession, *, kind: str, text: str) -> None:
         proc = session.proc
         if proc.stdin is None or proc.stdin.is_closing():
@@ -533,20 +684,25 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
                 ErrorCode.SESSION_DEAD, f"会话 {session.session_ref} 的输入通道已关闭"
             )
         if kind == "interrupt":
-            # Claude Code 的控制帧走同一条流式输入通道。
-            # 注意：该帧形状未在本机实测验证（需要一次真实的打断才能确认），
-            # 因此本适配器**默认不以流式通道启动**，只有显式配置后才声明 interrupt=True。
+            # Claude Code 的控制帧走同一条流式输入通道。实测 2.1.283 的回执：
+            # control_response{response:{subtype:"success", request_id, response:
+            # {still_queued:[]}}}，随后本轮以 result/error_during_execution 收尾，
+            # 进程继续存活（见 _handle_result 对 user_cancelled 的处理）。
+            self._interrupted[session.session_ref] = time.monotonic()
             frame = {
                 "type": "control_request",
                 "request_id": f"int-{uuid.uuid4().hex[:8]}",
                 "request": {"subtype": "interrupt"},
             }
         else:
-            frame = {
+            frame: dict[str, Any] = {
                 "type": "user",
-                "session_id": session.persist_locator,
                 "message": {"role": "user", "content": [{"type": "text", "text": text}]},
             }
+            if session.persist_locator:
+                # session_id 只用来说明「发给哪个会话」；新会话还没有 id 时不给，
+                # 官方 SDK 也不给（免得 harness 拿一个它自己还没确认的 id 去对账）。
+                frame["session_id"] = session.persist_locator
         data = (json.dumps(frame, ensure_ascii=False) + "\n").encode()
         try:
             proc.stdin.write(data)
@@ -555,6 +711,8 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
             raise AdapterError(
                 ErrorCode.SESSION_DEAD, f"会话 {session.session_ref} 输入通道已断开: {exc}"
             ) from exc
+        # 注入输入也算「有动静」：静默巡检据此重置，避免刚投完输入就被判静默。
+        self._activity[session.session_ref] = time.monotonic()
 
 
 # ----------------------------------------------------------------------
@@ -562,7 +720,7 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
 # ----------------------------------------------------------------------
 
 
-def _build_manifest(input_channel: bool) -> AdapterManifest:
+def _build_manifest(input_channel: bool, *, idle_end_seconds: float | None = None) -> AdapterManifest:
     return AdapterManifest(
         adapter_id=ADAPTER_ID,
         version=ADAPTER_VERSION,
@@ -573,8 +731,8 @@ def _build_manifest(input_channel: bool) -> AdapterManifest:
             create_session=True,
             resume_session=True,          # --resume <session-id>，已实测
             read_output=True,
-            interact=input_channel,       # 仅流式输入通道下成立
-            interrupt=input_channel,      # 同上
+            interact=input_channel,       # 仅流式输入通道下成立（实测可多轮注入）
+            interrupt=input_channel,      # 控制帧实测有回执，见 send_input 注释
             stop=True,
             compact=False,                # --autocompact 是启动参数，不是运行时操作
             permission_hook=False,        # 外部进程拿不到标准权限钩子
@@ -583,6 +741,8 @@ def _build_manifest(input_channel: bool) -> AdapterManifest:
             checkpoint_resume=False,
             keep_checkpoint_on_stop=False,
             reasoning_efforts=list(SUPPORTED_EFFORTS),
+            permission_modes=list(SUPPORTED_PERMISSION_MODES),
+            non_interactive_modes=list(NON_INTERACTIVE_PERMISSION_MODES),
             # models 留空 = 不限定。--model 同时接受别名与完整模型名，集合是开放的；
             # 列举反而会让用户填对的名字被误判为「不受支持」（CFG-02）。
             models=[],
@@ -607,7 +767,17 @@ def _build_manifest(input_channel: bool) -> AdapterManifest:
             "因此本 harness 不得被声明为支持非自动权限模式（HUM-03）。",
             "background_tasks=False：--bg / claude agents 面向游离会话，"
             "result 行的 subagent_stats 只是事后计数，不满足 RUN-06 的完成判据。",
-            "text 输入模式下 prompt 走 argv（进程命令行可见），且运行中无法注入输入。",
+            "permission_modes：来自 --help 的 choices（acceptEdits/auto/bypassPermissions/"
+            "manual/dontAsk/plan）。non_interactive_modes=[auto, bypassPermissions, dontAsk, plan] "
+            "是实测结论（无 SDK 宿主时逐个跑「删除文件」任务）：auto 直接执行、dontAsk 明确回「被拒绝」、"
+            "plan 拒绝一切非只读操作且不提问；manual 回「需要您批准」、acceptEdits 本次虽直接执行了，"
+            "但只实测了一种动作，无法排除它在别的动作上仍会询问，故按会询问处理（宁可保守，"
+            "把它错放进「不询问」等于替用户放行）。",
+            "text 输入模式下 prompt 走 argv（进程命令行可见），且运行中无法注入输入。"
+            "stream-json 输入通道下 prompt 走 stdin 的第一帧（不出现在命令行上）。",
+            "stream-json 输入通道是**常驻**会话：跑完一轮不会自己退出，"
+            f"适配器在静默 {DEFAULT_IDLE_END_SECONDS:.0f}s（{IDLE_END_SECONDS_ENV}，0=不自动结束）"
+            "后关闭输入通道让 harness 退出；session_ended 始终以进程真的退出为准。",
             "无 SDK 宿主时默认 --permission-prompts none：需要审批的动作会被拒绝，"
             "而不是让整轮挂在一个没人能回答的询问上。",
         ],

@@ -1,4 +1,7 @@
-"""系统类端点：健康、状态、事件增量、「需处理」、存储（OBS-01/02/05、RES-03）。"""
+"""系统类端点：健康、状态、事件增量、「需处理」、存储、会话台账。
+
+对应需求：OBS-01/02/05、RES-03、REC-03。
+"""
 
 from __future__ import annotations
 
@@ -54,6 +57,15 @@ async def events(
 )
 async def attention(services: ServicesDep) -> S.AttentionResponse:
     return await services.system.attention()
+
+
+@router.get(
+    "/api/sessions",
+    response_model=S.SessionListResponse,
+    summary="会话台账（REC-03，只读）",
+)
+async def sessions(services: ServicesDep) -> S.SessionListResponse:
+    return await services.system.sessions()
 
 
 @router.get(

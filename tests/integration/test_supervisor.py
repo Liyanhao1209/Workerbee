@@ -26,15 +26,14 @@ MOCK_CMD = [sys.executable, "-m", "workerbee.adapters.mock.main"]
 
 #: mock 适配器的剧本：建会话后先产出一段文本，然后停在那里等输入。
 #: 刻意不用「自动结束」——本文件测的是「会话能不能活着跨过客户端断开」。
+#: 步骤键是 ``do``（见 adapters/mock/adapter.py 的 _STEPS），不是 ``step``。
 HELLO_SCRIPT = {
     "steps": [
-        {"step": "output", "text": "开始工作"},
-        {"step": "turn_end"},
-        {"step": "wait"},
+        {"do": "output", "text": "开始工作"},
+        {"do": "turn_end"},
     ],
     "on_input": [
-        {"step": "output", "text": "收到输入"},
-        {"step": "wait"},
+        {"do": "output", "text": "收到输入"},
     ],
 }
 
