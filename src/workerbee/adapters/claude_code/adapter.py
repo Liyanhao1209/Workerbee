@@ -97,6 +97,10 @@ SUPPORTED_HARNESS_MAJOR = "2"
 
 #: ``--permission-mode`` 的合法取值（来自 claude --help 实测）。
 SUPPORTED_PERMISSION_MODES = (
+    # ``default`` 不在 --help 的 choices 里，但它确实被接受（实测：显式传它不报错，
+    # 且 init 事件上报的 permissionMode 就是 "default"）。它是最常用的「遇事就问我」
+    # 模式，漏掉它会让用户最想要的那个选项填不进去。
+    "default",
     "acceptEdits",
     "auto",
     "bypassPermissions",
@@ -321,9 +325,20 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
             # 未文档化的 flag）。代价是 system prompt 会出现在进程命令行上。
             argv += ["--append-system-prompt", request.system_prompt]
 
-        # 没有 SDK 宿主时，把权限询问交给 "host" 会让「本会弹窗的动作」永远挂着；
-        # 显式设为 none 使其**被拒绝**而不是卡死（与 permission_hook=False 一致）。
-        argv += ["--permission-prompts", str(opts.get("permission_prompts") or "none")]
+        # 谁来回答权限提问。
+        #
+        # - 有 host 控制通道时用 ``host``：**我们就是那个 host**，握手时注册了
+        #   PermissionRequest 钩子，harness 会反过来问我们，我们再问用户（HUM-03）。
+        # - 没有控制通道时用 ``none``：此时没人能回答，``host`` 会让本会弹窗的动作
+        #   永远挂着；``none`` 让它被明确拒绝而不是卡死。
+        #
+        # 这一行曾经硬编码成 ``none``，于是即使接通了钩子，CLI 也已经自行拒绝了——
+        # 表现是「审批能收到、批了、命令却没执行」，很难从现象反推到这里。
+        default_target = "host" if self.input_channel else "none"
+        argv += [
+            "--permission-prompts",
+            str(opts.get("permission_prompts") or default_target),
+        ]
 
         for d in opts.get("add_dirs") or request.extra.get("add_dirs") or []:
             argv += ["--add-dir", str(d)]
@@ -340,6 +355,87 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
         if opts.get("dangerously_skip_permissions"):
             argv += ["--dangerously-skip-permissions"]
         return argv
+
+    # ------------------------------------------------------------------
+    # host 控制通道（HUM-03）
+    # ------------------------------------------------------------------
+
+    def build_env(self, request: CreateSessionRequest, extras: dict) -> dict[str, str]:
+        env = super().build_env(request, extras)
+        if self.input_channel:
+            # 与官方 Agent SDK 一致：这两个变量告诉 CLI「上面有一个 host」。
+            # 少了它们，CLI 遇到需要授权的操作时**不是不问，而是直接拒绝**——
+            # 实测过：用户以为命令跑了，其实一步都没执行。
+            # 这里用 setdefault：注册表里的显式配置优先。
+            env.setdefault("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")
+            env.setdefault("CLAUDE_AGENT_SDK_VERSION", ADAPTER_VERSION)
+        return env
+
+    def initialize_request(self, session: CliSession) -> dict | None:
+        """注册 ``PermissionRequest`` 钩子。
+
+        这是 claude 的权限钩子——不在 CLI 的 flag 列表里，而在 host 控制协议里：
+        握手时声明「这类事件回调我」，harness 需要授权时就反过来调我们。
+        ``claude --help`` 只字未提，官方 SDK 也是这么做的（它设
+        ``CLAUDE_CODE_ENTRYPOINT=sdk-ts`` 再发这条 initialize）。
+        """
+        if not self.input_channel:
+            return None
+        callback_id = f"hook_perm_{session.session_ref[:8]}"
+        session.hook_callback_ids["PermissionRequest"] = callback_id
+        return {
+            "subtype": "initialize",
+            "hooks": {
+                "PermissionRequest": [
+                    {"matcher": None, "hookCallbackIds": [callback_id], "timeout": 3600}
+                ]
+            },
+            "sdkMcpServers": [],
+            "sdkMcpServerConfigs": {},
+            "sdkMcpServerManifests": {},
+        }
+
+    async def on_permission_hook(
+        self, session: CliSession, request_id: str, payload: dict
+    ) -> None:
+        """harness 问「这个操作能跑吗」→ 转成内核的审批项。
+
+        在用户答复之前，harness 会一直卡着（SDK 文档：权限提问没有 park 超时）。
+        所以这里既不能忘了记下 request_id，也不能在没人能答的时候假装答过——
+        两种情况都会让任务永远停住。
+        """
+        request = self.build_permission_request(session, request_id, payload)
+        session.pending_hooks[request.approval_id] = request_id
+
+        await self.notify(
+            NOTIFICATIONS.PERMISSION_REQUEST, request.model_dump(mode="json")
+        )
+        # 兜底超时：harness 的权限提问**没有 park 超时**（SDK 明文写的），
+        # 所以只要这条答复因为任何原因没送到，它就会永远卡着。
+        # 内核侧的审批超时管的是「用户没答」，这里管的是「答复丢了」——
+        # 两者叠加，才不会有任何一种情况把任务永久挂住。
+        self._spawn_bg(self._hook_watchdog(session, request.approval_id))
+
+    async def _hook_watchdog(self, session: CliSession, approval_id: str) -> None:
+        await asyncio.sleep(self.permission_hook_timeout)
+        request_id = session.pending_hooks.pop(approval_id, None)
+        if request_id is None:
+            return  # 已答复
+        await self.send_control_response(
+            session,
+            request_id,
+            {
+                "behavior": "deny",
+                "message": f"审批在 {self.permission_hook_timeout:.0f}s 内未送达，已按拒绝处理",
+            },
+        )
+        await self.emit_event(
+            EventKind.ERROR,
+            session_ref=session.session_ref,
+            attempt_id=session.attempt_id,
+            text=f"审批 {approval_id} 超时未送达，已按拒绝处理",
+            data={"error_kind": "approval_undelivered", "approval_id": approval_id},
+        )
 
     def credential_env_map(self) -> dict[str, str]:
         """Claude Code 认 Anthropic 系环境变量；凭据只在此处向内传（AUTH-02）。"""
@@ -735,7 +831,9 @@ def _build_manifest(input_channel: bool, *, idle_end_seconds: float | None = Non
             interrupt=input_channel,      # 控制帧实测有回执，见 send_input 注释
             stop=True,
             compact=False,                # --autocompact 是启动参数，不是运行时操作
-            permission_hook=False,        # 外部进程拿不到标准权限钩子
+            # 仅流式输入通道下成立：权限提问走 host 控制协议（initialize 注册
+            # PermissionRequest 钩子），必须先有控制通道。
+            permission_hook=input_channel,
             background_tasks=False,       # --bg/claude agents 管的是游离会话
             pause_in_place=False,
             checkpoint_resume=False,
@@ -762,9 +860,13 @@ def _build_manifest(input_channel: bool, *, idle_end_seconds: float | None = Non
         notes=[
             "compact=False：--autocompact 只能作为启动参数给出，运行时不提供整理操作；"
             "harness 自己触发的 compact_boundary 会被如实上报，但不等于适配器提供该能力。",
-            "permission_hook=False：没有面向外部进程的权限钩子。"
-            "--permission-prompt-tool 需要一个自实现的 MCP 宿主，本适配器不提供，"
-            "因此本 harness 不得被声明为支持非自动权限模式（HUM-03）。",
+            "permission_hook：**仅流式输入通道下为 True**。机制是 host 控制协议——"
+            "启动握手（initialize）时注册 PermissionRequest 钩子，harness 需要授权时"
+            "发 control_request 回调，我们回 control_response 给出决定。"
+            "这条路径 claude --help 里完全没有，只有官方 SDK 暴露；"
+            "它不需要 --permission-prompt-tool，也不需要自建 MCP 宿主。"
+            "text 通道下仍为 False——没有控制通道就没有钩子，此时会询问的权限模式"
+            "必须被 HUM-03 的门禁拦住，否则 harness 会卡在一个无人应答的提问上。",
             "background_tasks=False：--bg / claude agents 面向游离会话，"
             "result 行的 subagent_stats 只是事后计数，不满足 RUN-06 的完成判据。",
             "permission_modes：来自 --help 的 choices（acceptEdits/auto/bypassPermissions/"

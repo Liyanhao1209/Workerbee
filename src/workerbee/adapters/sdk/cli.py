@@ -31,6 +31,7 @@ from typing import Any, Sequence
 
 from .base import AdapterBase
 from .contract import (
+    PermissionRequest,
     CreateSessionRequest,
     HarnessConfig,
     InputKind,
@@ -206,6 +207,17 @@ class CliSession:
     """收到的 io.send_input，供 HUM-01/02 断言「到达了所选的那个会话」。"""
 
     accepted_initial_input: bool = False
+    initialized: bool = False
+    """host 握手（``initialize`` 控制帧）是否已发出。"""
+
+    #: 待答复的钩子回调：approval_id → 控制帧的 request_id。
+    #: harness 通过 control_request 回调来问权限，我们的答复必须原样带回那个
+    #: request_id，否则它匹配不上，工具会一直卡着（SDK 文档明说「权限提问
+    #: 没有 park 超时，丢一次答复就是永久阻塞」）。
+    pending_hooks: dict[str, str] = field(default_factory=dict)
+
+    #: 本次会话声明过的钩子回调 id（initialize 里注册的那些）。
+    hook_callback_ids: dict[str, str] = field(default_factory=dict)
     """建会话时是否**真的**把本轮首轮输入交付给了 harness。
 
     回包里的同名字段就是它。内核据此决定要不要再 ``send_input`` 一次：
@@ -284,6 +296,8 @@ class CliHarnessAdapter(AdapterBase):
         super().__init__()
         self._sessions: dict[str, CliSession] = {}
         self.terminate_grace_ms = DEFAULT_TERMINATE_GRACE_MS
+        #: 后台协程的强引用。asyncio 只持弱引用，不记下来就可能被 GC 掉。
+        self._bg_tasks: set[asyncio.Task] = set()
         self.kill_wait_ms = DEFAULT_KILL_WAIT_MS
         self.max_reported_stray_lines = 20
         """非 JSON 行与未知行类型的上报上限：流是长尾的，不能让它淹没事件通道。"""
@@ -431,6 +445,16 @@ class CliHarnessAdapter(AdapterBase):
             self._drain_stderr(session), name=f"{session.label}:stderr"
         )
 
+        # host 握手必须先于任何用户消息：harness 要靠它才知道「有人能回答我的
+        # 权限提问」。不握手时它不是不问，而是**直接拒绝**——用户以为命令跑了。
+        if self.input_channel:
+            try:
+                await self._send_initialize(session)
+            except Exception as exc:  # noqa: BLE001 - 握手失败不该拖垮建会话
+                await self._log_stray(
+                    session, f"host 握手发送失败：{type(exc).__name__}: {exc}", level="warn"
+                )
+
         if prompt is not None:
             try:
                 if self.input_channel:
@@ -494,6 +518,202 @@ class CliHarnessAdapter(AdapterBase):
     def credential_env_map(self) -> dict[str, str]:
         """凭据键 → 环境变量名的映射；空表示该 harness 不支持凭据注入。"""
         return {}
+
+    # ------------------------------------------------------------------
+    # host 控制通道（HUM-03：让 harness 的提问能到达用户）
+    # ------------------------------------------------------------------
+
+    #: 权限提问的兜底答复时限。harness 那边**没有 park 超时**，所以这条兜底是
+    #: 「答复丢了」与「根本没有审批通道」两种情况的最后一道防线。
+    permission_hook_timeout: float = 1800.0
+
+    def _spawn_bg(self, coro: Any) -> None:
+        """跑一个后台协程并保住强引用。
+
+        asyncio 只持弱引用，不记下来就可能被 GC 掉——那种 bug 的表现是
+        「偶尔不执行」，最难查。
+        """
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    def initialize_request(self, session: CliSession) -> dict | None:
+        """返回 ``initialize`` 控制帧的载荷；``None`` 表示本适配器不需要握手。
+
+        需要这个握手的 harness，其权限提问会以 ``control_request`` 的形式回到
+        我们这里（见 ``_handle_control_request``），而不是像没有 host 时那样
+        **直接拒绝**。没有握手的后果不是「问不到」，是「静默拒绝」——
+        用户以为命令跑了，其实一步都没执行。
+        """
+        return None
+
+    async def _send_initialize(self, session: CliSession) -> None:
+        payload = self.initialize_request(session)
+        if payload is None:
+            return
+        request_id = f"init-{session.session_ref[:8]}"
+        await self.send_control_request(session, request_id, payload)
+        session.initialized = True
+
+    async def send_control_request(
+        self, session: CliSession, request_id: str, request: dict
+    ) -> None:
+        """往 harness 的 stdin 写一条控制帧。"""
+        proc = session.proc
+        if proc.stdin is None or proc.stdin.is_closing():
+            raise AdapterError(
+                ErrorCode.SESSION_DEAD, "会话的输入通道已关闭，无法发送控制帧"
+            )
+        frame = {"type": "control_request", "request_id": request_id, "request": request}
+        proc.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode())
+        await proc.stdin.drain()
+
+    async def send_control_response(
+        self, session: CliSession, request_id: str, response: dict
+    ) -> None:
+        proc = session.proc
+        if proc.stdin is None or proc.stdin.is_closing():
+            return
+        frame = {
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": request_id, "response": response},
+        }
+        proc.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode())
+        await proc.stdin.drain()
+
+    async def _handle_control_request(self, session: CliSession, obj: dict) -> None:
+        """处理 harness 反向发来的控制帧。"""
+        request = obj.get("request") or {}
+        request_id = str(obj.get("request_id") or "")
+        subtype = str(request.get("subtype") or "")
+
+        if subtype == "hook_callback":
+            await self._handle_hook_callback(session, request_id, request)
+            return
+
+        # 其它控制帧（如 harness 主动查询）如实记一笔，不假装处理过。
+        await self._log_stray(
+            session, f"未处理的控制帧 subtype={subtype} request_id={request_id}", level="warn"
+        )
+
+    async def _handle_control_response(self, session: CliSession, obj: dict) -> None:
+        """harness 对我们发出的控制帧的答复。握手失败必须可见。"""
+        response = obj.get("response") or {}
+        if response.get("subtype") == "error" or obj.get("error"):
+            await self._log_stray(
+                session,
+                f"host 握手被拒绝：{json.dumps(obj, ensure_ascii=False)[:300]}；"
+                f"权限提问将不会被转达，harness 会自行拒绝这类操作",
+                level="warn",
+            )
+
+    async def _handle_hook_callback(
+        self, session: CliSession, request_id: str, request: dict
+    ) -> None:
+        """钩子回调。目前只认 ``PermissionRequest``（HUM-03）。
+
+        子类可覆盖以支持更多钩子事件（例如 MCP 的 ``Elicitation``——那是
+        agent 向用户要结构化输入的另一条路）。
+        """
+        payload = request.get("input") or {}
+        event = str(payload.get("hook_event_name") or "")
+        if event != "PermissionRequest":
+            await self._log_stray(
+                session, f"未处理的钩子事件 {event!r}（callback_id={request.get('callback_id')}）",
+                level="warn",
+            )
+            return
+        await self.on_permission_hook(session, request_id, payload)
+
+    async def on_permission_hook(
+        self, session: CliSession, request_id: str, payload: dict
+    ) -> None:
+        """把 harness 的权限提问转成内核认得的 ``PermissionRequest``。
+
+        默认实现直接**拒绝**并说明原因——不静默放行，也不静默卡住。
+        子类覆盖它来真正接上审批。
+        """
+        await self.send_control_response(
+            session, request_id, {"behavior": "deny", "message": "本适配器未接线审批通道"}
+        )
+
+    def build_permission_request(
+        self, session: CliSession, request_id: str, payload: dict
+    ) -> PermissionRequest:
+        """把 harness 的钩子载荷翻译成内核的审批实体。
+
+        字段尽量取 harness 给的原文（``title`` 是它渲染好的整句话），
+        而不是自己拿 tool_name + input 拼一句——那句原文里往往带着
+        「为什么拦」和「会动哪个路径」，拼不出来的。
+        """
+        tool_name = str(payload.get("tool_name") or "")
+        tool_input = payload.get("tool_input") or {}
+        summary = _describe_tool_input(tool_name, tool_input)
+
+        return PermissionRequest(
+            approval_id=f"ap-{uuid.uuid4().hex[:12]}",
+            session_ref=session.session_ref,
+            attempt_id=session.attempt_id,
+            action=summary,
+            target=_target_of(tool_input),
+            risk=str(payload.get("decision_reason") or payload.get("title") or "") or None,
+            tool_name=tool_name or None,
+            raw={
+                "request_id": request_id,
+                "tool_input": tool_input,
+                "cwd": payload.get("cwd"),
+                "permission_mode": payload.get("permission_mode"),
+            },
+        )
+
+    async def on_permission_respond(self, params: dict) -> dict:
+        """内核的审批决定 → 回到 harness 的控制帧（HUM-04）。
+
+        ``approved`` 与否之外还要带 ```updatedInput``：用户「修改后批准」时，
+        执行的必须是被改过的那份输入，否则「修改」只是个装饰。
+        """
+        approval_id = str(params.get("approval_id") or "")
+        if not approval_id:
+            raise AdapterError(ErrorCode.INVALID_PARAMS, "permission.respond 需要 approval_id")
+
+        # 先按 approval_id 找到它在 harness 那边的 request_id。
+        for session in self._sessions.values():
+            request_id = session.pending_hooks.pop(approval_id, None)
+            if request_id is None:
+                continue
+            decision = str(params.get("decision") or "").lower()
+            approved = decision == "approve"
+            inner: dict = {"behavior": "allow" if approved else "deny"}
+            modified = params.get("modified_action")
+            if approved and modified:
+                inner["updatedInput"] = {"command": str(modified)}
+            if not approved:
+                inner["message"] = str(params.get("note") or "用户拒绝了该操作")
+
+            # 钩子回调的答复必须包在 hookSpecificOutput 里并带上事件名——
+            # 裸的 {"behavior": ...} 会被 harness 当成「没听懂」而退回自行拒绝，
+            # 现象是「审批收到了、也批了、命令却没执行」。
+            response = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": inner,
+                }
+            }
+            await self.send_control_response(session, request_id, response)
+            await self.emit_event(
+                EventKind.STATE_CHANGE,
+                session_ref=session.session_ref,
+                attempt_id=session.attempt_id,
+                data={"state": "permission_answered", "approval_id": approval_id,
+                      "decision": decision},
+            )
+            return {"ok": True, "approval_id": approval_id, "decision": decision}
+
+        raise AdapterError(
+            ErrorCode.INVALID_PARAMS,
+            f"未知或已答复的 approval_id：{approval_id}（重复通知不构成再次授权）",
+            {"approval_id": approval_id},
+        )
 
     async def handle_json_line(self, session: CliSession, obj: dict) -> None:
         raise NotImplementedError
@@ -829,6 +1049,17 @@ class CliHarnessAdapter(AdapterBase):
             session.non_json_lines += 1
             await self._log_stray(session, line, level="warn")
             return
+
+        # 控制帧是 host 通道，属于适配层共有的事务，不该由各 harness 的
+        # handle_json_line 各写一遍——写漏的那家会让权限提问静默消失。
+        kind = obj.get("type")
+        if kind == "control_request":
+            await self._handle_control_request(session, obj)
+            return
+        if kind == "control_response":
+            await self._handle_control_response(session, obj)
+            return
+
         await self.handle_json_line(session, obj)
 
     async def _log_stray(self, session: CliSession, text: str, *, level: str) -> None:
@@ -960,3 +1191,42 @@ def _signal_soft(proc: asyncio.subprocess.Process) -> None:
 def _signal_hard(proc: asyncio.subprocess.Process) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# 钩子载荷 → 审批实体的翻译
+# ---------------------------------------------------------------------------
+
+#: 各工具里最能代表「这次要动什么」的字段，按优先级取第一个存在的。
+_TARGET_KEYS = (
+    "file_path", "path", "notebook_path", "url", "command", "pattern", "query",
+)
+
+
+def _describe_tool_input(tool_name: str, tool_input: dict[str, Any]) -> str:
+    """把工具调用压成一行人类可读的动作描述。
+
+    这里刻意**不**追求完整还原——完整内容随 ``raw`` 一起给前端，用户能展开看。
+    这一行只用于列表与标题，要的是「一眼知道它要干嘛」。
+    """
+    if not tool_input:
+        return tool_name or "未知操作"
+    for key in _TARGET_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            text = value.strip().replace("\n", " ")
+            if len(text) > 160:
+                text = text[:157] + "…"
+            return f"{tool_name}({text})" if tool_name else text
+    # 没命中已知字段：给出键名而不是空字符串，至少让人知道它带了参数。
+    keys = ", ".join(sorted(tool_input)[:6])
+    return f"{tool_name}({keys})" if tool_name else keys
+
+
+def _target_of(tool_input: dict[str, Any]) -> str | None:
+    """取「这次动作作用在什么上」。取不到返回 None，不编造。"""
+    for key in _TARGET_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:300]
+    return None

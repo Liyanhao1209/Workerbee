@@ -236,7 +236,7 @@ class Engine:
         # deny_pause 的策略等价于「拒绝该动作」，agent 应当收到一个否定答复而不是
         # 继续等下去。
         approved = status == ApprovalStatus.APPROVED
-        return bool(
+        delivered = bool(
             await respond(
                 session_ref,
                 approval_id=approval.approval_id,
@@ -244,6 +244,28 @@ class Engine:
                 modified_action=modified_action,
             )
         )
+
+        # 答复送到之后必须把阶段推回运行态。
+        #
+        # 不推的话它会一直停在「等待审批」——而 agent 那头其实已经拿到答复、
+        # 干完活、甚至已经退出了。界面显示「等你批准」，实际早就批完跑完了；
+        # 更糟的是完成判据只在 RUNNING/DISPATCHING 下生效，于是这条阶段
+        # 永远不会被判定成功或失败。批准与拒绝都走这里：拒绝之后 agent
+        # 同样会继续（它会看到工具被拒并给出结论），那也是一次正常的执行。
+        if delivered:
+            stage = await self.store.tasks.get_stage(approval.bound_to.stage_id)
+            if stage is not None and stage.observed_state.value == "awaiting_approval":
+                await self.sm.set_stage_state(
+                    stage,
+                    _stage_running(),
+                    reason="已收到用户决定，继续执行",
+                    actor="user",
+                    status_reason=None,
+                )
+                await self.notifier.state_changed(
+                    task_id=approval.bound_to.task_id, stage_id=stage.stage_id
+                )
+        return delivered
 
     async def _on_session_ended(
         self, session_ref: str, ok: bool, detail: str | None
