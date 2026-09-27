@@ -26,5 +26,6 @@ assets/logo-preview.*
 node_modules/
 web/dist/
 
-# 文档以及抽取产物
-docs/
+# PDF/DOCX 的抽取产物。文档本体（proposal、审计、需求清单、架构设计）要留在库里，
+# 只排除这个中间目录，所以规则精确到 _txt/ 而不是整个 docs/。
+docs/_txt/
