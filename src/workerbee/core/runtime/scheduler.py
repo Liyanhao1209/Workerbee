@@ -151,6 +151,12 @@ class Scheduler:
         # 退避中的阶段：到点后回队。放在内存里是有意的——重启后这些阶段
         # 由启动对账重新评估（REC-03），不需要为「还要等几秒」做持久化。
         self._retry_heap: list[tuple[float, str]] = []
+        #: 会话存活巡检（`_sweep_dead_sessions`）的状态。
+        #: 计数而非布尔，是因为 ``session_alive`` 在查不到时会返回 False——
+        #: 适配器忙一次、连接抖一下都会走到那条分支。单次否定不足以判定死亡，
+        #: 连续两次才收束，免得把健康的阶段误杀。
+        self._liveness_misses: dict[str, int] = {}
+        self._last_liveness_sweep = 0.0
 
     # ------------------------------------------------------------------
     # 循环
@@ -204,8 +210,57 @@ class Scheduler:
     # 一轮调度
     # ------------------------------------------------------------------
 
+    #: 会话存活巡检的最小间隔（秒）。调度 tick 比这快得多，不节流会对着
+    #: harness 狂发探测请求。
+    LIVENESS_SWEEP_INTERVAL = 10.0
+
+    async def _sweep_dead_sessions(self) -> int:
+        """巡检运行中的阶段，收束那些会话已经死掉的。
+
+        这是**兜底**，不是主路径：正常情况下由适配层发 SESSION_DIED 通知，走
+        ``on_session_ended``。但只要那条通知丢一次——广播时某个订阅者写失败、
+        core 重启错过了窗口、适配器进程被强杀——阶段就会永远停在 running，
+        任务无限期挂起，而两侧日志都是干净的。所以不能只依赖通知，还得有人
+        定期去问一句「它还活着吗」。
+
+        连续两次探测为否定才判定死亡：``session_alive`` 取不到结果时返回 False，
+        单次否定可能只是抖动。
+        """
+        swept = 0
+        for rt in list(self._runtimes.values()):
+            if rt.session_ended or not rt.session_ref:
+                continue
+            key = rt.attempt_id
+            try:
+                alive = await self.harness.session_alive(rt.session_ref)
+            except Exception:  # noqa: BLE001 - 探测失败按否定计，靠连续两次兜底
+                alive = False
+            if alive:
+                self._liveness_misses.pop(key, None)
+                continue
+
+            misses = self._liveness_misses.get(key, 0) + 1
+            self._liveness_misses[key] = misses
+            if misses < 2:
+                continue
+
+            self._liveness_misses.pop(key, None)
+            swept += 1
+            rt.session_ended = True
+            rt.ended_ok = False
+            rt.error_detail = rt.error_detail or "会话已不存在（存活巡检发现）"
+            await self._log_error(
+                f"存活巡检：会话 {rt.session_ref} 已不存在，收束阶段 {rt.stage_id}"
+            )
+            await self._maybe_complete(rt)
+        return swept
+
     async def tick(self) -> TickReport:
         report = TickReport()
+        now = asyncio.get_running_loop().time()
+        if now - self._last_liveness_sweep >= self.LIVENESS_SWEEP_INTERVAL:
+            self._last_liveness_sweep = now
+            await self._sweep_dead_sessions()
         report.advanced += await self._promote_due_retries()
         ready = await self.store.tasks.list_ready_stages(
             limit=self.config.max_dispatch_per_tick * 4

@@ -42,6 +42,10 @@ __all__ = ["Supervisor"]
 #: 而不是悄悄给出一个不完整的事件流让 core 以为补齐了。
 EVENT_BUFFER = 1000
 
+#: 单次会话存活探测的超时。心跳循环每 5 秒过一轮，探测本身不该拖过一轮间隔，
+#: 否则探测会互相追赶，最终把整个循环钉死。
+PROBE_TIMEOUT_SECONDS = 4.0
+
 
 class SessionLedger:
     """supervisor 自己的会话台账。
@@ -303,33 +307,63 @@ class Supervisor:
             await writer.wait_closed()
         return True
 
+    async def _probe_alive(self, session_ref: str) -> bool:
+        """探测会话存活。**必须带超时。**
+
+        不带超时的话，一个卡住的探测会把整个心跳循环钉死——此后所有会话的心跳
+        与死亡通知一起停摆，故障从一个会话扩散到全部。探测失败一律按「不活着」
+        处理，由调用方标记 lost 并通知，不在这里吞掉结论。
+        """
+        try:
+            return bool(
+                await asyncio.wait_for(
+                    self.harness.session_alive(session_ref),
+                    timeout=PROBE_TIMEOUT_SECONDS,
+                )
+            )
+        except Exception:  # noqa: BLE001 - 探不出来就是不活着
+            return False
+
+    async def _mark_session_lost(self, session_ref: str, reason: str) -> None:
+        """标记会话已死，并通知 core。**标记与通知必须成对，且顺序不可换。**
+
+        拆开写的代价实测过：标记落了库，通知抛异常被上层 suppress 吞掉。此后
+        ``alive_sessions()`` 不再返回这个会话，它永远不会被复查；core 也永远
+        收不到这次死亡——阶段停在 running，任务无限期挂起，而两侧日志都干净。
+        """
+        await self.ledger.set_state(session_ref, "lost")
+        try:
+            await self._notify(
+                NOTIFICATIONS.SESSION_DIED,
+                {"session_ref": session_ref, "reason": reason},
+            )
+        except Exception as exc:  # noqa: BLE001 - _notify 已逐订阅者兜底，这里再兜一层
+            print(
+                f"[supervisor] 会话 {session_ref} 的死亡通知广播失败：{exc}",
+                file=sys.stderr,
+            )
+
     async def _reconcile_ledger(self) -> None:
-        """把台账里标 alive 但实际已死的会话改成 lost。
+        """把台账里标 alive 但实际已死的会话改成 lost，并通知 core。
 
         「台账说活着」不等于「真的活着」——这条纪律在 core 与 supervisor 两侧都成立。
+        对账同样是死亡通知的来源之一，不能只改状态不通知。
         """
         for row in await self.ledger.alive_sessions():
             session_ref = row["session_ref"]
-            alive = False
-            with contextlib.suppress(Exception):
-                alive = bool(await self.harness.session_alive(session_ref))
-            if not alive:
-                await self.ledger.set_state(session_ref, "lost")
+            if not await self._probe_alive(session_ref):
+                await self._mark_session_lost(session_ref, "对账发现进程已不存在")
 
     async def _heartbeat_loop(self) -> None:
         while not self._stopping:
             await asyncio.sleep(5.0)
             for row in await self.ledger.alive_sessions():
-                with contextlib.suppress(Exception):
-                    alive = await self.harness.session_alive(row["session_ref"])
-                    if alive:
-                        await self.ledger.heartbeat(row["session_ref"])
-                    else:
-                        await self.ledger.set_state(row["session_ref"], "lost")
-                        await self._notify(
-                            NOTIFICATIONS.SESSION_DIED,
-                            {"session_ref": row["session_ref"], "reason": "心跳缺失"},
-                        )
+                session_ref = row["session_ref"]
+                if await self._probe_alive(session_ref):
+                    with contextlib.suppress(Exception):
+                        await self.ledger.heartbeat(session_ref)
+                    continue
+                await self._mark_session_lost(session_ref, "心跳缺失")
 
     # ------------------------------------------------------------------
     # 连接处理
@@ -405,8 +439,23 @@ class Supervisor:
             await self._send(writer, {"jsonrpc": "2.0", "id": req_id, "error": err})
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
+        """广播给所有订阅者。**单个订阅者写失败不得影响其余订阅者。**
+
+        这里曾经是裸循环：一个写不进去的连接抛异常，后面所有订阅者都收不到这条
+        通知。而调用方（心跳循环）把它包在 suppress 里，于是异常静默消失，
+        「已标记 lost」却已经落库——那个会话再也不会被复查，死亡通知永久丢失。
+        core 被强杀时读循环可能一直不知道对面已经没了，死 writer 会一直留在
+        集合里，所以这里主动摘除，不指望读循环来收尸。
+        """
+        frame = {"jsonrpc": "2.0", "method": method, "params": params}
         for writer in list(self._subscribers):
-            await self._send(writer, {"jsonrpc": "2.0", "method": method, "params": params})
+            try:
+                await self._send(writer, frame)
+            except Exception:  # noqa: BLE001 - 通知是尽力而为，坏连接即摘除
+                self._subscribers.discard(writer)
+                self._write_locks.pop(id(writer), None)
+                with contextlib.suppress(Exception):
+                    writer.close()
 
     # ------------------------------------------------------------------
     # 方法分发

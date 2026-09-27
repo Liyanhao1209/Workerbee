@@ -150,6 +150,12 @@ class Engine:
 
         engine = cls(cfg, store)
         engine.harness = harness if harness is not None else await engine._build_harness()
+        # 台账只负责「何时调、失败了怎么办」，真正的关闭动作在适配层（RES-01）。
+        # 这条装配漏掉不会有任何报错：每一次会话清理都失败，资源停在
+        # teardown_failed，Reaper 每轮重试、每轮失败，错误永久挂在「需处理」里。
+        # 实测症状是「已完成的阶段一直报会话关不掉」，而阶段本身是成功的——
+        # 报错和真正出问题的地方不在一处，所以它必须和 harness 同时就位。
+        engine.ledger.harness_teardown = engine._teardown_harness_session
         engine._wire_security()
         await engine._build_pipeline()
         return engine
@@ -310,6 +316,45 @@ class Engine:
             task_id=None,
             payload={"session_ref": session_ref, "reason": reason},
         )
+
+    async def _teardown_harness_session(
+        self, spec: dict[str, Any]
+    ) -> tuple[bool, str | None]:
+        """L2 台账到 L3 适配层的会话关闭注入口（RES-01、LIFE-06）。
+
+        台账把 ``{**locator, **spec}`` 交给这里，所以 ``session_ref`` 来自登记时的
+        locator。返回 ``(ok, err)``；``ok=False`` 时资源保持 teardown_failed 并
+        继续可见，而不是被当成已释放。
+        """
+        session_ref = spec.get("session_ref")
+        if not session_ref:
+            return False, "台账里没有 session_ref，无法定位要关闭的会话"
+        if self.harness is None:
+            return False, "适配层未装配，无法关闭会话"
+
+        dispose = getattr(self.harness, "dispose", None)
+        if dispose is None:
+            return False, "当前适配层没有 dispose，无法关闭会话"
+        try:
+            await dispose(session_ref)
+        except Exception as exc:  # noqa: BLE001 - 清理边界，异常要变成可读结果
+            return False, f"关闭会话 {session_ref} 失败：{type(exc).__name__}: {exc}"
+
+        # dispose 内部把适配器异常吞成日志，所以「没抛异常」不等于「已关闭」。
+        # 复核一次存活，免得把仍然活着的会话记成已释放——那会让台账开始说谎。
+        # 留几次重试是因为关闭分级执行（SIGTERM → 宽限 → SIGKILL），
+        # 刚发完信号就查会读到「还没死」。
+        alive = getattr(self.harness, "session_alive", None)
+        if alive is None:
+            return True, None
+        for _ in range(3):
+            try:
+                if not await alive(session_ref):
+                    return True, None
+            except Exception as exc:  # noqa: BLE001
+                return False, f"复核会话 {session_ref} 存活状态失败：{type(exc).__name__}: {exc}"
+            await asyncio.sleep(0.5)
+        return False, f"会话 {session_ref} 在 dispose 之后仍然存活"
 
     def _wire_security(self) -> None:
         """把脱敏器接进事件日志。凭据在任何情况下都不进历史（AUTH-02）。"""
