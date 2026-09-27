@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+dist/
+build/
+
+# 运行时数据：数据库、产物、临时工作目录、密钥
+.workerbee/
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 前端
+node_modules/
+web/dist/
+
+# 文档抽取产物
+docs/_txt/

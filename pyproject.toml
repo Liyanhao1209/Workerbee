@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workerbee"
+version = "0.1.0"
+description = "Workerbee - a cross-platform multi-agent workflow orchestration framework over local agent harnesses"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "aiosqlite>=0.20",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "websockets>=12.0",
+    "httpx>=0.27",
+    "cryptography>=42.0",
+    "argon2-cffi>=23.1",
+    "ptyprocess>=0.7",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.3",
+    "hypothesis>=6.100",
+    "anyio>=4.3",
+]
+tui = ["textual>=0.60"]
+
+[project.scripts]
+workerbee = "workerbee.cli:main"
+workerbee-core = "workerbee.server.main:main"
+workerbee-supervisor = "workerbee.supervisor.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/workerbee"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+timeout = 300
+markers = [
+    "unit: 单元测试（纯逻辑，无 IO）",
+    "integration: 跨模块／跨层集成测试",
+    "interactive: tests that drive a real harness CLI (slow, needs login)",
+    "scenario: AC-xx acceptance scenario tests",
+    "fuzz: property-based tests",
+]
+
+[tool.hypothesis]
+max_examples = 200
+deadline = 5000
