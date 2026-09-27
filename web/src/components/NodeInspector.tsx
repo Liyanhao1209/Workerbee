@@ -76,7 +76,7 @@ export function NodeInspector({
 
       <Field
         label="必需输入（每行一个字段名）"
-        hint="声明后即选择「可机器校验的契约机制」：有效上游若没有声明对应输出契约，校验会报错（ACT-03）。留空表示不参与机器校验。"
+        hint="声明后，若上游没有声明对应的输出契约，校验会报错。留空表示不参与机器校验。"
       >
         <textarea
           className="textarea textarea--code"

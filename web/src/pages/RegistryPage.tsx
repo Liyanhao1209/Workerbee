@@ -68,7 +68,7 @@ function ReadError({
       title={error.unreachable ? '无法连接内核' : `无法读取${what}`}
       hint={
         error.unreachable
-          ? '这不是「没有数据」，而是读取失败——所以下面不会显示任何占位表格。'
+          ? '读取失败，不代表没有数据，下面不会显示占位内容。'
           : error.hint ?? undefined
       }
       actions={
@@ -136,7 +136,7 @@ function CapabilityCellView({ cell }: { cell: CapabilityCell }): JSX.Element {
     case 'supported':
       return <Pill tone="success" title="适配器声明支持这项功能。">支持</Pill>;
     case 'unsupported':
-      return <Pill tone="danger" title="适配器明确声明不支持，而不是没有声明。">不支持</Pill>;
+      return <Pill tone="danger" title="适配器明确声明不支持这项功能。">不支持</Pill>;
     case 'undeclared':
       return <Pill tone="idle" title="适配器没有声明这一项。">未声明</Pill>;
     case 'limited':

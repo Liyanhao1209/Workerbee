@@ -441,7 +441,7 @@ function DeleteResultBody({ result }: { result: WorkflowDeleteResponse }): JSX.E
     <div className="col">
       <Banner variant="info" title="三个结论相互独立，请不要当成一个「删除成功」">
         ① 已接受只表示控制意图已落库；② 执行是否真的停下；③ 归属资源是否清理干净——
-        任一项未达成都会在下面对应位置如实标出。
+        任一项未达成都会在下面标出。
       </Banner>
       <TriState outcome={result} />
       <div>

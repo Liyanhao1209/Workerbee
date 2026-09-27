@@ -125,7 +125,7 @@ export function DiagnosticsGrouped({
   const groups: { severity: Severity; title: string }[] = [
     { severity: 'error', title: '错误（阻断发布 / 发射）' },
     { severity: 'warning', title: '警告（可继续，但需知悉）' },
-    { severity: 'info', title: '说明（能力边界与如实标注）' },
+    { severity: 'info', title: '说明' },
   ];
   const total = diagnostics.length;
   return (

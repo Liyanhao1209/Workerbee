@@ -506,7 +506,7 @@ function BindModal({
       }
     >
       <Banner variant="warn" title="该模板含凭据槽位，必须先绑定">
-        模板里只有占位引用，没有明文凭据。未绑定的槽位不会被补上任何默认值——实例化会把它报成未绑定，而不是静默塞入一个凭据。
+        模板里只有占位引用，没有明文凭据。未绑定的槽位不会被补上默认值，实例化时会报成未绑定。
       </Banner>
 
       {error ? <SubmitError error={error} what="实例化失败" /> : null}
