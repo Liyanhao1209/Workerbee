@@ -202,7 +202,7 @@ def test_p2_degradation_chain_is_monotone_full_then_summary_then_pointer():
 
 
 def test_each_downgrade_step_is_recorded_in_degraded():
-    _, pkg = _mode_at(700)  # 落到纯指针：两级降级都要留痕
+    _, pkg = _mode_at(300)  # 落到纯指针：两级降级都要留痕
     degraded = "；".join(pkg.degraded)
 
     assert pkg.sources[0].mode == "pointer"
@@ -258,7 +258,7 @@ def test_required_upstreams_are_placed_before_optional_ones():
 # ---------------------------------------------------------------------------
 
 
-def test_credentials_never_reach_any_partition(store):
+async def test_credentials_never_reach_any_partition(store):
     secret = "sk-live-ABCDEFGHIJKLMNOP"
     bearer = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4"
     pkg = ContextAssembler().assemble(
@@ -432,14 +432,17 @@ def test_summary_that_failed_the_gate_is_a_handoff_failure():
     item = UpstreamInput(
         from_node_id="A",
         artifact=make_artifact("art-A", summary="未过门禁的摘要", summary_ok=False),
-        content="正文",
+        content=ascii_content(1200),
         task_id="t1",
     )
-    pkg = ContextAssembler().assemble(make_request(upstream=[item]))
+    pkg = ContextAssembler().assemble(make_request(max_total_tokens=1500, upstream=[item]))
 
     assert any("质量门禁" in h for h in pkg.handoff_failures)
     assert any("质量门禁" in d for d in pkg.degraded)
-    assert pkg.sources[0].mode == "pointer"  # 未过门禁的摘要不作为「短摘要」注入
+    # 未过门禁的摘要仍可作参考，但注入方式的标注必须与可信摘要区分开
+    assert pkg.sources[0].mode == "summary"
+    assert "注入方式=短摘要（未过质量门禁）" in pkg.user_input
+    assert pkg.sources[0].required is True
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +458,9 @@ def test_p1_overflow_borrows_from_p5_and_is_visible():
 
     assert pkg.partition("P1").over_budget()
     assert pkg.partition("P1").borrowed_from_reserve > 0
-    assert pkg.partition("P5").used_tokens == pkg.partition("P1").borrowed_from_reserve
+    # P5 的 borrowed_from_reserve 记的是「借出去多少」，与 P1 借到的一致，且被挤占可见
+    assert pkg.partition("P5").borrowed_from_reserve == pkg.partition("P1").borrowed_from_reserve
+    assert any("运行保留被前面的分区挤占" in d for d in pkg.partition("P5").degraded)
     assert any("不截断指令类内容" in d for d in pkg.degraded)
 
 

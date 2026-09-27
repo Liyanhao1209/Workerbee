@@ -57,10 +57,27 @@ class ApprovalBinding(DomainModel):
     action_fingerprint: str | None = None
     """被授权动作内容的指纹。内容变化即作废，防止「改了命令仍复用旧批准」。"""
 
+    @staticmethod
+    def fingerprint(action: str, target: str | None, tool_name: str | None) -> str:
+        """动作内容指纹。
+
+        刻意只取「工具 + 动作 + 目标」三元组：这三样一变，用户当初看到并批准的东西
+        就不一样了，旧批准自然不该继续有效。放在领域层，使 L5 与 L3 都不必依赖对方。
+        """
+        import hashlib
+
+        payload = f"{tool_name or ''}\x00{action}\x00{target or ''}"
+        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
 
 class ApprovalDecision(DomainModel):
     by: str = "user"
     at: datetime = Field(default_factory=utcnow)
+
+    approved: bool = True
+    """决定本身。``status`` 会因为送达失败而变成 undeliverable，
+    此时用户的真实意愿只能从这里读——所以它必须被记下来。"""
+
     modified_action: str | None = None
     """用户可修改后批准；回注原请求方的是修改后的动作。"""
 

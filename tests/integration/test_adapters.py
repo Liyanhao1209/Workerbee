@@ -171,13 +171,15 @@ async def test_mock_handshake_declares_capabilities(mock_harness):
 async def test_full_round_trip_create_events_terminate(mock_harness):
     ap, rec = await mock_harness(
         {
+            # 这条链要走完 dispose，所以终止后进程要活着（进程死亡另有用例）。
+            "exit_on_terminate": False,
             "steps": [
                 {"do": "output", "text": "第一段"},
                 {"do": "tool_use", "name": "Bash", "input": {"command": "ls"}},
                 {"do": "tool_result", "name": "Bash", "content": "a.txt"},
                 {"do": "usage", "input_tokens": 120, "output_tokens": 7, "cost_usd": 0.01},
                 {"do": "turn_end"},
-            ]
+            ],
         }
     )
     created = await ap.call(METHODS.SESSION_CREATE, create_params())
@@ -202,8 +204,11 @@ async def test_full_round_trip_create_events_terminate(mock_harness):
 
     terminated = await ap.call(METHODS.TERMINATE, {"session_ref": ref})
     assert terminated["terminated"] is True
-    assert await wait_until(lambda: ap.proc.returncode is not None, timeout=5.0)
+    assert terminated["already_dead"] is False
     assert "session_ended" in rec.kinds()
+    assert (await ap.call(METHODS.SESSION_STAT, {"session_ref": ref}))["session"][
+        "state"
+    ] == "ended"
 
     disposed = await ap.call(METHODS.SESSION_DISPOSE, {"session_ref": ref, "forget": True})
     assert disposed["disposed"] is True
@@ -397,18 +402,37 @@ async def test_cancel_chain_kills_child_within_bound(mock_harness):
 
 
 async def test_terminate_after_death_is_reported_not_faked(mock_harness):
-    """已经死了就说已经死了，不要表演一次「成功终止」。"""
-    ap, rec = await mock_harness({"steps": [{"do": "sleep_forever"}]})
+    """已经结束了就说已经结束了，不要表演第二次「成功终止」。"""
+    ap, rec = await mock_harness(
+        {"exit_on_terminate": False, "steps": [{"do": "sleep_forever"}]}
+    )
     created = await ap.call(METHODS.SESSION_CREATE, create_params())
     ref = created["session"]["session_ref"]
     first = await ap.call(METHODS.TERMINATE, {"session_ref": ref})
+    assert first["terminated"] is True
     assert first["already_dead"] is False
+
+    second = await ap.call(METHODS.TERMINATE, {"session_ref": ref})
+    assert second["already_dead"] is True
+    assert second["terminated"] is False  # 不能谎报终止成功
+    assert (await ap.call(METHODS.SESSION_STAT, {"session_ref": ref}))["session"][
+        "state"
+    ] == "ended"
+    await asyncio.sleep(0.2)  # 第二次终止不该多出一条 session_ended
+    assert rec.kinds().count("session_ended") == 1
+
+
+async def test_calls_after_adapter_exit_fail_explicitly(mock_harness):
+    """适配器进程没了：后续调用必须拿到明确错误，而不是「成功」或挂起。"""
+    ap, _ = await mock_harness({"steps": [{"do": "sleep_forever"}]})
+    created = await ap.call(METHODS.SESSION_CREATE, create_params())
+    ref = created["session"]["session_ref"]
+    await ap.call(METHODS.TERMINATE, {"session_ref": ref})
     assert await wait_until(lambda: ap.proc.returncode is not None)
 
-    # 进程已退出：后续调用必须拿到明确错误，而不是「成功」
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(AdapterError) as excinfo:
         await ap.call(METHODS.TERMINATE, {"session_ref": ref})
-    assert getattr(excinfo.value, "code", None) == ErrorCode.HARNESS_UNAVAILABLE
+    assert excinfo.value.code == ErrorCode.HARNESS_UNAVAILABLE
 
 
 async def test_dispose_and_close_leave_no_leftover(mock_harness):

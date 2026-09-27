@@ -64,9 +64,14 @@ class StateMachine:
         expected_epoch: int | None = None,
         **fields: Any,
     ) -> bool:
-        """迁移任务状态。返回 False 表示守卫未通过（并发方已改过）。"""
+        """迁移任务状态。返回 False 表示守卫未通过（并发方已改过）。
+
+        **始终以库中的当前状态为准**，而不是调用方传入的对象。调用方手里的
+        对象可能已经过期（例如刚写完事件、刚被并发操作改过），用它的状态做
+        合法性判断会得到错误的结论——把合法迁移误判成非法，或反之。
+        """
         task_id = task if isinstance(task, str) else task.task_id
-        current = task if isinstance(task, Task) else await self.store.tasks.get_task(task_id)
+        current = await self.store.tasks.get_task(task_id)
         if current is None:
             raise KeyError(f"任务不存在: {task_id}")
 
@@ -155,9 +160,8 @@ class StateMachine:
         **fields: Any,
     ) -> bool:
         stage_id = stage if isinstance(stage, str) else stage.stage_id
-        current = (
-            stage if isinstance(stage, TaskStage) else await self.store.tasks.get_stage(stage_id)
-        )
+        # 同上：以库中状态为准，不用调用方对象里可能过期的状态做判断。
+        current = await self.store.tasks.get_stage(stage_id)
         if current is None:
             raise KeyError(f"阶段不存在: {stage_id}")
 

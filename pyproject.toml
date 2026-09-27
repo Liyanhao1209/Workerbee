@@ -46,10 +46,13 @@ packages = ["src/workerbee"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 timeout = 300
+# 默认不跑真实 harness（慢、要登录、要花 token）。要跑显式指定：
+#   .venv/bin/python -m pytest -m interactive tests/interactive
+addopts = '-m "not interactive"'
 markers = [
     "unit: 单元测试（纯逻辑，无 IO）",
     "integration: 跨模块／跨层集成测试",
-    "interactive: tests that drive a real harness CLI (slow, needs login)",
+    "interactive: 驱动真实 harness CLI 的测试（慢、需要登录、消耗 token）",
     "scenario: AC-xx acceptance scenario tests",
     "fuzz: property-based tests",
 ]

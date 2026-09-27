@@ -211,7 +211,7 @@ class SummarizerPort(Protocol):
     """摘要生成与质量门禁（D-06、DATA-03）。"""
 
     async def summarize(
-        self, content: str, *, contract_fields: Sequence[str], max_chars: int = 2000
+        self, content: str, *, contract_fields: Sequence[str], max_chars: int = 24_000
     ) -> Any:
         """返回带 ``summary`` / ``covered_fields`` / ``missing_fields`` / ``ok`` 的结果。
 

@@ -143,6 +143,19 @@ async def cancel_chain(
     # 5) 台账遍历清理。只信台账，不看内存状态（RES-01）。
     report.resources = await ledger.close_for_attempt(in_flight.attempt_id)
 
+    # 5b) 把这次尝试记成已结束。不做这一步，尝试会永远停留在「在途」，
+    #     而「执行已停止」的判据依赖它（LIFE-06 的第二态）。
+    from ..domain.task import AttemptOutcome, ErrorClass
+
+    await store.tasks.complete_attempt(
+        in_flight.attempt_id,
+        outcome=AttemptOutcome(
+            error_class=ErrorClass.USER_CANCELLED,
+            detail=f"执行被取消（{reason}）",
+            error_kind="user_cancelled",
+        ),
+    )
+
     # 6) 代次递增：此后到达的迟到回调会被按代次丢弃（REC-05）
     await store.tasks.bump_attempt_generation(in_flight.attempt_id)
 

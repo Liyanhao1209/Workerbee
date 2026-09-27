@@ -464,23 +464,21 @@ async def delete_task(
             # 已完成阶段保留其真实结果，不改写为失败（LIFE-04、OBS-03）
             report.preserved_succeeded.append(st.stage_id)
 
-    # 2) 排队/等待中的阶段标记为取消
-    for st in stages:
+    # 2) 其余非终态阶段一并取消。
+    #    必须**重新读取**：上面那轮取消链改变了在途阶段的状态，
+    #    用旧列表判断会把它们漏掉，留下永远停在 RUNNING 的僵尸阶段。
+    for st in await store.tasks.list_stages(task_id):
         if st.observed_state in (
-            StageState.WAITING_DEPS,
-            StageState.READY,
-            StageState.RETRYING,
-            StageState.PAUSED,
-            StageState.AWAITING_APPROVAL,
+            StageState.SUCCEEDED,
+            StageState.FAILED,
+            StageState.SKIPPED,
+            StageState.CANCELLED,
         ):
-            if await sm.set_stage_state(
-                st, StageState.CANCELLED, reason=reason or "任务被删除", actor=actor
-            ):
-                report.cancelled_stages.append(st.stage_id)
-        elif st.observed_state == StageState.LOST:
-            await sm.set_stage_state(
-                st, StageState.CANCELLED, reason="删除任务时仍在核对", actor=actor
-            )
+            continue
+        if await sm.set_stage_state(
+            st, StageState.CANCELLED, reason=reason or "任务被删除", actor=actor
+        ):
+            report.cancelled_stages.append(st.stage_id)
 
     report.execution_stopped = all_stopped
     # 3) 任务级资源遍历清理（跨阶段的共享资源）

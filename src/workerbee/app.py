@@ -1,0 +1,841 @@
+"""组合根（架构设计 v0.02 §12 边界规则）。
+
+**只有这个模块可以同时 import 全部各层**。core 只依赖接口，data 与 security 互不感知，
+adapters 只能依赖自己的 SDK——这些约束在此处一次性接线，而不是让各层互相渗透。
+
+本模块对外暴露的是**用例级 API**（发射任务、暂停、删除、调序……），
+不是仓储 API。这样上层（HTTP 网关、TUI）不必知道内核内部有哪些部件，
+也不必按正确顺序调用它们——顺序是内核的事。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from pathlib import Path
+from typing import Any, Sequence
+
+from pydantic import Field
+
+from .core.domain.base import DomainModel
+from .core.resources.ledger import ResourceLedger
+from .core.resources.reaper import Reaper, ReaperConfig
+from .core.runtime import lifecycle as lc
+from .core.runtime.notifier import BroadcastNotifier
+from .core.runtime.reconcile import reconcile_on_startup, resume_from_stage
+from .core.runtime.scheduler import Scheduler, SchedulerConfig
+from .core.runtime.state import StateMachine
+from .data.store import Store
+from .security.approval_gateway import ApprovalGateway
+
+__all__ = ["EngineConfig", "Engine"]
+
+
+class EngineConfig(DomainModel):
+    """启动参数。全部有合理默认值，`workerbee-core` 开箱即跑。"""
+
+    data_dir: Path = Path(".workerbee")
+    workspace_dir: Path | None = None
+    """托管目录。资源台账只在这个范围内删除文件（RES-01 的安全底线）。"""
+
+    passphrase: str | None = None
+    """Secret Store 口令。None 表示本次不加载凭据库——
+    此时引用凭据的节点会在派发时给出明确错误，而不是静默匿名运行。"""
+
+    adapter_commands: dict[str, list[str]] = Field(default_factory=dict)
+    """adapter_id → 启动命令。留空用内置映射。"""
+
+    poll_interval: float = 1.0
+    reaper_interval: float = 300.0
+    approval_timeout: float = 900.0
+    artifact_gc_enabled: bool = False
+
+    node_cwd: Path | None = None
+    """节点执行的工作目录。None 时用 process 当前目录。"""
+
+    use_context_assembler: bool = True
+    use_summarizer: bool = True
+    llm_backend: str | None = None
+    """None 表示自动：优先 harness CLI（零额外配置），失败则退到无 LLM 模式。
+
+    这里不做静默降级——降级结果会写进 `Engine.startup_notes`，UI 如实展示。
+    """
+
+    llm_base_url: str | None = None
+    llm_api_key_locator: str | None = None
+    llm_model: str | None = None
+
+    def resolved_workspace(self) -> Path:
+        return Path(self.workspace_dir) if self.workspace_dir else self.data_dir / "workspace"
+
+    def db_path(self) -> Path:
+        return self.data_dir / "workerbee.db"
+
+    def artifact_root(self) -> Path:
+        return self.data_dir / "artifacts"
+
+
+class Engine:
+    """内核的组装与生命周期。"""
+
+    def __init__(self, config: EngineConfig, store: Store) -> None:
+        self.config = config
+        self.store = store
+        self.sm = StateMachine(store)
+        self.notifier = BroadcastNotifier()
+        self.startup_notes: list[str] = []
+
+        self.ledger = ResourceLedger(
+            store,
+            managed_roots=[config.resolved_workspace()],
+            default_grace_ms=3000,
+        )
+        self.approvals = ApprovalGateway(
+            store=store,
+            notifier=self.notifier,
+            timeout_seconds=config.approval_timeout,
+        )
+        self.scheduler: Scheduler | None = None
+        self.reaper: Reaper | None = None
+        self.harness: Any | None = None
+
+        self._secret_store: Any = None
+        self._redactor: Any = None
+        self._tasks: list[asyncio.Task] = []
+        self._running = False
+
+    # ------------------------------------------------------------------
+    # 构造
+    # ------------------------------------------------------------------
+
+    @classmethod
+    async def create(
+        cls, config: EngineConfig | None = None, *, harness: Any | None = None
+    ) -> "Engine":
+        cfg = config or EngineConfig()
+        Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
+        cfg.resolved_workspace().mkdir(parents=True, exist_ok=True)
+
+        store = await Store.open(str(cfg.db_path()))
+        store.artifacts.root = cfg.artifact_root()
+
+        engine = cls(cfg, store)
+        engine.harness = harness if harness is not None else await engine._build_harness()
+        engine._wire_security()
+        await engine._build_pipeline()
+        return engine
+
+    async def _build_harness(self) -> Any:
+        try:
+            from .adapters.host.router import HarnessRouter
+        except ImportError as exc:  # pragma: no cover - 适配层缺失时的显式降级
+            self.startup_notes.append(
+                f"未找到 HarnessRouter（{exc}）；本轮不接任何 harness，"
+                f"任务会在派发时给出明确错误"
+            )
+            return _UnavailableHarness(str(exc))
+
+        return await HarnessRouter.create(
+            self.store,
+            adapter_commands=self.config.adapter_commands or None,
+            secret_store=self._secret_store,
+            on_event=self._on_adapter_event,
+            on_permission=self.on_permission_request,
+            on_exit=self._on_adapter_exit,
+            log=self._log_adapter,
+        )
+
+    def _wire_security(self) -> None:
+        """把脱敏器接进事件日志。凭据在任何情况下都不进历史（AUTH-02）。"""
+        try:
+            from .security.secret_store import SecretRedactor
+        except ImportError:  # pragma: no cover
+            return
+
+        redactor = SecretRedactor()
+        self._redactor = redactor
+        self.store.events.set_redactor(redactor)
+        self._redact_artifacts(redactor)
+
+    def _redact_artifacts(self, redactor: Any) -> None:
+        """产物内容与摘要也要过脱敏。
+
+        摘要是 LLM 生成的，而上游正文里可能有凭据；产物正文本身也会被写进
+        下游的上下文。两处都不能漏（AUTH-02）。
+        """
+
+        original_put = self.store.artifacts.put
+
+        async def guarded_put(content, **kwargs):
+            summary = kwargs.get("summary")
+            if isinstance(summary, str) and summary:
+                kwargs["summary"] = redactor(summary)
+            if isinstance(content, str) and content:
+                content = redactor(content)
+            return await original_put(content, **kwargs)
+
+        self.store.artifacts.put = guarded_put  # type: ignore[assignment]
+
+    async def _build_pipeline(self) -> None:
+        """装配上下文组装器与摘要器。"""
+        llm = None
+        summarizer = None
+        assembler = None
+
+        if self.config.use_summarizer or self.config.use_context_assembler:
+            llm = await self._build_llm()
+
+        if self.config.use_summarizer:
+            from .data.summarizer import NullSummarizer, Summarizer
+
+            summarizer = (
+                Summarizer(llm, timeout=60.0) if llm is not None else NullSummarizer()
+            )
+            if llm is None:
+                self.startup_notes.append(
+                    "摘要器不可用，已退化为截断式摘要；交接会显式标记为「摘要不完整」"
+                    "而不是假装成功（DATA-03）"
+                )
+
+        if self.config.use_context_assembler:
+            from .data.context_assembler import ContextAssembler
+
+            assembler = ContextAssembler()
+
+        self.scheduler = Scheduler(
+            store=self.store,
+            sm=self.sm,
+            harness=self.harness,
+            ledger=self.ledger,
+            context_builder=assembler,
+            summarizer=summarizer,
+            notifier=self.notifier,
+            config=SchedulerConfig(poll_interval=self.config.poll_interval),
+            node_cwd=str(self.config.node_cwd) if self.config.node_cwd else None,
+        )
+        self.reaper = Reaper(
+            store=self.store,
+            ledger=self.ledger,
+            notifier=self.notifier,
+            config=ReaperConfig(
+                interval_seconds=self.config.reaper_interval,
+                artifact_gc_enabled=self.config.artifact_gc_enabled,
+            ),
+        )
+
+    async def _build_llm(self) -> Any | None:
+        from .data.llm import LLMRouter
+
+        backends: list[Any] = []
+        try:
+            from .data.llm import HarnessCLIBackend
+
+            backends.append(HarnessCLIBackend(harness=self.config.llm_model))
+        except Exception as exc:  # noqa: BLE001
+            self.startup_notes.append(f"本机 harness CLI 后端不可用：{exc}")
+
+        if self.config.llm_base_url and self.config.llm_api_key_locator:
+            key = await self._load_secret_value(self.config.llm_api_key_locator)
+            if key:
+                try:
+                    from .data.llm import OpenAICompatBackend
+
+                    backends.append(
+                        OpenAICompatBackend(
+                            base_url=self.config.llm_base_url,
+                            api_key=key,
+                            model=self.config.llm_model or "gpt-4o-mini",
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.startup_notes.append(f"API 后端配置无效：{exc}")
+            else:
+                self.startup_notes.append(
+                    "配置了 API 后端但凭据库未解锁，本次只用 harness CLI 后端"
+                )
+
+        if not backends:
+            return None
+        return LLMRouter(backends, on_fallback=self._on_llm_fallback)
+
+    @property
+    def secret_store(self) -> Any:
+        return self._secret_store
+
+    async def unlock_secrets(self, passphrase: str) -> int:
+        """解锁凭据库并把全部密值登记进脱敏器。返回登记条数。"""
+        from .security.secret_store import SecretStore
+
+        try:
+            store = await SecretStore.open(
+                passphrase, str(self.config.data_dir / "secrets.vault")
+            )
+        except FileNotFoundError:
+            store = await SecretStore.create(
+                passphrase, str(self.config.data_dir / "secrets.vault")
+            )
+        except Exception as exc:  # noqa: BLE001 - 口令错等，如实上抛
+            raise
+
+        self._secret_store = store
+        n = 0
+        redactor = getattr(self, "_redactor", None)
+        if redactor is not None:
+            with contextlib.suppress(Exception):
+                n = redactor.bind_store(store)
+        if self.harness is not None and hasattr(self.harness, "set_secret_store"):
+            self.harness.set_secret_store(store)
+        return n
+
+    async def _load_secret_value(self, locator: str) -> str | None:
+        """取一个凭据值。库未解锁时返回 None，由调用方如实降级而不是匿名运行。"""
+        store = self._secret_store
+        if store is None:
+            return None
+        try:
+            data = await store.get(locator)
+        except Exception:  # noqa: BLE001
+            return None
+        if not data:
+            return None
+        for value in data.values():
+            if value:
+                return value
+        return None
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+
+    async def start(self, *, reconcile: bool = True) -> None:
+        if self._running:
+            return
+        self._running = True
+
+        if self.harness is not None and hasattr(self.harness, "start"):
+            with contextlib.suppress(Exception):
+                await self.harness.start()
+
+        await self.store.events.append(
+            scope=_scope("system"),
+            type=_event("SYSTEM_START"),
+            actor=_actor("system"),
+            payload={"data_dir": str(self.config.data_dir)},
+        )
+
+        if reconcile:
+            report = await reconcile_on_startup(
+                store=self.store,
+                sm=self.sm,
+                harness=self.harness,
+                ledger=self.ledger,
+                scheduler=self.scheduler,
+                notifier=self.notifier,
+            )
+            if report.lost:
+                self.startup_notes.append(
+                    f"对账发现 {len(report.lost)} 个阶段状态不明，需人工核对（REC-04）"
+                )
+            if report.reattached:
+                self.startup_notes.append(
+                    f"对账恢复了 {len(report.reattached)} 个仍在执行的会话监控"
+                )
+
+        self._spawn(self.scheduler.run_forever(), "scheduler")
+        self._spawn(self.reaper.run_forever(), "reaper")
+        self._spawn(self._approval_expiry_loop(), "approval-expiry")
+        self._spawn(self._drain_loop(), "drain-ops")
+
+    def _spawn(self, coro: Any, name: str) -> None:
+        task = asyncio.create_task(coro, name=f"workerbee:{name}")
+        self._tasks.append(task)
+
+    async def stop(self) -> None:
+        self._running = False
+        if self.scheduler is not None:
+            self.scheduler.stop()
+        if self.reaper is not None:
+            self.reaper.stop()
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._tasks.clear()
+
+        if self.harness is not None and hasattr(self.harness, "stop"):
+            with contextlib.suppress(Exception):
+                await self.harness.stop()
+        with contextlib.suppress(Exception):
+            await self.store.events.append(
+                scope=_scope("system"),
+                type=_event("SYSTEM_STOP"),
+                actor=_actor("system"),
+                payload={},
+            )
+        await self.store.close()
+
+    async def _approval_expiry_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(max(1.0, min(30.0, self.config.approval_timeout / 10)))
+            with contextlib.suppress(Exception):
+                await self._expire_approvals_once()
+
+    async def _expire_approvals_once(self) -> list[dict[str, Any]]:
+        expired = await self.approvals.expire_due()
+        for item in expired:
+            # 超时的审批把阶段置为显式等待态，释放 stream 资源（§9.2、D-03）
+            with contextlib.suppress(Exception):
+                stage = await self.store.tasks.get_stage(item["stage_id"])
+                if stage is not None:
+                    await self.sm.set_stage_state(
+                        stage,
+                        _stage_blocked(),
+                        reason="审批超时（deny_pause），等待用户处置",
+                        actor="system",
+                        blocked_reason="审批等待超时，动作已被拒绝",
+                    )
+            await self.notifier.attention_required(
+                kind="approval_expired", task_id=item["task_id"], payload=item
+            )
+        return expired
+
+    async def _drain_loop(self) -> None:
+        """周期推进「排水」中的节点启停操作（D-01）。"""
+        while self._running:
+            await asyncio.sleep(2.0)
+            with contextlib.suppress(Exception):
+                done = await lc.complete_drain_ops(store=self.store, sm=self.sm)
+                for item in done:
+                    await self.notifier.attention_required(
+                        kind="node_disabled",
+                        task_id=None,
+                        payload=item,
+                    )
+
+    # ------------------------------------------------------------------
+    # 适配层回调
+    # ------------------------------------------------------------------
+
+    async def _on_adapter_event(self, event: Any) -> None:
+        if self.scheduler is None:
+            return
+        kind = str(getattr(event, "kind", ""))
+        session_ref = getattr(event, "session_ref", None)
+        if not session_ref:
+            return
+
+        if kind == "session_ended":
+            ok = bool(getattr(event, "data", {}).get("ok", True))
+            detail = getattr(event, "data", {}).get("detail")
+            await self.scheduler.on_session_ended(
+                session_ref=session_ref, ok=ok, detail=detail
+            )
+            await self.notifier.state_changed(task_id="", stage_id=None)
+            return
+
+        data = dict(getattr(event, "data", {}) or {})
+        if kind == "output" and getattr(event, "text", None) is not None:
+            data["text"] = event.text
+        await self.scheduler.on_event(session_ref=session_ref, kind=kind, payload=data)
+        # 进度类事件不必逐条推送（OBS-05），只在有状态含义时提醒
+        if kind in ("state_change", "compact", "error"):
+            await self.notifier.state_changed(task_id="", stage_id=None)
+
+    async def on_permission_request(self, request: Any) -> None:
+        """把 harness 的权限事件转译为 Approval（HUM-03）。"""
+        rt = None
+        if self.scheduler is not None:
+            rt = self.scheduler.runtime_for_session(request.session_ref)
+        if rt is None:
+            # 会话不在我们的在途表里：可能是已结束阶段的迟到请求。
+            # 不能凭空授权——如实登记一条无法归属的请求并拒发决定。
+            await self.notifier.attention_required(
+                kind="orphan_permission",
+                task_id=None,
+                payload={
+                    "session_ref": request.session_ref,
+                    "action": request.action,
+                    "note": "该权限请求无法归属到任何在途阶段，未自动处理",
+                },
+            )
+            return
+
+        stage = await self.store.tasks.get_stage(rt.stage_id)
+        task = await self.store.tasks.get_task(rt.task_id)
+        if stage is None or task is None:
+            return
+
+        approval = await self.approvals.request(
+            approval_id=request.approval_id,
+            task_id=task.task_id,
+            stage_id=stage.stage_id,
+            attempt_id=rt.attempt_id,
+            revision_seq=task.revision_seq,
+            node_id=stage.node_id,
+            action=request.action,
+            target=request.target,
+            risk=request.risk,
+            tool_name=request.tool_name,
+            workflow_name=task.workflow_name,
+            raw=getattr(request, "raw", None),
+        )
+
+        # 等待审批期间受保护操作不得执行，且阶段显示为「等待审批」——
+        # 它不占执行槽（D-03），同节点的后续任务可以继续跑。
+        if stage.observed_state.value == "running":
+            await self.sm.set_stage_state(
+                stage,
+                _stage_awaiting(),
+                reason=f"等待用户审批：{approval.action[:80]}",
+                actor="adapter",
+                status_reason="等待审批（不占用执行节点）",
+            )
+        await self.notifier.state_changed(task_id=task.task_id, stage_id=stage.stage_id)
+
+    async def _on_adapter_exit(self, harness_id: str, code: int | None, stderr: str) -> None:
+        await self.store.events.append(
+            scope=_scope("session"),
+            type=_event("SESSION_LOST"),
+            actor=_actor("adapter"),
+            payload={
+                "harness_id": harness_id,
+                "exit_code": code,
+                "stderr_tail": stderr[-2000:] if stderr else None,
+                "note": "适配器进程退出；相关会话状态未知，等待对账（REC-02）",
+            },
+        )
+        await self.notifier.attention_required(
+            kind="adapter_exited",
+            task_id=None,
+            payload={"harness_id": harness_id, "exit_code": code},
+        )
+
+    def _log_adapter(self, message: str) -> None:
+        # 适配器日志可能夹带 harness 原始输出；过一遍脱敏再落地
+        redactor = getattr(self, "_redactor", None)
+        if redactor is not None and message:
+            with contextlib.suppress(Exception):
+                message = redactor(message)
+        print(f"[adapter] {message}")
+
+    async def _on_llm_fallback(self, *args: Any, **kwargs: Any) -> None:
+        """LLM 后端降级必须可见（不静默）。"""
+        await self.notifier.attention_required(
+            kind="llm_fallback",
+            task_id=None,
+            payload={"detail": str(args) or str(kwargs)},
+        )
+
+    # ------------------------------------------------------------------
+    # 用例 API：发射与控制
+    # ------------------------------------------------------------------
+
+    async def submit(
+        self,
+        *,
+        workflow_id: str,
+        input_payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        priority: int = 50,
+        actor: str = "user",
+    ) -> dict[str, Any]:
+        from .core.runtime.launch import launch_task
+
+        try:
+            result = await launch_task(
+                store=self.store,
+                workflow_id=workflow_id,
+                input_payload=input_payload,
+                idempotency_key=idempotency_key,
+                priority=priority,
+                actor=actor,
+            )
+        except Exception as exc:
+            from .core.runtime.launch import LaunchRejected
+
+            if isinstance(exc, LaunchRejected):
+                return {
+                    "accepted": False,
+                    "report": exc.report.model_dump(mode="json"),
+                }
+            raise
+
+        await self.notifier.state_changed(task_id=result.task.task_id)
+        return {
+            "accepted": True,
+            "created": result.created,
+            "task_id": result.task.task_id,
+        }
+
+    async def pause(self, task_id: str, *, from_node_id: str | None = None, reason: str | None = None):
+        return await lc.pause_task(
+            store=self.store, sm=self.sm, harness=self.harness, ledger=self.ledger,
+            task_id=task_id, origin_node_id=from_node_id, reason=reason,
+        )
+
+    async def resume(self, task_id: str, *, restart_failed: bool = False):
+        return await lc.resume_task(
+            store=self.store, sm=self.sm, harness=self.harness, ledger=self.ledger,
+            task_id=task_id, restart_failed=restart_failed,
+        )
+
+    async def delete_task(self, task_id: str, *, from_node_id: str | None = None, reason: str | None = None):
+        return await lc.delete_task(
+            store=self.store, sm=self.sm, harness=self.harness, ledger=self.ledger,
+            task_id=task_id, origin_node_id=from_node_id, reason=reason,
+        )
+
+    async def delete_workflow(self, workflow_id: str):
+        return await lc.delete_workflow(
+            store=self.store, sm=self.sm, harness=self.harness, ledger=self.ledger,
+            workflow_id=workflow_id,
+        )
+
+    async def set_node_enabled(
+        self, workflow_id: str, node_id: str, enable: bool, *, mode: str = "drain", reason: str | None = None
+    ):
+        return await lc.set_node_enabled(
+            store=self.store, sm=self.sm, harness=self.harness, ledger=self.ledger,
+            workflow_id=workflow_id, node_id=node_id, enable=enable, mode=mode, reason=reason,
+        )
+
+    async def preview_toggle(self, workflow_id: str, node_id: str, enable: bool) -> dict[str, Any]:
+        """ACT-02 的路径可见：操作前展示受影响的节点、依赖与任务范围。"""
+        from .core.graph.validate import validate_toggle
+
+        rev = await self.store.workflows.get_current_revision(workflow_id)
+        if rev is None:
+            raise ValueError("Workflow 没有可用的修订版本")
+        registry = await self.store.registry.snapshot()
+        delta, report = validate_toggle(rev.graph, node_id, enable, registry)
+
+        affected_tasks: list[str] = []
+        for task in await self.store.tasks.list_live_tasks():
+            if task.workflow_id != workflow_id:
+                continue
+            stages = await self.store.tasks.list_stages(task.task_id)
+            if any(s.node_id == node_id for s in stages):
+                affected_tasks.append(task.task_id)
+
+        return {
+            "delta": delta.model_dump(mode="json"),
+            "report": report.model_dump(mode="json"),
+            "affected_tasks": affected_tasks,
+        }
+
+    async def reorder(self, node_id: str, stage_ids: Sequence[str]):
+        return await lc.reorder_stages(
+            store=self.store, node_id=node_id, ordered_stage_ids=stage_ids
+        )
+
+    async def resume_from_stage(self, task_id: str, node_id: str) -> dict[str, Any]:
+        return await resume_from_stage(
+            store=self.store, sm=self.sm, task_id=task_id, node_id=node_id
+        )
+
+    # ------------------------------------------------------------------
+    # 用例 API：查询
+    # ------------------------------------------------------------------
+
+    async def task_detail(self, task_id: str) -> dict[str, Any]:
+        task = await self.store.tasks.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        stages = await self.store.tasks.list_stages(task_id)
+        attempts = await self.store.tasks.list_attempts_for_task(task_id)
+        artifacts = await self.store.artifacts.list_by_task(task_id)
+        approvals = await self.store.approvals.list_for_task(task_id)
+        return {
+            "task": task.model_dump(mode="json"),
+            "stages": [s.model_dump(mode="json") for s in stages],
+            "attempts": [a.model_dump(mode="json") for a in attempts],
+            "artifacts": [
+                {
+                    "artifact_id": a.artifact_id,
+                    "kind": a.kind.value,
+                    "summary": a.summary,
+                    "summary_ok": a.summary_ok,
+                    "covered_fields": a.covered_fields,
+                    "size_bytes": a.size_bytes,
+                    "sensitivity": a.sensitivity,
+                    "producer": a.producer.model_dump(mode="json") if a.producer else None,
+                }
+                for a in artifacts
+            ],
+            "approvals": [a.model_dump(mode="json") for a in approvals],
+        }
+
+    async def node_queue(self, node_id: str) -> dict[str, Any]:
+        """节点队列投影（RUN-04）：权威队列在 Task/TaskStage 表，这里是只读视图。"""
+        pending = await self.store.tasks.list_stages_by_node(
+            node_id, states=[_stage_waiting(), _stage_ready()]
+        )
+        running = await self.store.tasks.list_stages_by_node(
+            node_id, states=[_stage_dispatching(), _stage_running(), _stage_awaiting()]
+        )
+        history = await self.store.tasks.list_all_stages_by_node(node_id, limit=100)
+        return {
+            "node_id": node_id,
+            "pending": [s.model_dump(mode="json") for s in pending],
+            "running": [s.model_dump(mode="json") for s in running],
+            "history": [s.model_dump(mode="json") for s in history],
+        }
+
+    async def attention_items(self) -> dict[str, Any]:
+        """「需处理」入口（OBS-05）：审批、失败、清理未完成、状态不明。"""
+        approvals = await self.approvals.open_items()
+        failed = await self.store.tasks.list_tasks(
+            states=[_task_failed(), _task_blocked()], limit=100
+        )
+        lost = await self.store.tasks.list_stages_in_states([_stage_lost()])
+        unresolved = await self.ledger.teardown_failed()
+        return {
+            "approvals": [a.model_dump(mode="json") for a in approvals],
+            "failed_tasks": [t.model_dump(mode="json") for t in failed],
+            "lost_stages": [s.model_dump(mode="json") for s in lost],
+            "unresolved_resources": unresolved,
+            "startup_notes": self.startup_notes,
+        }
+
+    async def storage_report(self) -> dict[str, Any]:
+        if self.reaper is None:
+            return await self.store.db.storage_report()
+        return await self.reaper.storage_report()
+
+    async def approve(
+        self, approval_id: str, *, approve: bool, by: str = "user", modified_action: str | None = None
+    ):
+        return await self.approvals.decide(
+            approval_id, approve=approve, by=by, modified_action=modified_action
+        )
+
+
+# ---------------------------------------------------------------------------
+# 状态枚举的惰性引用（避免在模块顶部引入过多领域导入）
+# ---------------------------------------------------------------------------
+
+
+def _stage(state: str):
+    from .core.domain.task import StageState
+
+    return StageState(state)
+
+
+def _task(state: str):
+    from .core.domain.task import TaskState
+
+    return TaskState(state)
+
+
+def _stage_blocked():
+    return _stage("blocked")
+
+
+def _stage_ready():
+    return _stage("ready")
+
+
+def _stage_running():
+    return _stage("running")
+
+
+def _stage_dispatching():
+    return _stage("dispatching")
+
+
+def _stage_awaiting():
+    return _stage("awaiting_approval")
+
+
+def _stage_waiting():
+    return _stage("waiting_deps")
+
+
+def _stage_lost():
+    return _stage("lost")
+
+
+def _task_failed():
+    return _task("failed")
+
+
+def _task_blocked():
+    return _task("blocked")
+
+
+def _scope(name: str):
+    from .data.event_log import EventScope
+
+    return {
+        "system": EventScope.SYSTEM,
+        "session": EventScope.SESSION,
+        "workflow": EventScope.WORKFLOW,
+    }[name]
+
+
+def _event(name: str):
+    from .data.event_log import EventType
+
+    return getattr(EventType, name)
+
+
+def _actor(name: str):
+    from .data.event_log import EventActor
+
+    return EventActor(name)
+
+
+class _UnavailableHarness:
+    """适配层不可用时的替身。
+
+    它**明确失败**而不是静默空转：派发一个任务会得到一条可读的原因，
+    而不是永远停在 dispatching。
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    async def create_session(self, **kwargs: Any) -> Any:
+        from .adapters.sdk.protocol import AdapterError, ErrorCode
+
+        raise AdapterError(
+            ErrorCode.HARNESS_UNAVAILABLE, f"适配层不可用：{self.reason}"
+        )
+
+    async def capabilities(self, harness_id: str) -> Any:
+        from .core.runtime.ports import SessionCaps
+
+        return SessionCaps()
+
+    async def session_alive(self, session_ref: str) -> bool:
+        return False
+
+    async def dispose(self, session_ref: str) -> None:
+        return None
+
+    async def terminate(self, session_ref: str, *, signal: str = "TERM") -> bool:
+        return True
+
+    async def abort_stream(self, session_ref: str) -> None:
+        return None
+
+    async def checkpoint(self, session_ref: str) -> str | None:
+        return None
+
+    async def pause(self, session_ref: str) -> bool:
+        return False
+
+    async def compact(self, session_ref: str, threshold: int | None) -> dict[str, Any]:
+        return {"ok": False, "reason": "适配层不可用"}
+
+    async def send_input(self, session_ref: str, text: str, *, kind: str = "user") -> bool:
+        return False
+
+    async def interrupt(self, session_ref: str) -> bool:
+        return False
+
+    async def resume_session(self, **kwargs: Any) -> Any:
+        from .adapters.sdk.protocol import AdapterError, ErrorCode
+
+        raise AdapterError(ErrorCode.NOT_SUPPORTED, "适配层不可用")

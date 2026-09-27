@@ -17,11 +17,15 @@
       "manifest": {"protocol_version": "1.0", "harness_family": "mock", ...},
       "handshake": {"skip_version_check": false},
       "drop_methods": ["session.list"],          # 收下但永不回包（测在途崩溃）
+      "unsupported_methods": ["control.compact"],  # 回 NOT_SUPPORTED（测降级路径）
       "methods_delay_ms": {"session.create": 300},  # 回包前先拖一会儿（测超时）
       "exit_on_terminate": true,                 # terminate 后进程退出（取消链）
       "steps": [ ... ],
       "on_input": [ ... ]                        # 收到 io.send_input 后追加执行
     }
+
+``unsupported_methods`` 与 ``manifest.capabilities`` 里的 False 是一件事的两面：
+剧本要测降级时，两边都得写，否则就成了「声明不支持却做得到」的假替身。
 
 步骤（``{"do": ...}``）：
 
@@ -101,6 +105,13 @@ class MockScript(BaseModel):
     drop_methods: list[str] = Field(default_factory=list)
     """收下这些方法但永不回包——制造「在途请求」用。"""
 
+    unsupported_methods: list[str] = Field(default_factory=list)
+    """对这些方法回 NOT_SUPPORTED——测内核的降级路径（D-07、D-09）。
+
+    用它与 ``manifest.capabilities`` 里对应的 False 配对写：声明不支持，
+    协议上就真的做不到，而不是「声明 False 却样样都行」的假替身。
+    """
+
     methods_delay_ms: dict[str, int] = Field(default_factory=dict)
     """这些方法回包前先睡一会儿——测内核侧超时。"""
 
@@ -154,6 +165,10 @@ class MockSession:
     events_emitted: int = 0
     task: asyncio.Task | None = None
     pause_requested: bool = False
+
+    credential_keys: list[str] = field(default_factory=list)
+    """收到的凭据**键名**，供测试断言「凭据确实传到了适配器」。
+    只记键名不记值——AUTH-02 允许指代，不允许留存。"""
 
     def alive(self) -> bool:
         return self.state in ("alive", "paused")
@@ -248,6 +263,12 @@ class MockAdapter(AdapterBase):
 
     async def _dispatch(self, method: str, params: dict) -> Any:
         self._calls.append({"method": method, "params": params})
+        if method in self.script.unsupported_methods:
+            raise AdapterError(
+                ErrorCode.NOT_SUPPORTED,
+                f"剧本声明本替身不支持 {method}",
+                {"mock_unsupported": method},
+            )
         if method in self.script.drop_methods:
             # 永不回包：内核侧的请求会一直挂着，直到本进程退出或调用超时。
             await asyncio.Event().wait()
@@ -272,8 +293,21 @@ class MockAdapter(AdapterBase):
             attempt_id=request.attempt_id,
             model_name=request.model_name or None,
             created_at=_now_iso(),
+            credential_keys=sorted((request.harness.credential or {}).keys()),
         )
         self._sessions[session_ref] = session
+        # 会话真的起来了才发 session_started；真实适配器是在 init 行到达时报的，
+        # 这里创建即就绪，所以在脚本第一步之前发，保证事件顺序与真实情形一致。
+        await self.emit_event(
+            EventKind.SESSION_STARTED,
+            session_ref=session_ref,
+            attempt_id=session.attempt_id,
+            data={
+                "persist_locator": session.persist_locator,
+                "harness_id": session.harness_id,
+                "model": session.model_name,
+            },
+        )
         await self._start_script(session, self.script.steps, start_index=0)
         return {"session": session.to_info().model_dump(mode="json"), "created": True}
 
@@ -294,6 +328,7 @@ class MockAdapter(AdapterBase):
             attempt_id=request.attempt_id,
             model_name=request.model_name or None,
             created_at=_now_iso(),
+            credential_keys=sorted((request.harness.credential or {}).keys()),
         )
         self._sessions[session_ref] = session
         await self.emit_event(
@@ -323,6 +358,8 @@ class MockAdapter(AdapterBase):
                 "events_emitted": session.events_emitted,
                 "calls_seen": len(self._calls),
                 "pending_permissions": sorted(self._pending_permissions),
+                # 只回键名：让测试能断言「凭据确实到了适配器」，又不把值带出子进程。
+                "credential_keys": list(session.credential_keys),
             },
         }
 
@@ -416,8 +453,23 @@ class MockAdapter(AdapterBase):
     async def on_terminate(self, params: dict) -> dict:
         session = self._get_session(params)
         signal = str(params.get("signal") or "TERM").upper()
+        if session.state == "ended":
+            # 已经结束了就照实说，不要表演一次「成功终止」（§8.3）。
+            return {
+                "ok": True,
+                "session_ref": session.session_ref,
+                "terminated": False,
+                "already_dead": True,
+                "signal": signal,
+            }
         await self._stop_script(session)
         session.state = "ended"
+        await self.emit_event(
+            EventKind.STATE_CHANGE,
+            session_ref=session.session_ref,
+            attempt_id=session.attempt_id,
+            data={"state": "ended", "reason": "terminate", "signal": signal},
+        )
         await self.emit_event(
             EventKind.SESSION_ENDED,
             session_ref=session.session_ref,
@@ -432,6 +484,7 @@ class MockAdapter(AdapterBase):
             "ok": True,
             "session_ref": session.session_ref,
             "terminated": True,
+            "already_dead": False,
             "signal": signal,
             "exit_on_terminate": self.script.exit_on_terminate,
         }
