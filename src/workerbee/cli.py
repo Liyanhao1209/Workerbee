@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -35,6 +36,39 @@ app.add_typer(workflow_app, name="workflow")
 
 DEFAULT_API = os.environ.get("WORKERBEE_API", "http://127.0.0.1:8765")
 DEFAULT_PORT = 8765
+
+#: systemd user service 的默认 PATH。守护进程**不**继承登录 shell 的 PATH，
+#: 而 harness（claude 常在 ~/.nvm/...、kimi 常在 ~/.kimi-code/bin）几乎都装在
+#: 这个范围之外。doctor 要能在装服务之前就把这件事说破。
+_SERVICE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _in_default_service_path(path: str) -> bool:
+    """该可执行文件是否落在守护进程的默认 PATH 覆盖范围内。"""
+    parent = str(Path(path).parent)
+    return parent in _SERVICE_PATH.split(":")
+
+
+def _read_registrations(db: Path) -> list[dict[str, Any]] | None:
+    """只读地看一眼注册表。读不到返回 None。
+
+    doctor 是离线命令，不该为了看这么一眼就去装配整个内核（那会起连接、跑迁移）。
+    以只读模式打开，也不会干扰正在运行的内核。
+    """
+    if not db.exists():
+        return None
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT harness_id, exec_path, last_probe_ok, last_probe_error "
+                    "FROM harness_registration ORDER BY harness_id"
+                )
+            ]
+    except sqlite3.Error:
+        return None
 
 
 def _client(base_url: str, token: str | None):
@@ -78,6 +112,7 @@ def doctor(
     typer.echo("")
 
     typer.echo("依赖")
+    found: dict[str, str] = {}
     for cmd, why in (
         ("claude", "Claude Code harness 适配器"),
         ("kimi", "Kimi Code harness 适配器"),
@@ -85,9 +120,24 @@ def doctor(
     ):
         path = shutil.which(cmd)
         if path:
+            found[cmd] = path
             typer.echo(f"  [ok] {cmd:8s} {path}")
         else:
             typer.echo(f"  [--] {cmd:8s} 未找到（{why} 将不可用）")
+
+    # 这一节存在的理由：上面查的是**你当前 shell** 的 PATH，而真正拉起 harness 的
+    # 是守护进程。把内核装成服务时它不继承 shell 的 PATH，于是 doctor 说「找得到」
+    # 而探测照样失败——两边查的根本不是同一个环境，这个差异极难自行反推。
+    outside = {c: p for c, p in found.items() if not _in_default_service_path(p)}
+    if outside:
+        typer.echo("")
+        typer.echo("  [!!] 以下可执行文件在当前 shell 能找到，但守护进程默认找不到：")
+        for cmd, path in outside.items():
+            typer.echo(f"       {cmd:8s} {path}")
+        typer.echo(f"       守护进程默认 PATH：{_SERVICE_PATH}")
+        typer.echo("       把内核作为服务运行时，探测与派发都会失败。二选一：")
+        typer.echo("         1. 在注册表的「可执行路径」里填上面的绝对路径（推荐，按 harness 精确指定）")
+        typer.echo("         2. 在 service unit 里设 Environment=PATH=... 把它并进去")
 
     typer.echo("")
     typer.echo("数据目录")
@@ -113,6 +163,26 @@ def doctor(
         f"  [{'ok' if vault.exists() else '--'}] 凭据库 {vault}"
         f"{'' if vault.exists() else '（尚未创建）'}"
     )
+
+    typer.echo("")
+    typer.echo("已登记的 harness")
+    rows = _read_registrations(db)
+    if rows is None:
+        typer.echo("  [--] 读不到注册表（数据库尚未创建）")
+    elif not rows:
+        typer.echo("  [--] 尚未登记任何 harness")
+    else:
+        for row in rows:
+            exec_path = row["exec_path"] or "（跟随 PATH——服务形态下多半找不到）"
+            if row["last_probe_ok"] is None:
+                probe = "尚未探测"
+            elif row["last_probe_ok"]:
+                probe = "成功"
+            else:
+                detail = (row["last_probe_error"] or "").strip().replace("\n", " ")
+                probe = f"失败：{detail[:70]}"
+            typer.echo(f"  {row['harness_id']:12s} 可执行路径 = {exec_path}")
+            typer.echo(f"  {'':12s} 最近探测   = {probe}")
 
     typer.echo("")
     typer.echo("内核")

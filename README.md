@@ -175,6 +175,15 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=%h/workerbee
+
+# 关键：守护进程不继承你登录 shell 的 PATH。systemd 默认只给
+# /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin，
+# 而 claude 常装在 ~/.nvm/.../bin、kimi 常装在 ~/.kimi-code/bin——
+# 少了这一行，`workerbee doctor` 在终端里说「找得到」，
+# 而 supervisor 拉起 harness 时会失败，且两边都看不出原因。
+# `workerbee doctor` 会在你的 harness 位于默认 PATH 之外时明确提示。
+Environment=PATH=%h/.kimi-code/bin:%h/.nvm/versions/node/v22.23.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 ExecStart=%h/workerbee/.venv/bin/workerbee-supervisor --data-dir %h/.workerbee
 Restart=always
 RestartSec=3
@@ -182,6 +191,10 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 ```
+
+`Environment=PATH=` 里的两个路径按你机器上的实际位置改（用 `command -v claude`、`command -v kimi` 查）。
+
+**也可以不改 unit**，改为在注册表的「可执行路径」字段里给每个 harness 填绝对路径。那样更精确、且不受 PATH 影响，代价是每个 harness 各填一次。
 
 `~/.config/systemd/user/workerbee-core.service`：
 
