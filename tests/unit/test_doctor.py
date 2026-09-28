@@ -1,12 +1,11 @@
 """`workerbee doctor` 的环境报告。
 
-重点在**它必须说破的那个陷阱**：doctor 查的是当前 shell 的 PATH，而真正拉起
-harness 的是守护进程，后者不继承登录 shell 的 PATH。claude 常装在 ~/.nvm/...、
-kimi 常装在 ~/.kimi-code/bin，都不在 systemd 的默认 PATH 里。
+重点在它必须分清两件事：**你当前 shell 看到的**，和**守护进程实际会用的**。
+真正拉起 harness 的是后者，而服务形态拿到的是 systemd 的默认 PATH，与 shell
+的不是同一个。真出过这事：doctor 在终端里报「kimi 在 ~/.kimi-code/bin/kimi」，
+用户以为一切就绪，装成服务后探测照样失败——两边输出长得几乎一样，无从反推。
 
-真出过这事：`workerbee doctor` 在终端里报「kimi /home/.../.kimi-code/bin/kimi」，
-用户以为一切就绪，装成服务后探测照样失败——因为 supervisor 看不到那个目录。
-两边查的根本不是同一个环境，光看输出无从反推。所以 doctor 要主动提示。
+所以 doctor 两套都报，并且只在**两者不一致**时才告警。
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from workerbee.cli import _in_default_service_path, app
+from workerbee.cli import app
 
 pytestmark = pytest.mark.unit
 
@@ -28,64 +27,63 @@ def _run(*args: str) -> str:
     return result.output
 
 
-# ===========================================================================
-# 判定本身
-# ===========================================================================
+def _fake_which(monkeypatch, mapping: dict[str, str | None]) -> None:
+    monkeypatch.setattr("workerbee.cli.shutil.which", lambda cmd: mapping.get(cmd))
 
 
-def test_paths_inside_the_service_path_are_recognized():
-    assert _in_default_service_path("/usr/bin/git")
-    assert _in_default_service_path("/usr/local/bin/claude")
-    assert _in_default_service_path("/usr/sbin/whatever")
-
-
-def test_paths_outside_the_service_path_are_recognized():
-    """用户自己装的 harness 基本都落在这些位置。"""
-    assert not _in_default_service_path("/home/u/.kimi-code/bin/kimi")
-    assert not _in_default_service_path("/home/u/.nvm/versions/node/v22.23.2/bin/claude")
-    assert not _in_default_service_path("/home/u/.local/bin/claude")
-    # 前缀相同但目录不同，不能误判成「在里面」
-    assert not _in_default_service_path("/usr/local/bin/../home/u/claude")
-
-
-# ===========================================================================
-# 输出
-# ===========================================================================
-
-
-def test_warns_when_a_harness_is_outside_the_service_path(tmp_path, monkeypatch):
-    """hook 出来的路径在默认 PATH 之外时，必须给出提示与两种处理方式。"""
+def _fake_resolve(monkeypatch, mapping: dict[str, str | None]) -> None:
     monkeypatch.setattr(
-        "workerbee.cli.shutil.which",
-        lambda cmd: f"/home/u/.kimi-code/bin/{cmd}" if cmd == "kimi" else None,
+        "workerbee.cli.resolve_executable", lambda _path, cmd: mapping.get(cmd)
     )
+
+
+# ===========================================================================
+# 两套视角都要报
+# ===========================================================================
+
+
+def test_reports_both_shell_view_and_daemon_view(tmp_path, monkeypatch):
+    """两个视角必须都出现——只报一个正是当初误导人的原因。"""
+    _fake_which(monkeypatch, {"claude": "/home/u/.local/bin/claude", "kimi": None})
+    _fake_resolve(monkeypatch, {"claude": "/home/u/.local/bin/claude", "kimi": "/home/u/.kimi-code/bin/kimi"})
 
     out = _run("--data-dir", str(tmp_path))
 
-    assert "守护进程默认找不到" in out
+    assert "你当前 shell 看到的" in out
+    assert "守护进程解析" in out
     assert "/home/u/.kimi-code/bin/kimi" in out
+
+
+def test_no_warning_when_the_daemon_can_resolve_everything(tmp_path, monkeypatch):
+    """守护进程找得到就不该告警——哪怕你的 shell 找不到。"""
+    _fake_which(monkeypatch, {"claude": None, "kimi": None})
+    _fake_resolve(monkeypatch, {"claude": "/opt/x/claude", "kimi": "/opt/x/kimi"})
+
+    out = _run("--data-dir", str(tmp_path))
+
+    assert "守护进程找不到" not in out
+
+
+def test_warns_when_only_the_shell_can_find_a_harness(tmp_path, monkeypatch):
+    """真正的缺口：shell 找得到、守护进程找不到。这时才需要提示两种处理方式。"""
+    _fake_which(monkeypatch, {"claude": "/home/u/odd-place/claude", "kimi": None})
+    _fake_resolve(monkeypatch, {"claude": None, "kimi": None})
+
+    out = _run("--data-dir", str(tmp_path))
+
+    assert "守护进程找不到" in out
+    assert "/home/u/odd-place/claude" in out
     assert "可执行路径" in out and "Environment=PATH=" in out, "要给出两种可行的处理方式"
 
 
-def test_no_warning_when_everything_is_inside_the_service_path(tmp_path, monkeypatch):
-    """都在默认 PATH 里时不该平白吓唬人。"""
-    monkeypatch.setattr(
-        "workerbee.cli.shutil.which",
-        lambda cmd: f"/usr/bin/{cmd}",
-    )
-
-    out = _run("--data-dir", str(tmp_path))
-
-    assert "守护进程默认找不到" not in out
-
-
-def test_missing_harness_is_reported_as_unavailable(tmp_path, monkeypatch):
-    monkeypatch.setattr("workerbee.cli.shutil.which", lambda _cmd: None)
+def test_missing_everywhere_is_reported_as_unavailable(tmp_path, monkeypatch):
+    _fake_which(monkeypatch, {"claude": None, "kimi": None})
+    _fake_resolve(monkeypatch, {"claude": None, "kimi": None})
 
     out = _run("--data-dir", str(tmp_path))
 
     assert "未找到" in out
-    assert "守护进程默认找不到" not in out, "根本没找到就不是 PATH 差异问题"
+    assert "守护进程找不到" not in out, "两边都没有就不是环境差异问题"
 
 
 # ===========================================================================
@@ -120,7 +118,7 @@ def test_registrations_are_listed_with_probe_result(tmp_path, monkeypatch):
     out = _run("--data-dir", str(tmp_path))
 
     assert "已登记的 harness" in out
-    assert "跟随 PATH" in out, "空 exec_path 要说明它走 PATH 查找"
+    assert "自动解析" in out, "空 exec_path 要说明它由适配器解析，而不是留白"
     assert "/opt/bin/claude" in out
     assert "失败：" in out and "PATH 中找不到 kimi" in out
 

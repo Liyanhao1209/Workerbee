@@ -24,12 +24,13 @@ import asyncio
 import contextlib
 import json
 import os
-import shutil
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from .base import AdapterBase
+from .executables import resolve as resolve_executable
+from .executables import search_dirs
 from .contract import (
     PermissionRequest,
     CreateSessionRequest,
@@ -106,7 +107,12 @@ def parse_session_request(params: dict) -> tuple[CreateSessionRequest, dict]:
 
 
 def find_executable(exec_path: str | None, default: str) -> str:
-    """解析 harness 可执行文件，找不到时给出可读错误而非裸 FileNotFoundError。"""
+    """解析 harness 可执行文件，找不到时给出可读错误而非裸 FileNotFoundError。
+
+    查找范围见 ``executables`` 模块：**不止 PATH**。守护进程拿到的是 systemd
+    的默认 PATH，用户自装的 harness 基本都在它之外——只查 PATH 会让
+    「doctor 说找得到、服务起来却找不到」这种故障反复出现。
+    """
     candidate = exec_path or default
     if os.path.isabs(candidate) or os.sep in candidate:
         if not os.path.exists(candidate):
@@ -116,13 +122,15 @@ def find_executable(exec_path: str | None, default: str) -> str:
                 {"exec_path": candidate},
             )
         return candidate
-    found = shutil.which(candidate)
+
+    found = resolve_executable(candidate, candidate)
     if found is None:
+        searched = [str(d) for d in search_dirs()]
         raise AdapterError(
             ErrorCode.HARNESS_UNAVAILABLE,
-            f"PATH 中找不到 {candidate}。请在 HarnessRegistration.exec_path "
-            f"里指定绝对路径，或安装该 harness。",
-            {"exec_path": candidate},
+            f"找不到 {candidate}：PATH 与常见安装位置里都没有。"
+            f"请在 HarnessRegistration.exec_path 里指定绝对路径，或安装该 harness。",
+            {"exec_path": candidate, "searched": searched},
         )
     return found
 

@@ -19,6 +19,7 @@ from typing import Any, Optional
 import typer
 
 from . import __version__
+from .adapters.sdk.executables import resolve as resolve_executable
 
 app = typer.Typer(
     name="workerbee",
@@ -36,17 +37,6 @@ app.add_typer(workflow_app, name="workflow")
 
 DEFAULT_API = os.environ.get("WORKERBEE_API", "http://127.0.0.1:8765")
 DEFAULT_PORT = 8765
-
-#: systemd user service 的默认 PATH。守护进程**不**继承登录 shell 的 PATH，
-#: 而 harness（claude 常在 ~/.nvm/...、kimi 常在 ~/.kimi-code/bin）几乎都装在
-#: 这个范围之外。doctor 要能在装服务之前就把这件事说破。
-_SERVICE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-
-def _in_default_service_path(path: str) -> bool:
-    """该可执行文件是否落在守护进程的默认 PATH 覆盖范围内。"""
-    parent = str(Path(path).parent)
-    return parent in _SERVICE_PATH.split(":")
 
 
 def _read_registrations(db: Path) -> list[dict[str, Any]] | None:
@@ -111,7 +101,7 @@ def doctor(
     typer.echo(f"workerbee {__version__}")
     typer.echo("")
 
-    typer.echo("依赖")
+    typer.echo("依赖（以下是你当前 shell 看到的）")
     found: dict[str, str] = {}
     for cmd, why in (
         ("claude", "Claude Code harness 适配器"),
@@ -125,16 +115,22 @@ def doctor(
         else:
             typer.echo(f"  [--] {cmd:8s} 未找到（{why} 将不可用）")
 
-    # 这一节存在的理由：上面查的是**你当前 shell** 的 PATH，而真正拉起 harness 的
-    # 是守护进程。把内核装成服务时它不继承 shell 的 PATH，于是 doctor 说「找得到」
-    # 而探测照样失败——两边查的根本不是同一个环境，这个差异极难自行反推。
-    outside = {c: p for c, p in found.items() if not _in_default_service_path(p)}
-    if outside:
+    # 上面那节查的是**你当前 shell**。真正拉起 harness 的是守护进程，而服务形态
+    # 拿到的是 systemd 的默认 PATH，与你 shell 的不是同一个。这里用适配层同一套
+    # 解析跑一遍，报出它实际会用的路径——「你的 shell 找得到」不代表「它也找得到」，
+    # 这两件事的输出长得几乎一样，是这类故障最难反推的地方。
+    resolved = {cmd: resolve_executable(None, cmd) for cmd in ("claude", "kimi", "git")}
+    typer.echo("")
+    typer.echo("  守护进程解析（内核以服务运行时用的是这套）")
+    for cmd, path in resolved.items():
+        typer.echo(f"    [{'ok' if path else '--'}] {cmd:8s} {path or '找不到'}")
+
+    gap = [c for c, p in resolved.items() if p is None and c in found]
+    if gap:
         typer.echo("")
-        typer.echo("  [!!] 以下可执行文件在当前 shell 能找到，但守护进程默认找不到：")
-        for cmd, path in outside.items():
-            typer.echo(f"       {cmd:8s} {path}")
-        typer.echo(f"       守护进程默认 PATH：{_SERVICE_PATH}")
+        typer.echo("  [!!] 以下可执行文件你的 shell 找得到，但守护进程找不到：")
+        for cmd in gap:
+            typer.echo(f"       {cmd:8s} {found[cmd]}")
         typer.echo("       把内核作为服务运行时，探测与派发都会失败。二选一：")
         typer.echo("         1. 在注册表的「可执行路径」里填上面的绝对路径（推荐，按 harness 精确指定）")
         typer.echo("         2. 在 service unit 里设 Environment=PATH=... 把它并进去")
@@ -173,7 +169,7 @@ def doctor(
         typer.echo("  [--] 尚未登记任何 harness")
     else:
         for row in rows:
-            exec_path = row["exec_path"] or "（跟随 PATH——服务形态下多半找不到）"
+            exec_path = row["exec_path"] or "（未指定，由适配器自动解析）"
             if row["last_probe_ok"] is None:
                 probe = "尚未探测"
             elif row["last_probe_ok"]:
