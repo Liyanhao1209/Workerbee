@@ -1,10 +1,18 @@
 name: CI
 
-# 面向合并的检查：任何 PR 都要过，推送到主分支也要过。
+# 只在集成分支 wb-main 上跑。
+#
+# push 限分支：贡献者在自己的分支上反复推 WIP 不会触发 CI，省额度也省等待。
+# pull_request 也限分支：这里限制的是 **base**，也就是「合并进 wb-main 的 PR」。
+# 贡献者的分支不需要登记在这里——PR 一开就会跑。
+#
+# 副作用：合并进别的分支的 PR 不会跑 CI。若将来多出别的集成分支，
+# 需要同时加进这两处。
 on:
   push:
-    branches: [wb-main, master]
+    branches: [wb-main]
   pull_request:
+    branches: [wb-main]
   workflow_dispatch:
 
 # 同一分支上新的推送取消上一次没跑完的，省时间也省额度。
