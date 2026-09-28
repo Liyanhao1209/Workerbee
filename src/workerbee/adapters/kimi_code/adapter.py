@@ -179,7 +179,9 @@ class KimiCodeAdapter(CliHarnessAdapter):
         resume_locator: str | None,
         checkpoint: Any,
     ) -> list[str]:
-        exe = find_executable(request.harness.exec_path, self.exec_default)
+        # 同 claude 适配器：这里只取名字，不查存在性。存在性在 create_session
+        # 拉起进程前统一解析，否则测 argv 形状的用例会平白依赖本机装了什么。
+        exe = request.harness.exec_path or self.exec_default
         opts = dict(request.harness.adapter_options or {})
         opts.update(request.extra.get("options") or {})
 

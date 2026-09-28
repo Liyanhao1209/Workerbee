@@ -637,6 +637,16 @@ def _request(prompt: str | None = "hi", **kwargs: Any) -> CreateSessionRequest:
     )
 
 
+def _with_exec_path(exec_path: str) -> CreateSessionRequest:
+    """``_request`` 的 kwargs 落在 CreateSessionRequest 上，而 exec_path 属于
+    HarnessConfig——需要单独指定它时用这个。"""
+    return CreateSessionRequest(
+        harness=HarnessConfig(harness_id="h1", exec_path=exec_path),
+        model_name="m1",
+        extra={"prompt": "hi"},
+    )
+
+
 def test_claude_manifest_is_honest_about_what_it_cannot_do():
     caps = ClaudeCodeAdapter().manifest.capabilities
     assert caps.create_session is True
@@ -906,6 +916,63 @@ def test_kimi_default_permission_mode_adds_no_flag(mode):
     )
     assert "-y" not in argv and "--yolo" not in argv
     assert "--auto" not in argv and "--plan" not in argv
+
+
+# ----------------------------------------------------------------------
+# 5b. build_argv 是纯变换，不依赖本机装了什么
+# ----------------------------------------------------------------------
+
+
+class TestBuildArgvDoesNotDependOnTheEnvironment:
+    """构造参数列表不该查可执行文件在不在。
+
+    这条曾经是坏的：``build_argv`` 里调 ``find_executable``，于是每一个测
+    argv 形状的用例都隐式要求本机装了 claude / kimi。开发机上装了，全绿；
+    CI 上没装，11 条纯逻辑用例当场变红——而它们要测的根本不是「装没装」。
+
+    存在性检查没有消失，只是挪到了真正要拉起进程的那一刻（``create_session``）。
+    """
+
+    def test_which_returning_nothing_does_not_break_argv(self, monkeypatch):
+        """把 PATH 查找掐掉，argv 仍然要构造得出来。"""
+        monkeypatch.setattr("shutil.which", lambda _name: None)
+
+        claude = ClaudeCodeAdapter().build_argv(
+            request=_request(), prompt="hello", resume_locator=None, checkpoint=None
+        )
+        assert claude[0] == "claude", "配置为空时应回落到默认可执行文件名"
+
+        kimi = KimiCodeAdapter().build_argv(
+            request=_request(), prompt="hello", resume_locator=None, checkpoint=None
+        )
+        assert kimi[0] == "kimi"
+
+    def test_explicit_exec_path_is_used_verbatim(self, monkeypatch):
+        """注册表里给的路径直接进 argv，不在这里被解析成别的样子。"""
+        monkeypatch.setattr("shutil.which", lambda _name: None)
+        argv = ClaudeCodeAdapter().build_argv(
+            request=_with_exec_path("/opt/bin/claude"),
+            prompt="x",
+            resume_locator=None,
+            checkpoint=None,
+        )
+        assert argv[0] == "/opt/bin/claude"
+
+    async def test_spawn_still_reports_a_missing_executable(self):
+        """检查挪了位置，但不能挪没了——真拉起进程时仍要给可读错误。
+
+        用绝对路径指向一个不存在的文件，这样在解析阶段就失败，不会真的起进程。
+        """
+        adapter = ClaudeCodeAdapter()
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter._spawn_session(
+                _with_exec_path("/nonexistent/claude"),
+                {"prompt": "x"},
+                resume_locator=None,
+                checkpoint=None,
+            )
+        assert excinfo.value.code == ErrorCode.HARNESS_UNAVAILABLE
+        assert "/nonexistent/claude" in excinfo.value.message
 
 
 # ----------------------------------------------------------------------

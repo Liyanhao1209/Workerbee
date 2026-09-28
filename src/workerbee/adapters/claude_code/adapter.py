@@ -265,7 +265,11 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
         resume_locator: str | None,
         checkpoint: Any,
     ) -> list[str]:
-        exe = find_executable(request.harness.exec_path, self.exec_default)
+        # 只取名字，**不查它在不在**。构造参数列表是纯变换；「本机装没装这个
+        # harness」是要拉起进程时才必须回答的问题，由 create_session 统一解析。
+        # 在这里查会让每一个测 argv 形状的用例都依赖环境——CI 上没有 claude，
+        # 一批纯逻辑用例会红，而它们要测的根本不是这件事。
+        exe = request.harness.exec_path or self.exec_default
         opts = dict(request.harness.adapter_options or {})
         opts.update(request.extra.get("options") or {})
 

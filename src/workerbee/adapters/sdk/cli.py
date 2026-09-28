@@ -274,7 +274,11 @@ class CliHarnessAdapter(AdapterBase):
     """本地 CLI harness 适配器基类。
 
     子类需要提供：
-    - ``build_argv(request, prompt, resume_locator, extras)`` → argv；
+    - ``build_argv(request, prompt, resume_locator, extras)`` → argv。
+      **约定 argv[0] 是可执行文件**：基类在拉起进程前会把它替换成解析后的
+      绝对路径。``build_argv`` 本身不查可执行文件是否存在——构造参数列表是
+      纯变换，让它依赖本机装了什么，会让每一个测 argv 形状的用例都变成
+      环境依赖（CI 上没装 claude，一批纯逻辑用例当场就红）。
     - ``handle_json_line(session, obj)`` → 解释一行 NDJSON 并上报事件；
     - 可选覆盖 ``on_stream_closed`` / ``on_interrupt`` / ``on_send_input`` 等。
 
@@ -398,6 +402,13 @@ class CliHarnessAdapter(AdapterBase):
             resume_locator=resume_locator,
             checkpoint=checkpoint,
         )
+        # argv[0] 按约定是 harness 可执行文件。在这里解析并校验它，而不是在
+        # build_argv 里：构造参数列表是纯变换，不该取决于本机装没装这个 harness；
+        # 而「装没装」在真正要拉起进程的这一刻才是必须回答的问题。
+        # 顺带把裸名字换成绝对路径，保证拉起的就是刚刚校验过的那个文件。
+        argv = list(argv)
+        argv[0] = find_executable(request.harness.exec_path, self.exec_default)
+
         harness = request.harness
         env = self.build_env(request, extras)
         cwd = harness.cwd
