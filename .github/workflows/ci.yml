@@ -71,3 +71,27 @@ jobs:
       - name: Typecheck and build
         working-directory: web
         run: npm run build
+
+  # 汇总门禁。分支保护只需要勾这一个检查。
+  #
+  # 为什么不直接勾上面几个：矩阵展开出来的检查名是 "Python 3.12" / "Python 3.13"，
+  # 名字随矩阵变。哪天加个 3.14 或去掉 3.12，分支保护里勾的那个名字就永远等不到，
+  # PR 会一直卡在 "Expected — Waiting for status to be reported"——**不报错，
+  # 只是永远合不了**。勾一个名字固定的汇总 job 就没这个问题。
+  ci-ok:
+    name: CI
+    needs: [python, web]
+    # 必须带 always()：不加的话上游一失败这个 job 会被直接跳过，而分支保护
+    # 里「跳过」不算通过，PR 照样合不了——那就白加了。
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 核对上游作业结果
+        run: |
+          echo "python = ${{ needs.python.result }}"
+          echo "web    = ${{ needs.web.result }}"
+          if [ "${{ needs.python.result }}" != "success" ] \
+             || [ "${{ needs.web.result }}" != "success" ]; then
+            echo "::error::上游作业未全部成功，CI 不通过"
+            exit 1
+          fi
