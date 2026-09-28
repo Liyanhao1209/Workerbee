@@ -277,8 +277,13 @@ async def test_adapter_exit_lands_on_the_affected_tasks_timeline(
 
     上一版测试靠「崩溃赶在派发登记之前」这条竞态去间接命中它，因此在 CI 上
     时序一变就红。这里直接把「归属」这件事测掉，不依赖任何竞态。
+
+    用 ``with_permission=True``：权限那一步会**一直阻塞到有人答复**，阶段因此
+    稳稳停在运行态。带 ``with_permission=False`` 的剧本会立刻 graceful exit，
+    根本没有可断言的在途尝试——第一版就是这么写的，本地靠抢时序碰巧过，CI 上
+    立刻暴露。
     """
-    engine, wf = await _setup(store, engine_factory, tmp_path, with_permission=False)
+    engine, wf = await _setup(store, engine_factory, tmp_path, with_permission=True)
     result = await launch_task(store=store, workflow_id=wf.workflow_id)
     task_id = result.task.task_id
 
