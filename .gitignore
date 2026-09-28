@@ -14,7 +14,10 @@ build/
 # 演示数据目录，而数据库恰好被下面的 *.db 规则挡住、产物文件（无扩展名）挡不住，
 # 结果是「库没进去、产物进去了」这种半泄漏。
 .workerbee*/
-data/
+# 只忽略仓库根下的 data/。**必须带前导斜杠**：不带的话 gitignore 的匹配是
+# 「任意层级」，`data/` 会连 `src/workerbee/data/`（源码包）一起吃掉——
+# 结果是整个数据层从来没能提交，别人 clone 下来 import 就失败。
+/data/
 *.db
 *.db-wal
 *.db-shm
