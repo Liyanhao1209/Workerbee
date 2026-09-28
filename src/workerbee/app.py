@@ -13,11 +13,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 from pydantic import Field
 
+from .executables import resolve as resolve_executable
 from .core.domain.base import DomainModel
+from .core.domain.registry import HarnessRegistration
 from .core.resources.ledger import ResourceLedger
 from .core.resources.reaper import Reaper, ReaperConfig
 from .core.runtime import lifecycle as lc
@@ -29,6 +31,41 @@ from .data.store import Store
 from .security.approval_gateway import ApprovalGateway
 
 __all__ = ["EngineConfig", "Engine"]
+
+
+class _BuiltinHarness(NamedTuple):
+    """首次启动时自动登记的候选。"""
+
+    harness_id: str
+    name: str
+    adapter_id: str
+    binary: str
+    env_template: dict[str, str]
+
+
+#: 内置适配器 → 默认登记信息。只在注册表为空时用（见
+#: ``_auto_register_builtin_harnesses``）。
+#:
+#: claude 必须带上 INPUT_FORMAT=stream-json，否则会走默认的 text 输入模式，
+#: 审批转发与运行中交互（attach）**静默不可用**——注册能成功、探测也能成功，
+#: 只有等你真去点审批时才发现功能是灰的。这种「配好了但没有」最难查，所以
+#: 自动登记时直接给对。
+_BUILTIN_HARNESSES: tuple[_BuiltinHarness, ...] = (
+    _BuiltinHarness(
+        harness_id="claude",
+        name="Claude Code",
+        adapter_id="claude_code",
+        binary="claude",
+        env_template={"WORKERBEE_CLAUDE_CODE_INPUT_FORMAT": "stream-json"},
+    ),
+    _BuiltinHarness(
+        harness_id="kimi",
+        name="Kimi Code",
+        adapter_id="kimi_code",
+        binary="kimi",
+        env_template={},
+    ),
+)
 
 
 class EngineConfig(DomainModel):
@@ -521,10 +558,12 @@ class Engine:
         # 默认后端走本机已登录的 harness CLI：零额外配置。
         # 挑一个**实际存在**的，而不是假定名为 claude——
         # 在没有 claude 的机器上，假定会导致「摘要器不可用」这种本可避免的降级。
-        import shutil as _shutil
-
+        # 用与适配器同一套查找，**不只查 PATH**：守护进程的 PATH 里通常没有
+        # nvm / ~/.kimi-code/bin 这类位置，只查 PATH 会在这台明明装了两者的机器上
+        # 报「既没有 claude 也没有 kimi」，与紧随其后的自动登记提示自相矛盾。
         chosen = next(
-            (c for c in ("claude", "kimi") if _shutil.which(c) is not None), None
+            (c for c in ("claude", "kimi") if resolve_executable(None, c) is not None),
+            None,
         )
         if chosen is None:
             self.startup_notes.append(
@@ -690,6 +729,9 @@ class Engine:
                 )
 
         with contextlib.suppress(Exception):
+            await self._auto_register_builtin_harnesses()
+
+        with contextlib.suppress(Exception):
             await self._ensure_capability_snapshots()
 
         self._spawn(self.scheduler.run_forever(), "scheduler")
@@ -731,6 +773,46 @@ class Engine:
             )
         if close_store:
             await self.store.close()
+
+    async def _auto_register_builtin_harnesses(self) -> list[str]:
+        """首次启动（注册表为空）时，把本机找得到的内置 harness 登记上。
+
+        **只在注册表为空时动手。** 只要里面已经有任何东西就完全不动——用户可能
+        是有意只登记一部分，凭空补记录会打乱他的配置，而且删起来还得先弄清是
+        自己建的还是自动建的。
+
+        登记时存**解析后的绝对路径**，而不是留空靠每次再解析：路径要能看见、
+        能改。用户以后想知道「它用的是哪个 claude」，不该需要去猜搜索顺序。
+        代价是工具搬家后要重新登记，但那时界面上明摆着一个错的路径，比一个
+        空字段好排查。
+        """
+        if await self.store.registry.list_harnesses():
+            return []
+
+        registered: list[str] = []
+        for entry in _BUILTIN_HARNESSES:
+            path = resolve_executable(None, entry.binary)
+            if path is None:
+                continue
+            await self.store.registry.upsert_harness(
+                HarnessRegistration(
+                    harness_id=entry.harness_id,
+                    name=entry.name,
+                    adapter_id=entry.adapter_id,
+                    exec_path=path,
+                    env_template=dict(entry.env_template),
+                    enabled=True,
+                )
+            )
+            registered.append(f"{entry.name}（{path}）")
+
+        if registered:
+            self.startup_notes.append(
+                "首次启动，已自动登记本机检测到的 harness："
+                + "、".join(registered)
+                + "。可在注册表页查看或修改。"
+            )
+        return registered
 
     async def _ensure_capability_snapshots(self, *, force: bool = False) -> dict[str, str]:
         """给尚未探测过的 harness 补一次能力探测。

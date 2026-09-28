@@ -33,12 +33,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import signal
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from ...core.domain.task import Usage
+from ...executables import resolve as resolve_executable
 from ..redact import redact_text
 from .backend import (
     LLMBackendError,
@@ -398,6 +398,11 @@ class HarnessCLIBackend:
         env = dict(os.environ)
         env.update(self.env)
 
+        # argv[0] 是可执行文件。解析放在这里而不是 build_argv 里——构造参数列表
+        # 是纯变换，不该取决于本机装了什么。用的是和 harness 适配器同一套查找，
+        # 所以它也认 PATH 之外那些约定俗成的安装位置（nvm / ~/.kimi-code/bin）。
+        argv = [resolve_executable(self.binary, self.binary) or self.binary, *argv[1:]]
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -557,11 +562,11 @@ class HarnessCLIBackend:
         只做存在性与 ``--version`` 探测，**不**发补全请求（健康检查不该消耗配额）。
         注意：这不能证明「已登录」——登录态只有真调用才知道。
         """
-        path = shutil.which(self.binary)
+        path = resolve_executable(self.binary, self.binary)
         if not path:
             return False, (
                 f"未找到可执行文件 {self.binary}（harness={self.harness}）："
-                f"请先安装并登录该 harness"
+                f"PATH 与常见安装位置里都没有，请安装该 harness"
             )
         if not self.probe_version:
             return True, "未验证登录态（已跳过 --version 探测）"

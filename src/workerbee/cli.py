@@ -19,7 +19,7 @@ from typing import Any, Optional
 import typer
 
 from . import __version__
-from .adapters.sdk.executables import resolve as resolve_executable
+from .executables import resolve as resolve_executable
 
 app = typer.Typer(
     name="workerbee",

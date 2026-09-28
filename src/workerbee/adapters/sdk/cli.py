@@ -29,8 +29,8 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from .base import AdapterBase
-from .executables import resolve as resolve_executable
-from .executables import search_dirs
+from ...executables import resolve as resolve_executable
+from ...executables import search_dirs
 from .contract import (
     PermissionRequest,
     CreateSessionRequest,

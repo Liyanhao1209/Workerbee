@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from workerbee.adapters.sdk import executables
+from workerbee import executables
 from workerbee.adapters.sdk.cli import find_executable
 from workerbee.adapters.sdk.protocol import AdapterError, ErrorCode
 
@@ -48,7 +48,7 @@ def test_path_wins_over_search_dirs(monkeypatch, fake_dirs):
     _make, bin_a, _ = fake_dirs
     _make(bin_a, "claude")
     monkeypatch.setattr(
-        "workerbee.adapters.sdk.executables.shutil.which",
+        "workerbee.executables.shutil.which",
         lambda _n: "/usr/bin/claude",
     )
 
@@ -59,7 +59,7 @@ def test_falls_back_to_a_search_dir_when_path_misses(monkeypatch, fake_dirs):
     """守护进程的 PATH 里没有，但装在了约定俗成的位置——这种情况必须能找到。"""
     _make, bin_a, _ = fake_dirs
     expected = _make(bin_a, "kimi")
-    monkeypatch.setattr("workerbee.adapters.sdk.executables.shutil.which", lambda _n: None)
+    monkeypatch.setattr("workerbee.executables.shutil.which", lambda _n: None)
 
     assert executables.resolve(None, "kimi") == str(expected)
 
@@ -67,7 +67,7 @@ def test_falls_back_to_a_search_dir_when_path_misses(monkeypatch, fake_dirs):
 def test_later_search_dir_is_used_when_earlier_ones_lack_it(monkeypatch, fake_dirs):
     _make, _, bin_b = fake_dirs
     expected = _make(bin_b, "claude")
-    monkeypatch.setattr("workerbee.adapters.sdk.executables.shutil.which", lambda _n: None)
+    monkeypatch.setattr("workerbee.executables.shutil.which", lambda _n: None)
 
     assert executables.resolve(None, "claude") == str(expected)
 
@@ -76,14 +76,14 @@ def test_explicit_exec_path_is_returned_verbatim(tmp_path, monkeypatch):
     exe = tmp_path / "my-claude"
     exe.write_text("#!/bin/sh\n")
     exe.chmod(0o755)
-    monkeypatch.setattr("workerbee.adapters.sdk.executables.shutil.which", lambda _n: "/usr/bin/other")
+    monkeypatch.setattr("workerbee.executables.shutil.which", lambda _n: "/usr/bin/other")
 
     assert executables.resolve(str(exe), "claude") == str(exe)
 
 
 def test_missing_absolute_path_resolves_to_none(tmp_path, monkeypatch):
     """显式指定的路径不存在时**不**回落到搜索——那会悄悄用了别的 harness。"""
-    monkeypatch.setattr("workerbee.adapters.sdk.executables.shutil.which", lambda _n: None)
+    monkeypatch.setattr("workerbee.executables.shutil.which", lambda _n: None)
 
     assert executables.resolve(str(tmp_path / "nope"), "claude") is None
 
@@ -94,13 +94,13 @@ def test_non_executable_file_is_not_accepted(monkeypatch, fake_dirs):
     plain = bin_a / "claude"
     plain.write_text("not executable")
     plain.chmod(0o644)
-    monkeypatch.setattr("workerbee.adapters.sdk.executables.shutil.which", lambda _n: None)
+    monkeypatch.setattr("workerbee.executables.shutil.which", lambda _n: None)
 
     assert executables.resolve(None, "claude") is None
 
 
 def test_nothing_anywhere_resolves_to_none(monkeypatch, fake_dirs):
-    monkeypatch.setattr("workerbee.adapters.sdk.executables.shutil.which", lambda _n: None)
+    monkeypatch.setattr("workerbee.executables.shutil.which", lambda _n: None)
 
     assert executables.resolve(None, "nonexistent-harness") is None
 
@@ -125,7 +125,7 @@ def test_version_dirs_are_ordered_numerically_not_lexically(tmp_path, monkeypatc
 
     monkeypatch.setattr(executables, "SEARCH_DIRS", ())
     monkeypatch.setattr(executables, "SEARCH_GLOBS", (str(root / "*" / "bin"),))
-    monkeypatch.setattr("workerbee.adapters.sdk.executables.shutil.which", lambda _n: None)
+    monkeypatch.setattr("workerbee.executables.shutil.which", lambda _n: None)
 
     resolved = executables.resolve(None, "claude")
 
@@ -152,7 +152,7 @@ def test_search_dirs_skips_nonexistent_entries(monkeypatch, tmp_path):
 def test_find_executable_raises_with_the_searched_locations(monkeypatch, fake_dirs):
     """找不到时的报错要能让人知道「都找过哪儿了」，否则无从下手。"""
     _make, bin_a, _ = fake_dirs
-    monkeypatch.setattr("workerbee.adapters.sdk.executables.shutil.which", lambda _n: None)
+    monkeypatch.setattr("workerbee.executables.shutil.which", lambda _n: None)
 
     with pytest.raises(AdapterError) as excinfo:
         find_executable(None, "claude")
