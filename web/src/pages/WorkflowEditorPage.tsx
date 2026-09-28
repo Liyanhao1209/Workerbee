@@ -23,7 +23,7 @@ import type {
 } from '../api/types';
 import { registry as registryApi, workflows as workflowApi } from '../api/endpoints';
 import { ApiError } from '../api/client';
-import { emptyGraphSpec, newLocalId } from '../api/guards';
+import { emptyGraph, emptyGraphSpec, newLocalId } from '../api/guards';
 import { useAsync, useSubmit } from '../hooks/useAsync';
 import { CanvasFocus, WorkflowCanvas } from '../graph/WorkflowCanvas';
 import { NodeInspector } from '../components/NodeInspector';
@@ -90,10 +90,17 @@ export function WorkflowEditorPage(): JSX.Element {
     return list.reduce((acc, r) => (acc === null || r.revision_seq > acc.revision_seq ? r : acc), null as null | (typeof list)[number]);
   }, [revisions.data, workflow.data]);
 
+  /** 新建流程的合法初态：服务端还没有任何修订。 */
+  const isNewWorkflow =
+    workflow.data?.current_revision_seq === 0 &&
+    revisions.loaded &&
+    !revisions.error &&
+    revisions.data?.revisions.length === 0;
+
   const baseGraph = useMemo<GraphSpec | null>(() => {
-    if (!baseRevision) return null;
-    return emptyGraphSpec(baseRevision.graph);
-  }, [baseRevision]);
+    if (baseRevision) return emptyGraphSpec(baseRevision.graph);
+    return isNewWorkflow ? emptyGraph() : null;
+  }, [baseRevision, isNewWorkflow]);
 
   /**
    * 初始化只做一次：把服务端当前修订读进画布。
@@ -103,11 +110,18 @@ export function WorkflowEditorPage(): JSX.Element {
    */
   const [initialized, setInitialized] = useState(false);
   useEffect(() => {
-    if (initialized || !baseRevision) return;
-    setDraft(emptyGraphSpec(baseRevision.graph));
-    setBaseSeq(baseRevision.revision_seq);
+    if (initialized || !workflow.data || !revisions.loaded || revisions.error) return;
+    if (baseRevision) {
+      setDraft(emptyGraphSpec(baseRevision.graph));
+      setBaseSeq(baseRevision.revision_seq);
+    } else if (isNewWorkflow) {
+      setDraft(emptyGraph());
+      setBaseSeq(0);
+    } else {
+      return;
+    }
     setInitialized(true);
-  }, [initialized, baseRevision]);
+  }, [initialized, workflow.data, revisions.loaded, revisions.error, baseRevision, isNewWorkflow]);
 
   /** 服务端已经有比编辑基点更新的修订（不自动同步，只提示）。 */
   const serverNewer = useMemo(() => {
@@ -256,6 +270,19 @@ export function WorkflowEditorPage(): JSX.Element {
   }
 
   if (!draft) {
+    if (revisions.error || (revisions.loaded && !baseRevision && !isNewWorkflow)) {
+      return (
+        <div className="page">
+          <Banner
+            variant="danger"
+            title="无法读取流程修订"
+            actions={<button type="button" className="btn btn--sm" onClick={revisions.reload}>重试</button>}
+          >
+            {revisions.error?.detail ?? '流程的当前修订不可用，请重试。'}
+          </Banner>
+        </div>
+      );
+    }
     return (
       <div className="page">
         <Loading label="准备画布" />
