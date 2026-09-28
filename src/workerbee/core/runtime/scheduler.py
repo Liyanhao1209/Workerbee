@@ -669,6 +669,16 @@ class Scheduler:
     def runtime_for(self, attempt_id: str) -> AttemptRuntime | None:
         return self._runtimes.get(attempt_id)
 
+    def runtimes_for_harness(self, harness_id: str) -> list[AttemptRuntime]:
+        """当前正在跑、且由这个 harness 承载的尝试。
+
+        适配器进程退出时用它找出受影响的尝试：退出会打断这些尝试，它们的
+        任务时间线上必须看得到这件事。
+        """
+        if not harness_id:
+            return []
+        return [rt for rt in self._runtimes.values() if rt.harness_id == harness_id]
+
     def runtime_for_session(self, session_ref: str) -> AttemptRuntime | None:
         for rt in self._runtimes.values():
             if rt.session_ref == session_ref:

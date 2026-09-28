@@ -1034,21 +1034,49 @@ class Engine:
         await self.notifier.state_changed(task_id=task.task_id, stage_id=stage.stage_id)
 
     async def _on_adapter_exit(self, harness_id: str, code: int | None, stderr: str) -> None:
-        await self.store.events.append(
-            scope=_scope("session"),
-            type=_event("SESSION_LOST"),
-            actor=_actor("adapter"),
-            payload={
-                "harness_id": harness_id,
-                "exit_code": code,
-                "stderr_tail": stderr[-2000:] if stderr else None,
-                "note": "适配器进程退出；相关会话状态未知，等待对账（REC-02）",
-            },
-        )
+        """适配器进程退出。
+
+        事件**按受影响的尝试逐条写**，而不是只写一条无归属的。崩溃会打断这些
+        任务，它们的时间线上必须看得到——只写在全局视野里的话，用户在任务详情页
+        只会看到一个停在 running 的阶段，不知道发生过什么。适配器空闲时退出
+        （没有受影响的尝试）仍写一条无归属的，那是系统级事实。
+        """
+        payload = {
+            "harness_id": harness_id,
+            "exit_code": code,
+            "stderr_tail": stderr[-2000:] if stderr else None,
+            "note": "适配器进程退出；相关会话状态未知，等待对账（REC-02）",
+        }
+        affected = self.scheduler.runtimes_for_harness(harness_id) if self.scheduler else []
+
+        if affected:
+            for rt in affected:
+                await self.store.events.append(
+                    scope=_scope("session"),
+                    type=_event("SESSION_LOST"),
+                    actor=_actor("adapter"),
+                    task_id=rt.task_id,
+                    stage_id=rt.stage_id,
+                    payload={**payload, "attempt_id": rt.attempt_id},
+                )
+        else:
+            await self.store.events.append(
+                scope=_scope("session"),
+                type=_event("SESSION_LOST"),
+                actor=_actor("adapter"),
+                payload=payload,
+            )
+
+        # 「需处理」只报一条：一次崩溃是一个系统级事实，受影响的任务数放在
+        # payload 里。按任务各报一条会让一次崩溃刷出 N 个同样的条目，把清单淹掉。
         await self.notifier.attention_required(
             kind="adapter_exited",
             task_id=None,
-            payload={"harness_id": harness_id, "exit_code": code},
+            payload={
+                "harness_id": harness_id,
+                "exit_code": code,
+                "affected_tasks": [rt.task_id for rt in affected],
+            },
         )
 
     def _log_adapter(self, message: str) -> None:

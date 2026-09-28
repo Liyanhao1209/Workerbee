@@ -264,3 +264,52 @@ async def test_crash_is_recorded_and_visible(store, engine_factory, tmp_path):
 
     found = await _wait_for(_has_record, timeout=25.0)
     assert found, "适配器退出必须被记入事件历史"
+
+
+async def test_adapter_exit_lands_on_the_affected_tasks_timeline(
+    store, engine_factory, tmp_path
+):
+    """适配器退出要写在**受影响任务**的事件里，而不只是全局视野。
+
+    这条曾经是无归属的：事件确实写进去了，但 ``task_id`` 为空，而任务详情页
+    按 task_id 查事件——于是用户在那个任务上只看到一个停在 running 的阶段，
+    时间线里什么线索都没有，无从知道适配器崩过。
+
+    上一版测试靠「崩溃赶在派发登记之前」这条竞态去间接命中它，因此在 CI 上
+    时序一变就红。这里直接把「归属」这件事测掉，不依赖任何竞态。
+    """
+    engine, wf = await _setup(store, engine_factory, tmp_path, with_permission=False)
+    result = await launch_task(store=store, workflow_id=wf.workflow_id)
+    task_id = result.task.task_id
+
+    async def _running():
+        runtimes = engine.scheduler.runtimes_for_harness("mock-1")
+        return runtimes[0] if runtimes else None
+
+    rt = await _wait_for(_running, timeout=25.0)
+    assert rt is not None, "阶段没有进入运行态，测试前提不成立"
+
+    # 直接触发退出回调，不依赖进程真的崩——测的是「事件归属」这件事本身
+    await engine._on_adapter_exit("mock-1", 1, "mock: 模拟崩溃")
+
+    events = await store.events.for_task(task_id)
+    records = [e for e in events if e["type"] == "session.lost"]
+    assert records, "适配器退出必须出现在该任务的事件时间线上"
+    hit = records[-1]
+    assert hit["payload"]["harness_id"] == "mock-1"
+    assert hit["payload"]["exit_code"] == 1
+    assert hit["stage_id"] == rt.stage_id
+    assert hit["payload"]["attempt_id"] == rt.attempt_id
+
+
+async def test_idle_adapter_exit_is_recorded_without_a_task(store, engine_factory, tmp_path):
+    """适配器空闲时退出没有受影响的尝试，写一条无归属的系统级记录即可。"""
+    engine, _ = await _setup(store, engine_factory, tmp_path, with_permission=False)
+
+    await engine._on_adapter_exit("mock-1", 0, "")
+
+    rows = await store.db.fetch_all(
+        "SELECT task_id, payload FROM event_log WHERE type='session.lost'"
+    )
+    assert rows, "空闲退出也要留记录"
+    assert all(r["task_id"] is None for r in rows), "没有受影响的尝试时不该硬安一个归属"
