@@ -989,11 +989,76 @@ export interface DeliveryResult {
 }
 
 // ===========================================================================
+// 基础助手（AI-01）—— 字段与 schemas.py 的 Assistant* 模型逐字对齐
+// ===========================================================================
+
+export interface AssistantThread {
+  thread_id: string;
+  title: string;
+  closed: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AssistantMessage {
+  message_id: string;
+  thread_id: string;
+  /** user / assistant / memory（「整理前文」产出的摘要）。 */
+  role: string;
+  content: string;
+  backend: string | null;
+  /** null = 后端没给用量（未知，不是 0）（OBS-04）。 */
+  tokens_in: number | null;
+  tokens_out: number | null;
+  /** true = 这条回复发生过降级（备用后端、快照裁剪、指引缺失等）。 */
+  degraded: boolean;
+  created_at: string;
+}
+
+export interface AssistantSendResult {
+  message: AssistantMessage;
+  user_message: AssistantMessage;
+  /** 因窗口限制未随本次发送的更早消息条数（滑动窗口截断，不产生额外调用）。 */
+  dropped: number;
+  degraded: boolean;
+  degraded_reasons: string[];
+}
+
+export interface AssistantCompactResult {
+  compacted: boolean;
+  /** 被整理进摘要的旧消息条数。 */
+  summarized: number;
+  memory_message_id: string | null;
+  note: string | null;
+}
+
+export interface AssistantConfig {
+  enabled: boolean;
+  credential_ref: string | null;
+  model_override: string | null;
+  window_rounds: number;
+  window_chars: number;
+  snapshot_budget: number;
+  /** 凭据库此刻是否已解锁；未解锁时即使配置齐了也读不到密钥，前端据此显示引导。 */
+  secrets_unlocked: boolean;
+}
+
+/** 局部更新：只接受引用，不接受任何密钥本体。 */
+export interface AssistantConfigUpdate {
+  enabled?: boolean;
+  credential_ref?: string | null;
+  model_override?: string | null;
+  window_rounds?: number;
+  window_chars?: number;
+  snapshot_budget?: number;
+}
+
+// ===========================================================================
 // WebSocket 推送
 // ===========================================================================
 
 export interface WsPush {
-  kind: 'state_changed' | 'attention';
+  kind: 'state_changed' | 'attention' | 'assistant_message';
   task_id: string | null;
   stage_id: string | null;
   payload: Record<string, unknown>;

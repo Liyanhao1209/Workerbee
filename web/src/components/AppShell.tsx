@@ -13,7 +13,9 @@ import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { useConnection } from '../store/connection';
 import { attentionCount, useAttention, wireAttention } from '../store/attention';
+import { wireAssistant } from '../store/assistant';
 import { hostingDescription, useSystem, wireSystem } from '../store/system';
+import { AssistantPanel } from './AssistantPanel';
 import { AttentionDrawer } from './AttentionDrawer';
 import { Banner } from './common';
 
@@ -39,11 +41,13 @@ export function AppShell(): JSX.Element {
   const systemStatus = useSystem((s) => s.status);
   const refreshSystem = useSystem((s) => s.refresh);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
   const [notesOpen, setNotesOpen] = useState(true);
   const location = useLocation();
 
   useEffect(() => {
     wireAttention();
+    wireAssistant();
     wireSystem();
     void check();
     const timer = window.setInterval(() => {
@@ -117,6 +121,14 @@ export function AppShell(): JSX.Element {
             需处理
             {count > 0 ? <span className="badge">{count > 99 ? '99+' : count}</span> : null}
           </button>
+          <button
+            type="button"
+            className="btn btn--sm"
+            onClick={() => setAssistantOpen((v) => !v)}
+            title="向内置助手提问：怎么用、现在什么状态、报错是什么意思"
+          >
+            助手
+          </button>
         </div>
       </header>
 
@@ -182,6 +194,7 @@ export function AppShell(): JSX.Element {
       </main>
 
       {drawerOpen ? <AttentionDrawer onClose={() => setDrawerOpen(false)} /> : null}
+      {assistantOpen ? <AssistantPanel onClose={() => setAssistantOpen(false)} /> : null}
     </div>
   );
 }

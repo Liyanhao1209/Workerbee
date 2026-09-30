@@ -816,6 +816,74 @@ kbd,
   padding: var(--sp-3);
 }
 
+/* 助手聊天面板：消息区滚动、输入区固定，不走 sidepanel__body。 */
+.assistant-settings {
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.assistant-settings .field {
+  margin-bottom: var(--sp-2);
+}
+.chat-scroll {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.chat-row {
+  display: flex;
+}
+.chat-row--user {
+  justify-content: flex-end;
+}
+.chat-bubble {
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-lg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+}
+.chat-bubble--user {
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-dim);
+}
+.chat-bubble--assistant {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+}
+.chat-meta {
+  font-size: var(--fs-xs);
+  color: var(--fg-3);
+  margin-top: 2px;
+}
+.chat-memory {
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  padding: var(--sp-2);
+  background: var(--bg-2);
+  font-size: var(--fs-xs);
+  color: var(--fg-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.chat-memory__label {
+  color: var(--fg-3);
+  margin-bottom: var(--sp-1);
+}
+.chat-composer {
+  border-top: 1px solid var(--line);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-2);
+}
+.chat-composer textarea {
+  width: 100%;
+  resize: none;
+}
+
 /* ==========================================================================
    徽标计数
    ========================================================================== */

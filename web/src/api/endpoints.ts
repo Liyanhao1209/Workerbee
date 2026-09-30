@@ -9,6 +9,12 @@ import { ApiError, request } from './client';
 import { isRecord } from './guards';
 import type {
   Approval,
+  AssistantCompactResult,
+  AssistantConfig,
+  AssistantConfigUpdate,
+  AssistantMessage,
+  AssistantSendResult,
+  AssistantThread,
   AttentionResponse,
   CredentialKind,
   CredentialRef,
@@ -410,6 +416,44 @@ export const approvals = {
   /** 回注失败（undeliverable）后的重试入口（HUM-04）。 */
   retryDelivery: (id: string) =>
     request<DeliveryResult>(`/api/approvals/${encodeURIComponent(id)}/retry-delivery`, { method: 'POST' }),
+};
+
+// ---------------------------------------------------------------------------
+// 基础助手（AI-01）
+// ---------------------------------------------------------------------------
+
+export const assistant = {
+  threads: () =>
+    request<{ threads: AssistantThread[]; returned: number }>('/api/assistant/threads'),
+
+  createThread: (title?: string) =>
+    request<AssistantThread>('/api/assistant/threads', {
+      method: 'POST',
+      body: title ? { title } : {},
+    }),
+
+  messages: (threadId: string) =>
+    request<{ messages: AssistantMessage[]; returned: number }>(
+      `/api/assistant/threads/${encodeURIComponent(threadId)}/messages`,
+    ),
+
+  /** 发消息，同步返回助手回复。生成期间调用方负责显示「正在生成」。 */
+  send: (threadId: string, content: string) =>
+    request<AssistantSendResult>(`/api/assistant/threads/${encodeURIComponent(threadId)}/messages`, {
+      method: 'POST',
+      body: { content },
+    }),
+
+  /** 手动整理前文：唯一会额外调用一次模型的记忆操作（用户显式触发）。 */
+  compact: (threadId: string) =>
+    request<AssistantCompactResult>(`/api/assistant/threads/${encodeURIComponent(threadId)}/compact`, {
+      method: 'POST',
+    }),
+
+  config: () => request<AssistantConfig>('/api/assistant/config'),
+
+  updateConfig: (body: AssistantConfigUpdate) =>
+    request<AssistantConfig>('/api/assistant/config', { method: 'PUT', body }),
 };
 
 /** 供页面复用：从节点列表里取名字，用于诊断与预览的定位文案。 */
