@@ -213,8 +213,8 @@ export const SEVERITY_LABELS: Record<Severity, { text: string; tone: Tone }> = {
 export const CREDENTIAL_KIND_LABELS: Record<CredentialKind, string> = {
   api_key: 'API Key',
   oauth: 'OAuth',
-  base_url_pair: 'Base URL + Key',
-  harness_login: 'Harness 本机登录态',
+  base_url_pair: 'API Key + 自建服务地址',
+  harness_login: '本机登录态',
 };
 
 export const AUTH_MODE_LABELS: Record<string, string> = {

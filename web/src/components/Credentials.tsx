@@ -115,8 +115,7 @@ export function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
                 <tr>
                   <th>名称</th>
                   <th>ID</th>
-                  <th>类型</th>
-                  <th>凭据库条目</th>
+                  <th>认证方式</th>
                   <th>服务地址</th>
                   <th>默认模型</th>
                   <th>状态</th>
@@ -131,17 +130,6 @@ export function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
                       <ShortId id={credential.credential_id} />
                     </td>
                     <td>{CREDENTIAL_KIND_LABELS[credential.kind]}</td>
-                    <td>
-                      {credential.kind === 'harness_login' ? (
-                        <span className="dim">由 harness 登录态提供</span>
-                      ) : credential.secret_locator ? (
-                        <span className="mono text-xs" title={credential.secret_locator}>
-                          {credential.secret_locator}
-                        </span>
-                      ) : (
-                        <span className="dim">未登记条目名</span>
-                      )}
-                    </td>
                     <td>
                       {credential.base_url ? (
                         <span className="mono text-xs" title={credential.base_url}>
@@ -239,42 +227,37 @@ export function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
 
 function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }): JSX.Element {
   const [label, setLabel] = useState('');
-  const [kind, setKind] = useState<CredentialKind>('api_key');
-  const [mode, setMode] = useState<'secret' | 'locator'>('secret');
+  const [auth, setAuth] = useState<'login' | 'key'>('key');
   const [apiKey, setApiKey] = useState('');
-  const [locator, setLocator] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [defaultModel, setDefaultModel] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const submit = useSubmit();
 
-  const isLogin = kind === 'harness_login';
+  const isLogin = auth === 'login';
 
   const save = async (): Promise<void> => {
     if (!label.trim()) {
       setFormError('名称必填。');
       return;
     }
-    if (!isLogin && mode === 'secret' && !apiKey.trim()) {
+    if (!isLogin && !apiKey.trim()) {
       setFormError('请填写 API Key。');
       return;
     }
-    if (!isLogin && mode === 'locator' && !locator.trim()) {
-      setFormError('请填写凭据库中已有条目的名称。');
-      return;
-    }
     setFormError(null);
-    const secret: Record<string, string> | null =
-      !isLogin && mode === 'secret'
-        ? kind === 'base_url_pair'
-          ? { api_key: apiKey.trim(), base_url: baseUrl.trim() }
-          : { api_key: apiKey.trim() }
-        : null;
+    // 类型由填写内容推导：填了服务地址就是 base_url_pair，否则是 api_key。
+    // 不向用户暴露这个枚举——它对行为的影响只有「注入哪些环境变量」。
+    const kind: CredentialKind = isLogin ? 'harness_login' : baseUrl.trim() ? 'base_url_pair' : 'api_key';
+    const secret: Record<string, string> | null = isLogin
+      ? null
+      : baseUrl.trim()
+        ? { api_key: apiKey.trim(), base_url: baseUrl.trim() }
+        : { api_key: apiKey.trim() };
     const saved = await submit.run(() =>
       registryApi.createCredential({
         label: label.trim(),
         kind,
-        secret_locator: isLogin || mode === 'secret' ? null : locator.trim(),
         base_url: baseUrl.trim() || null,
         default_model: defaultModel.trim() || null,
         secret,
@@ -305,71 +288,39 @@ function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSa
       ) : null}
       {submit.error ? <SubmitError error={submit.error} what="新建凭据失败" /> : null}
 
-      <div className="field-row">
-        <Field label="名称" required hint="给自己看的名字">
-          <input className="input" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="如：公司 Claude 账号" />
-        </Field>
-        <Field label="类型" required>
-          <select
-            className="select"
-            value={kind}
-            onChange={(e) => {
-              const next = e.target.value as CredentialKind;
-              setKind(next);
-              if (next === 'harness_login') setLocator('');
-            }}
-          >
-            {(Object.keys(CREDENTIAL_KIND_LABELS) as CredentialKind[]).map((value) => (
-              <option key={value} value={value}>
-                {CREDENTIAL_KIND_LABELS[value]}
-              </option>
-            ))}
+      <Field label="名称" required hint="给自己看的名字，建节点时按名字选它">
+        <input className="input" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="如：公司 Claude 账号" />
+      </Field>
+
+      <div style={{ marginTop: 'var(--sp-3)' }}>
+        <Field label="怎么认证" required>
+          <select className="select" value={auth} onChange={(e) => setAuth(e.target.value as 'login' | 'key')}>
+            <option value="key">填写 API Key（key 会加密保存在本机）</option>
+            <option value="login">用 harness 在这台机器上的登录状态（不保存任何 key）</option>
           </select>
         </Field>
       </div>
 
       {isLogin ? (
         <div style={{ marginTop: 'var(--sp-3)' }} className="text-sm dim">
-          这种类型不需要填写任何密钥：执行时直接使用该 harness 在这台机器上的登录状态。
+          什么都不用填：执行时直接使用 harness 当前的登录状态（比如已经跑过 kimi login / claude 登录）。
         </div>
       ) : (
         <>
           <div style={{ marginTop: 'var(--sp-3)' }}>
-            <Field label="密钥来源" required>
-              <select className="select" value={mode} onChange={(e) => setMode(e.target.value as 'secret' | 'locator')}>
-                <option value="secret">直接填写密钥</option>
-                <option value="locator">引用凭据库中已有的条目</option>
-              </select>
+            <Field label="API Key" required hint="加密后保存；保存后这里、日志和历史记录都不会再显示它。">
+              <input
+                className="input input--mono"
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="sk-..."
+              />
             </Field>
           </div>
 
-          {mode === 'secret' ? (
-            <div style={{ marginTop: 'var(--sp-3)' }}>
-              <Field label="API Key" required hint="加密后保存；保存后这里、日志和历史记录都不会再显示它。">
-                <input
-                  className="input input--mono"
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="sk-..."
-                />
-              </Field>
-            </div>
-          ) : (
-            <div style={{ marginTop: 'var(--sp-3)' }}>
-              <Field label="条目名" required hint="凭据库中已有条目的名字，通常只有手工管理凭据库时才用这种方式。">
-                <input
-                  className="input input--mono"
-                  value={locator}
-                  onChange={(e) => setLocator(e.target.value)}
-                  placeholder="secret://openai"
-                />
-              </Field>
-            </div>
-          )}
-
           <div style={{ marginTop: 'var(--sp-3)' }}>
-            <Field label="服务地址" hint="只有「Base URL + Key」类型需要；其它类型留空。">
+            <Field label="服务地址" hint="可留空。只有走第三方网关或自建服务时才填，用官方服务就留空。">
               <input
                 className="input input--mono"
                 value={baseUrl}
@@ -378,21 +329,19 @@ function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSa
               />
             </Field>
           </div>
+
+          <div style={{ marginTop: 'var(--sp-3)' }}>
+            <Field label="默认模型" hint="可留空。节点没填模型名时会用这个值，这样一份凭据就是完整的接入配置。">
+              <input
+                className="input input--mono"
+                value={defaultModel}
+                onChange={(e) => setDefaultModel(e.target.value)}
+                placeholder="如 claude-sonnet-4-6 / kimi-k2"
+              />
+            </Field>
+          </div>
         </>
       )}
-
-      {!isLogin ? (
-        <div style={{ marginTop: 'var(--sp-3)' }}>
-          <Field label="默认模型" hint="可留空。节点没填模型名时会用这个值，这样一份凭据就是完整的接入配置。">
-            <input
-              className="input input--mono"
-              value={defaultModel}
-              onChange={(e) => setDefaultModel(e.target.value)}
-              placeholder="如 claude-sonnet-4-6 / kimi-k2"
-            />
-          </Field>
-        </div>
-      ) : null}
     </Modal>
   );
 }

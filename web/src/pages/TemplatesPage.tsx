@@ -21,7 +21,6 @@ import type {
   NodeDefinition,
   Template,
   TemplateInstantiateResult,
-  TemplateKind,
   TemplatePayload,
 } from '../api/types';
 import { Banner, Chip, Empty, Field, Loading, Modal, Pill, ShortId } from '../components/common';
@@ -311,6 +310,7 @@ export function TemplatesPage(): JSX.Element {
 
       {createOpen ? (
         <CreateTemplateModal
+          kind={tab === 'node' ? 'node' : 'workflow'}
           onClose={() => setCreateOpen(false)}
           onSaved={() => {
             setCreateOpen(false);
@@ -361,13 +361,20 @@ export function TemplatesPage(): JSX.Element {
 // 生成模板
 // ===========================================================================
 
-function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }): JSX.Element {
+function CreateTemplateModal({
+  kind,
+  onClose,
+  onSaved,
+}: {
+  kind: 'workflow' | 'node';
+  onClose: () => void;
+  onSaved: () => void;
+}): JSX.Element {
   const workflows = useAsync(workflowApi.list, []);
   const [fromWorkflowId, setFromWorkflowId] = useState('');
   const [fromRevision, setFromRevision] = useState('');
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [kind, setKind] = useState<TemplateKind>('workflow');
   const [keepCredentials, setKeepCredentials] = useState(true);
   const [formError, setFormError] = useState<string | null>(null);
   const submit = useSubmit();
@@ -408,7 +415,7 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
 
   return (
     <Modal
-      title="生成模板"
+      title={kind === 'node' ? '生成节点模板' : '生成流程模板'}
       onClose={onClose}
       footer={
         <>
@@ -434,7 +441,10 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
       {workflows.error ? <ReadError error={workflows.error} what="流程列表" onRetry={workflows.reload} /> : null}
 
       <div className="field-row">
-        <Field label="来源流程">
+        <Field
+          label="来源流程"
+          hint={kind === 'node' ? '节点模板只能从只含一个节点的流程生成。' : undefined}
+        >
           {workflows.loading && !workflows.loaded ? (
             <span className="text-sm dim">加载流程列表…</span>
           ) : (
@@ -460,16 +470,12 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
 
       <div className="field-row" style={{ marginTop: 'var(--sp-3)' }}>
         <Field label="名称">
-          <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="标准三节点流水线" />
-        </Field>
-        <Field label="类型">
-          <select className="select" value={kind} onChange={(e) => setKind(e.target.value as TemplateKind)}>
-            {(Object.keys(TEMPLATE_KIND_LABELS) as TemplateKind[]).map((value) => (
-              <option key={value} value={value}>
-                {TEMPLATE_KIND_LABELS[value]}
-              </option>
-            ))}
-          </select>
+          <input
+            className="input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={kind === 'node' ? '代码审查节点' : '标准三节点流水线'}
+          />
         </Field>
       </div>
 
