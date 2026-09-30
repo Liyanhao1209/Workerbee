@@ -187,7 +187,7 @@ export function NodeInspector({
       <div className="divider" />
       <RefPicker
         title="Skills"
-        hint="写给模型的执行指导，运行这个节点时会随任务一起发给模型。"
+        hint="写给模型的执行指导，运行这个节点时会随任务一起注入执行上下文；使用 kimi 运行时还会作为会话级技能目录传给 kimi，会顶替 kimi 自动发现的技能目录。"
         refs={node.skill_refs}
         options={skills.filter((s) => s.enabled).map((s) => ({ id: s.skill_id, label: `${s.name} @v${s.version}` }))}
         onChange={(refs) => patch({ skill_refs: refs })}
@@ -195,7 +195,7 @@ export function NodeInspector({
       />
       <RefPicker
         title="MCP 工具"
-        hint="模型运行这个节点时可以调用的外部工具。工具自身的风险分级与审批策略不受影响。"
+        hint="工具的名称与说明会随任务注入执行上下文；工具服务器进程目前只有 claude 会真正拉起，kimi 只注入说明。工具自身的风险分级与审批策略不受影响。"
         refs={node.tool_refs}
         options={tools.filter((t) => t.enabled).map((t) => ({ id: t.tool_id, label: `${t.name} @v${t.version}` }))}
         onChange={(refs) => patch({ tool_refs: refs })}
@@ -884,7 +884,7 @@ function RefPicker({
             ))
           )}
           <div className="text-xs dim">
-            版本留空表示跟随最新。填写具体版本可以保证每次执行用的是同一份。
+            版本留空表示跟随最新。当前存储只保留每项的最新版本，填写版本号仅作记录，实际执行始终使用最新版本。
           </div>
         </div>
       ) : null}
