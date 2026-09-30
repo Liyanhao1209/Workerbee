@@ -312,6 +312,8 @@ export const registry = {
     kind: CredentialKind;
     secret_locator?: string | null;
     base_url?: string | null;
+    /** 密钥本体（如 { api_key: 'sk-...' }）。只在请求体出现一次，响应不回显。 */
+    secret?: Record<string, string> | null;
   }) => request<CredentialRef>('/api/credentials', { method: 'POST', body }),
 
   revokeCredential: (id: string, revoked: boolean) =>
@@ -358,6 +360,12 @@ export const templates = {
     kind?: 'workflow' | 'node';
     from_workflow_id?: string | null;
     from_revision_seq?: number | null;
+    /** 直接给载荷时，凭据必须已剥离为 sensitive_slots 占位。 */
+    payload?: {
+      nodes: unknown[];
+      edges: unknown[];
+      sensitive_slots: { slot: string; original_label?: string | null; original_kind?: string | null }[];
+    } | null;
   }) => request<Template>('/api/templates', { method: 'POST', body }),
 
   get: (id: string) => request<Template>(`/api/templates/${encodeURIComponent(id)}`),

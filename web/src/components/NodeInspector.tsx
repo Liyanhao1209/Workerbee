@@ -20,6 +20,8 @@ import type {
   VersionedRef,
 } from '../api/types';
 import { defaultRetryPolicy, newLocalId } from '../api/guards';
+import { registry as registryApi } from '../api/endpoints';
+import { ApiError } from '../api/client';
 import { CREDENTIAL_KIND_LABELS } from '../labels';
 import { Chip, Field, ShortId } from './common';
 
@@ -31,8 +33,17 @@ export interface NodeInspectorProps {
   credentials: CredentialRef[];
   skills: SkillDoc[];
   tools: ToolSpec[];
+  /** 新建凭据后通知父级刷新列表。 */
+  onCredentialsChanged: () => void;
   /** 注册表读取失败时如实说明，而不是显示成「一个都没有」。 */
   registryError: string | null;
+}
+
+/** 从能力快照里取字符串列表；快照可能缺失或形状不符，取不到就当空列表。 */
+function capList(capabilities: Record<string, unknown> | null, key: string): string[] {
+  const raw = capabilities?.[key];
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((x): x is string => typeof x === 'string');
 }
 
 export function NodeInspector({
@@ -43,6 +54,7 @@ export function NodeInspector({
   credentials,
   skills,
   tools,
+  onCredentialsChanged,
   registryError,
 }: NodeInspectorProps): JSX.Element {
   const patch = (changes: Partial<NodeDefinition>): void => onChange({ ...node, ...changes });
@@ -50,7 +62,7 @@ export function NodeInspector({
   return (
     <div className="col" style={{ gap: 'var(--sp-3)' }}>
       <div className="section-title">基本信息</div>
-      <Field label="名称" hint="节点在图中与历史里显示的名字">
+      <Field label="名称" required hint="节点在图中与历史里显示的名字">
         <input
           className="input"
           value={node.name}
@@ -58,7 +70,7 @@ export function NodeInspector({
           placeholder="如：实现"
         />
       </Field>
-      <Field label="角色" hint="进入 ContextPackage 的 P1 分区（§7.3），如「规划者」「编码者」「审计者」">
+      <Field label="角色" hint="节点扮演的角色，会写进发给模型的指令，如「规划者」「编码者」「审计者」">
         <input
           className="input"
           value={node.role ?? ''}
@@ -75,12 +87,13 @@ export function NodeInspector({
       </Field>
 
       <Field
-        label="必需输入（每行一个字段名）"
-        hint="声明后，若上游没有声明对应的输出契约，校验会报错。留空表示不参与机器校验。"
+        label="要求上游提供的内容"
+        hint="每行一个名称。上游节点完成后必须把这些内容交给本节点；如果上游没有声明会提供，校验时会报错。留空表示不检查。"
       >
         <textarea
           className="textarea textarea--code"
           rows={3}
+          placeholder={'如：\n需求说明\n接口设计'}
           value={node.required_inputs.join('\n')}
           onChange={(e) =>
             patch({
@@ -95,7 +108,7 @@ export function NodeInspector({
 
       <Field
         label="系统 prompt"
-        hint="留空是合法的：仍会以任务输入与上游摘要执行（P1/P2）。填写它不会取消必需交接；上游材料只进入 P2，不会获得修改系统约束的权限。"
+        hint="发给模型的长期指令。可以留空：模型仍会拿到任务说明和上游产出的摘要。"
       >
         <textarea
           className="textarea textarea--code"
@@ -110,7 +123,7 @@ export function NodeInspector({
       <div className="divider" />
       <div className="row row--between">
         <div className="section-title" style={{ margin: 0 }}>
-          执行候选（有序，顺序即优先级）
+          执行候选（按顺序尝试，第一个失败才用下一个）
         </div>
         <button
           type="button"
@@ -125,6 +138,7 @@ export function NodeInspector({
                   harness_ref: null,
                   credential_ref: null,
                   reasoning_effort: null,
+                  permission_mode: null,
                   retry: defaultRetryPolicy(),
                   compact_threshold: null,
                   extra: {},
@@ -140,7 +154,7 @@ export function NodeInspector({
         <div className="banner banner--warn">
           <div className="banner__body">
             <div className="banner__title">至少需要一组执行候选</div>
-            可运行节点至少要有一组执行候选，否则发布校验不会通过。
+            没有执行候选的节点无法运行，发布校验不会通过。
           </div>
         </div>
       ) : null}
@@ -152,6 +166,7 @@ export function NodeInspector({
           total={node.profiles.length}
           harnesses={harnesses}
           credentials={credentials}
+          onCredentialsChanged={onCredentialsChanged}
           onChange={(next) =>
             patch({ profiles: node.profiles.map((p) => (p.profile_id === next.profile_id ? next : p)) })
           }
@@ -172,7 +187,7 @@ export function NodeInspector({
       <div className="divider" />
       <RefPicker
         title="Skills"
-        hint="写给模型的执行指导。框架不会据此限制系统资源。"
+        hint="写给模型的执行指导，运行这个节点时会随任务一起发给模型。"
         refs={node.skill_refs}
         options={skills.filter((s) => s.enabled).map((s) => ({ id: s.skill_id, label: `${s.name} @v${s.version}` }))}
         onChange={(refs) => patch({ skill_refs: refs })}
@@ -180,7 +195,7 @@ export function NodeInspector({
       />
       <RefPicker
         title="MCP 工具"
-        hint="会进入 ContextPackage 的 P4 分区；风险分级与审批策略挂在工具本身。"
+        hint="模型运行这个节点时可以调用的外部工具。工具自身的风险分级与审批策略不受影响。"
         refs={node.tool_refs}
         options={tools.filter((t) => t.enabled).map((t) => ({ id: t.tool_id, label: `${t.name} @v${t.version}` }))}
         onChange={(refs) => patch({ tool_refs: refs })}
@@ -212,6 +227,7 @@ function ProfileEditor({
   total,
   harnesses,
   credentials,
+  onCredentialsChanged,
   onChange,
   onMove,
   onRemove,
@@ -221,6 +237,7 @@ function ProfileEditor({
   total: number;
   harnesses: HarnessRegistration[];
   credentials: CredentialRef[];
+  onCredentialsChanged: () => void;
   onChange: (next: ExecutionProfile) => void;
   onMove: (direction: number) => void;
   onRemove: () => void;
@@ -231,6 +248,11 @@ function ProfileEditor({
   const harness = harnesses.find((h) => h.harness_id === profile.harness_ref);
   const capabilities = harness?.capabilities_snapshot ?? null;
   const supportsCompact = capabilities ? capabilities['compact'] === true : null;
+  const efforts = capList(capabilities, 'reasoning_efforts');
+  const permissionModes = capList(capabilities, 'permission_modes');
+  const nonInteractive = capList(capabilities, 'non_interactive_modes');
+  const declaredModels = capList(capabilities, 'models');
+  const noPermissionHook = capabilities ? capabilities['permission_hook'] === false : false;
 
   return (
     <div
@@ -247,7 +269,7 @@ function ProfileEditor({
           {profile.model_name || '（未填模型名）'}
           {profile.harness_ref ? <span className="dim mono"> @{profile.harness_ref}</span> : null}
         </span>
-        <button type="button" className="btn btn--xs" disabled={index === 0} onClick={() => onMove(-1)} title="上移（提高优先级）">
+        <button type="button" className="btn btn--xs" disabled={index === 0} onClick={() => onMove(-1)} title="上移（先用它）">
           ↑
         </button>
         <button
@@ -255,7 +277,7 @@ function ProfileEditor({
           className="btn btn--xs"
           disabled={index === total - 1}
           onClick={() => onMove(1)}
-          title="下移（降低优先级）"
+          title="下移（后用）"
         >
           ↓
         </button>
@@ -269,29 +291,13 @@ function ProfileEditor({
 
       {open ? (
         <div className="col" style={{ marginTop: 'var(--sp-2)', gap: 'var(--sp-2)' }}>
-          <Field label="模型名" hint="系统不评价模型强弱，只做兼容性检查">
-            <input
-              className="input input--mono"
-              value={profile.model_name}
-              onChange={(e) => patch({ model_name: e.target.value })}
-              placeholder="如 gpt-5-codex / claude-sonnet-4-6"
-            />
-          </Field>
-
-          <Field
-            label="Harness"
-            hint={
-              harness
-                ? '模型与 harness 解耦，同一候选只绑定一个 harness'
-                : '未选择 harness 时，节点校验会报「待配置」'
-            }
-          >
+          <Field label="Harness" required hint="运行这个节点的 agent 程序（如 Claude Code、Kimi Code）">
             <select
               className="select"
               value={profile.harness_ref ?? ''}
               onChange={(e) => patch({ harness_ref: e.target.value || null })}
             >
-              <option value="">（未绑定 harness）</option>
+              <option value="">（未选择）</option>
               {harnesses.map((h) => (
                 <option key={h.harness_id} value={h.harness_id}>
                   {h.name}
@@ -301,10 +307,16 @@ function ProfileEditor({
             </select>
           </Field>
 
-          <Field
-            label="凭据"
-            hint="只保存引用；密钥本体在 Secret Store，永不出现在这里、模板或历史里（AUTH-02）"
-          >
+          <Field label="模型名" hint="留空表示用 harness 当前登录态的默认模型">
+            <input
+              className="input input--mono"
+              value={profile.model_name}
+              onChange={(e) => patch({ model_name: e.target.value })}
+              placeholder={declaredModels.length > 0 ? `如 ${declaredModels[0]}` : '如 claude-sonnet-4-6 / kimi-k2'}
+            />
+          </Field>
+
+          <Field label="凭据" hint="用哪份凭据调用模型服务。默认使用 harness 本机的登录状态。">
             <select
               className="select"
               value={profile.credential_ref ?? ''}
@@ -318,122 +330,288 @@ function ProfileEditor({
                 </option>
               ))}
             </select>
+            <CredentialQuickCreate onCreated={onCredentialsChanged} />
           </Field>
 
-          <Field
-            label="Reasoning effort"
-            hint="可选项来自适配器的能力声明，填了不支持的取值会被拒绝。留空表示不指定。"
-          >
-            <input
-              className="input input--mono"
-              value={profile.reasoning_effort ?? ''}
-              onChange={(e) => patch({ reasoning_effort: e.target.value || null })}
-              placeholder="如 low / medium / high"
-            />
-          </Field>
+          {!harness ? (
+            <Field label="Reasoning effort" hint="选择 harness 后，这里会列出它支持的取值。">
+              <select className="select" disabled value="">
+                <option value="">（先选择 harness）</option>
+              </select>
+            </Field>
+          ) : efforts.length === 0 ? (
+            <Field label="Reasoning effort" hint="该 harness 没有这个设置项，不需要填。">
+              <select className="select" disabled value="">
+                <option value="">（不适用）</option>
+              </select>
+              {profile.reasoning_effort ? (
+                <span className="field__error">
+                  当前填了「{profile.reasoning_effort}」，该 harness 不支持这个取值，校验会报错。
+                  <button
+                    type="button"
+                    className="btn btn--xs"
+                    style={{ marginLeft: 6 }}
+                    onClick={() => patch({ reasoning_effort: null })}
+                  >
+                    清除
+                  </button>
+                </span>
+              ) : null}
+            </Field>
+          ) : (
+            <Field label="Reasoning effort" hint="模型思考投入程度。留空表示不指定。">
+              <select
+                className="select"
+                value={profile.reasoning_effort ?? ''}
+                onChange={(e) => patch({ reasoning_effort: e.target.value || null })}
+              >
+                <option value="">（不指定）</option>
+                {efforts.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+                {profile.reasoning_effort && !efforts.includes(profile.reasoning_effort) ? (
+                  <option value={profile.reasoning_effort}>{profile.reasoning_effort}（该 harness 不支持）</option>
+                ) : null}
+              </select>
+            </Field>
+          )}
 
-          <Field
-            label="Compact 阈值（token）"
-            hint={
-              supportsCompact === false
-                ? '该 harness 不支持上下文整理，填了也不会生效。'
-                : supportsCompact === null
-                  ? 'harness 尚未探测，上限未知。实际触发点取用户阈值与 harness 上限中较小的那个，再留一点余量。'
-                  : '期望触发整理的阈值，不是模型最大窗口。留空表示不主动整理。'
-            }
-          >
-            <input
-              className="input input--num input--mono"
-              type="number"
-              min={1}
-              value={profile.compact_threshold ?? ''}
-              onChange={(e) => {
-                const raw = e.target.value.trim();
-                const parsed = raw === '' ? null : Number(raw);
-                patch({ compact_threshold: parsed !== null && Number.isFinite(parsed) && parsed > 0 ? parsed : null });
-              }}
-            />
-          </Field>
-
-          <div className="section-title" style={{ marginTop: 4 }}>
-            重试策略（有界，必须有终点）
-          </div>
-          <div className="field-row">
-            <Field label="最大尝试次数（含首次）">
-              <input
-                className="input input--num input--mono"
-                type="number"
-                min={1}
-                value={profile.retry.max_attempts}
-                onChange={(e) =>
-                  patch({
-                    retry: { ...profile.retry, max_attempts: Math.max(1, Number(e.target.value) || 1) },
-                  })
-                }
-              />
-            </Field>
-            <Field label="退避基数（ms）">
-              <input
-                className="input input--num input--mono"
-                type="number"
-                min={0}
-                value={profile.retry.backoff_base_ms}
-                onChange={(e) =>
-                  patch({
-                    retry: { ...profile.retry, backoff_base_ms: Math.max(0, Number(e.target.value) || 0) },
-                  })
-                }
-              />
-            </Field>
-            <Field label="退避上限（ms）">
-              <input
-                className="input input--num input--mono"
-                type="number"
-                min={0}
-                value={profile.retry.backoff_cap_ms}
-                onChange={(e) =>
-                  patch({
-                    retry: { ...profile.retry, backoff_cap_ms: Math.max(0, Number(e.target.value) || 0) },
-                  })
-                }
-              />
-            </Field>
-          </div>
-          <Field
-            label="可重试错误类别（逗号分隔）"
-            hint="默认对应 D-05：网络错误 / 限流 / 5xx 可重试；认证失败与 4xx 配置错误不可重试，直接切换候选。"
-          >
-            <input
-              className="input input--mono"
-              value={profile.retry.retryable_errors.join(', ')}
-              onChange={(e) =>
-                patch({
-                  retry: {
-                    ...profile.retry,
-                    retryable_errors: e.target.value
-                      .split(',')
-                      .map((s) => s.trim())
-                      .filter(Boolean),
-                  },
-                })
+          {harness && permissionModes.length > 0 ? (
+            <Field
+              label="权限模式"
+              required={noPermissionHook}
+              hint={
+                noPermissionHook
+                  ? '该 harness 运行中不会向你请求授权，必须选一个不会中途停下来问人的模式（标注了「不会询问」的），否则发布校验不通过。'
+                  : '该 harness 运行中会把授权请求转发给你处理，一般可以不指定。'
               }
-            />
-          </Field>
-          {profile.retry.backoff_cap_ms < profile.retry.backoff_base_ms ? (
-            <div className="field__error">退避上限不能小于基数，内核会拒绝该配置。</div>
+            >
+              <select
+                className="select"
+                value={profile.permission_mode ?? ''}
+                onChange={(e) => patch({ permission_mode: e.target.value || null })}
+              >
+                <option value="">（不指定）</option>
+                {permissionModes.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                    {nonInteractive.includes(m) ? '（不会询问）' : ''}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          ) : null}
+          {harness && noPermissionHook && permissionModes.length === 0 ? (
+            <div className="field__error">
+              该 harness 不会向你请求授权，却也没有声明任何可用的权限模式；这样的组合无法无人值守运行，请换用其他 harness。
+            </div>
           ) : null}
 
           <details>
-            <summary className="text-xs dim" style={{ cursor: 'pointer' }}>
-              附加参数（透传给适配器）
+            <summary className="text-sm dim" style={{ cursor: 'pointer' }}>
+              高级设置（通常不用改）
             </summary>
-            <ExtraEditor
-              extra={profile.extra}
-              onChange={(extra) => patch({ extra })}
-            />
+            <div className="col" style={{ marginTop: 'var(--sp-2)', gap: 'var(--sp-2)' }}>
+              <Field
+                label="上下文整理阈值（token）"
+                hint={
+                  supportsCompact === false
+                    ? '该 harness 不支持上下文整理，填了也不会生效。'
+                    : '对话长度超过这个值时主动压缩上下文。留空表示不主动整理。'
+                }
+              >
+                <input
+                  className="input input--num input--mono"
+                  type="number"
+                  min={1}
+                  placeholder="如 120000"
+                  value={profile.compact_threshold ?? ''}
+                  onChange={(e) => {
+                    const raw = e.target.value.trim();
+                    const parsed = raw === '' ? null : Number(raw);
+                    patch({ compact_threshold: parsed !== null && Number.isFinite(parsed) && parsed > 0 ? parsed : null });
+                  }}
+                />
+              </Field>
+
+              <div className="section-title" style={{ marginTop: 4 }}>
+                重试策略
+              </div>
+              <div className="field-row">
+                <Field label="最大尝试次数" hint="含首次">
+                  <input
+                    className="input input--num input--mono"
+                    type="number"
+                    min={1}
+                    value={profile.retry.max_attempts}
+                    onChange={(e) =>
+                      patch({
+                        retry: { ...profile.retry, max_attempts: Math.max(1, Number(e.target.value) || 1) },
+                      })
+                    }
+                  />
+                </Field>
+                <Field label="退避基数（毫秒）" hint="首次重试前的等待">
+                  <input
+                    className="input input--num input--mono"
+                    type="number"
+                    min={0}
+                    value={profile.retry.backoff_base_ms}
+                    onChange={(e) =>
+                      patch({
+                        retry: { ...profile.retry, backoff_base_ms: Math.max(0, Number(e.target.value) || 0) },
+                      })
+                    }
+                  />
+                </Field>
+                <Field label="退避上限（毫秒）" hint="等待时间不超过它">
+                  <input
+                    className="input input--num input--mono"
+                    type="number"
+                    min={0}
+                    value={profile.retry.backoff_cap_ms}
+                    onChange={(e) =>
+                      patch({
+                        retry: { ...profile.retry, backoff_cap_ms: Math.max(0, Number(e.target.value) || 0) },
+                      })
+                    }
+                  />
+                </Field>
+              </div>
+              <Field
+                label="可重试的错误（逗号分隔）"
+                hint="哪些错误值得重试。网络错误、限流、服务器 5xx 默认可重试；认证失败和配置错误不重试，直接换下一个候选。"
+              >
+                <input
+                  className="input input--mono"
+                  value={profile.retry.retryable_errors.join(', ')}
+                  onChange={(e) =>
+                    patch({
+                      retry: {
+                        ...profile.retry,
+                        retryable_errors: e.target.value
+                          .split(',')
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      },
+                    })
+                  }
+                />
+              </Field>
+              {profile.retry.backoff_cap_ms < profile.retry.backoff_base_ms ? (
+                <div className="field__error">退避上限不能小于基数，保存时会被拒绝。</div>
+              ) : null}
+
+              <ExtraEditor extra={profile.extra} onChange={(extra) => patch({ extra })} />
+            </div>
           </details>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 内联新建凭据
+// ---------------------------------------------------------------------------
+
+function CredentialQuickCreate({
+  onCreated,
+}: {
+  onCreated: () => void;
+}): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [label, setLabel] = useState('');
+  const [kind, setKind] = useState<'api_key' | 'base_url_pair'>('api_key');
+  const [apiKey, setApiKey] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!open) {
+    return (
+      <button type="button" className="btn btn--xs" onClick={() => setOpen(true)}>
+        + 新建凭据
+      </button>
+    );
+  }
+
+  const submit = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const secret: Record<string, string> = { api_key: apiKey.trim() };
+      if (kind === 'base_url_pair') secret['base_url'] = baseUrl.trim();
+      await registryApi.createCredential({
+        label: label.trim(),
+        kind,
+        base_url: kind === 'base_url_pair' ? baseUrl.trim() || null : null,
+        secret,
+      });
+      onCreated();
+      setOpen(false);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="col"
+      style={{
+        gap: 'var(--sp-2)',
+        marginTop: 4,
+        padding: 'var(--sp-2)',
+        border: '1px solid var(--line)',
+        borderRadius: 'var(--radius)',
+      }}
+    >
+      <Field label="名称" required hint="给自己看的名字，如「公司 Claude 账号」">
+        <input className="input input--sm" value={label} onChange={(e) => setLabel(e.target.value)} />
+      </Field>
+      <Field label="类型" required>
+        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'api_key' | 'base_url_pair')}>
+          <option value="api_key">API Key</option>
+          <option value="base_url_pair">API Key + 自定义服务地址</option>
+        </select>
+      </Field>
+      <Field label="API Key" required hint="只保存加密后的内容，这里和历史记录都不会显示它。">
+        <input
+          className="input input--sm input--mono"
+          type="password"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          placeholder="sk-..."
+        />
+      </Field>
+      {kind === 'base_url_pair' ? (
+        <Field label="服务地址" required>
+          <input
+            className="input input--sm input--mono"
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder="https://api.example.com/v1"
+          />
+        </Field>
+      ) : null}
+      {error ? <div className="field__error">{error}</div> : null}
+      <div className="row row--tight">
+        <button
+          type="button"
+          className="btn btn--sm btn--primary"
+          disabled={busy || !label.trim() || !apiKey.trim() || (kind === 'base_url_pair' && !baseUrl.trim())}
+          onClick={() => void submit()}
+        >
+          {busy ? '保存中…' : '保存'}
+        </button>
+        <button type="button" className="btn btn--sm" disabled={busy} onClick={() => setOpen(false)}>
+          取消
+        </button>
+      </div>
     </div>
   );
 }
@@ -449,8 +627,7 @@ function ExtraEditor({
   return (
     <div className="col" style={{ marginTop: 6, gap: 4 }}>
       <div className="text-xs dim">
-        透传给适配器的附加参数（如 API base url 覆盖、模型别名）。含凭据性内容时必须走凭据引用，
-        不要写在这里——它会进入历史记录。
+        传给 harness 的附加参数。不要在这里写密钥——它会进入历史记录；密钥请用上面的「凭据」。
       </div>
       {entries.map(([key, value]) => (
         <div className="row row--tight" key={key}>

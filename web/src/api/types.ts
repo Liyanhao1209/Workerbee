@@ -102,6 +102,8 @@ export interface ExecutionProfile {
   credential_ref: string | null;
   /** 以适配器验证的能力为准；不可用的取值必须提示，不能静默忽略（CFG-02）。 */
   reasoning_effort: string | null;
+  /** 权限模式（HUM-03）。harness 无权限钩子时必须显式选一个不询问的模式。 */
+  permission_mode: string | null;
   retry: RetryPolicy;
   /** 用户**期望**触发整理的阈值，不是模型最大窗口（CFG-04）。 */
   compact_threshold: number | null;

@@ -592,6 +592,7 @@ export function WorkflowEditorPage(): JSX.Element {
                 credentials={credentials.data ?? []}
                 skills={skills.data ?? []}
                 tools={tools.data ?? []}
+                onCredentialsChanged={credentials.reload}
                 registryError={registryError}
               />
             ) : (
