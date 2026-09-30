@@ -334,10 +334,10 @@ export function WorkflowEditorPage(): JSX.Element {
               className="select select--sm"
               value={validateMode}
               onChange={(e) => setValidateMode(e.target.value === 'draft' ? 'draft' : 'publish')}
-              title="草稿校验只看这一版能不能存；发布校验按发布标准检查（更严）"
+              title="草稿校验：只检查这一版能不能保存；发布校验：按能运行的标准检查（更严格）"
             >
-              <option value="draft">草稿校验</option>
-              <option value="publish">发布校验</option>
+              <option value="draft">草稿校验（能否保存）</option>
+              <option value="publish">发布校验（能否运行）</option>
             </select>
             <button
               type="button"

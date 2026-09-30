@@ -20,7 +20,7 @@ import type {
   VersionedRef,
 } from '../api/types';
 import { defaultRetryPolicy, newLocalId } from '../api/guards';
-import { registry as registryApi } from '../api/endpoints';
+import { registry as registryApi, templates as templatesApi } from '../api/endpoints';
 import { ApiError } from '../api/client';
 import { CREDENTIAL_KIND_LABELS } from '../labels';
 import { Chip, Field, ShortId } from './common';
@@ -201,6 +201,9 @@ export function NodeInspector({
         onChange={(refs) => patch({ tool_refs: refs })}
         registryError={registryError}
       />
+
+      <div className="divider" />
+      <SaveNodeAsTemplate node={node} credentials={credentials} />
 
       <div className="divider" />
       <div className="row row--between">
@@ -676,6 +679,110 @@ function ExtraAdd({ onAdd }: { onAdd: (key: string) => void }): JSX.Element {
       >
         添加
       </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 存为节点模板
+// ---------------------------------------------------------------------------
+
+function SaveNodeAsTemplate({
+  node,
+  credentials,
+}: {
+  node: NodeDefinition;
+  credentials: CredentialRef[];
+}): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  if (!open) {
+    return (
+      <div className="col" style={{ gap: 4 }}>
+        <button
+          type="button"
+          className="btn btn--sm"
+          onClick={() => {
+            setName(node.name);
+            setDone(false);
+            setError(null);
+            setOpen(true);
+          }}
+        >
+          存为节点模板
+        </button>
+        <div className="text-xs dim">把这个节点的配置存进模板库，以后建图时可以直接复用。</div>
+      </div>
+    );
+  }
+
+  const submit = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const slots: { slot: string; original_label: string | null }[] = [];
+      const profiles = node.profiles.map((p, idx) => {
+        if (p.credential_ref) {
+          const cred = credentials.find((c) => c.credential_id === p.credential_ref);
+          slots.push({
+            slot: `${node.name}.profiles[${idx}].credential_ref`,
+            original_label: cred?.label ?? p.credential_ref,
+          });
+        }
+        return { ...p, credential_ref: null };
+      });
+      await templatesApi.create({
+        name: name.trim(),
+        kind: 'node',
+        payload: {
+          nodes: [
+            {
+              name: node.name,
+              role: node.role,
+              description: node.description,
+              system_prompt: node.system_prompt,
+              profiles,
+              skill_refs: node.skill_refs,
+              tool_refs: node.tool_refs,
+              required_inputs: node.required_inputs,
+            },
+          ],
+          edges: [],
+          sensitive_slots: slots,
+        },
+      });
+      setDone(true);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="col" style={{ gap: 'var(--sp-2)' }}>
+      <Field label="模板名称" required hint="凭据不会存进模板；使用模板时需要重新选择凭据。">
+        <input className="input input--sm" value={name} onChange={(e) => setName(e.target.value)} />
+      </Field>
+      {error ? <div className="field__error">{error}</div> : null}
+      {done ? <div className="text-xs" style={{ color: 'var(--st-success)' }}>已存入模板库。</div> : null}
+      <div className="row row--tight">
+        <button
+          type="button"
+          className="btn btn--sm btn--primary"
+          disabled={busy || !name.trim()}
+          onClick={() => void submit()}
+        >
+          {busy ? '保存中…' : '保存'}
+        </button>
+        <button type="button" className="btn btn--sm" disabled={busy} onClick={() => setOpen(false)}>
+          取消
+        </button>
+      </div>
     </div>
   );
 }
