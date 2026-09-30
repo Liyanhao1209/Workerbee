@@ -35,13 +35,14 @@ import json
 import os
 import signal
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, AsyncIterator, Mapping, Sequence
 
 from ...core.domain.task import Usage
 from ...executables import resolve as resolve_executable
 from ..redact import redact_text
 from .backend import (
     LLMBackendError,
+    LLMChunk,
     LLMConfigError,
     LLMResponseError,
     LLMResponse,
@@ -392,6 +393,33 @@ class HarnessCLIBackend:
 
         text, usage, model = self.parse_output(stdout, output_format=self.output_format)
         return LLMResponse(text=text, usage=usage, model=model, backend=self.name)
+
+    async def stream(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: float | None = None,
+    ) -> AsyncIterator[LLMChunk]:
+        """**伪流式**：harness CLI 的单次调用形态拿不到增量，这里就是调
+        :meth:`complete` 等全文返回后一次性 yield。
+
+        终帧如实标 ``streamed=False``——调用方（助手服务）据此在结果上标注
+        「非流式」，而不是让界面假装逐字生成。
+        """
+        resp = await self.complete(
+            messages, max_tokens=max_tokens, temperature=temperature, timeout=timeout
+        )
+        yield LLMChunk(
+            kind="text",
+            final=True,
+            text=resp.text,
+            usage=resp.usage,
+            model=resp.model,
+            backend=self.name,
+            streamed=False,
+        )
 
     async def _run(self, argv: Sequence[str], *, timeout: float) -> tuple[str, str, int]:
         """起子进程、有界读输出、超时即杀。返回 ``(stdout, stderr, returncode)``。"""

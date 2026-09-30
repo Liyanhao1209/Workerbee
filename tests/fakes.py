@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from workerbee.core.domain.artifact import ArtifactKind, ArtifactProducer
 from workerbee.core.runtime.ports import AssembledContext, SessionCaps, SessionHandle
-from workerbee.data.llm import LLMMessage, LLMResponse
+from workerbee.data.llm import LLMChunk, LLMMessage, LLMResponse
 
 __all__ = [
     "FakeHarness",
@@ -273,6 +273,11 @@ class FakeLLMBackend:
     ``responses`` 按调用次序取用，可以是字符串（正常回复）或异常（按要求失败）；
     用完后重复最后一个。``calls`` 记录每次实际收到的 messages——
     断言「模型真的收到了 guidebook / 快照 / 历史」全靠它，只断言状态码不算数。
+
+    流式：``stream`` 把同一份脚本拆成逐 chunk 产出——reasoning（``reasonings``
+    与 ``responses`` 按下标对齐）在前、正文在后（正文拆成两段，便于断言
+    累积顺序），恰以一个终帧结束。脚本是异常时在**第一个 chunk 之前**抛出，
+    与真实后端「建连即失败」的形态一致。
     """
 
     def __init__(
@@ -280,12 +285,23 @@ class FakeLLMBackend:
         *responses: Any,
         name: str = "fake-llm",
         model: str = "fake-model",
+        reasonings: tuple[str, ...] = (),
     ) -> None:
         self._responses = list(responses) or ["（空回复）"]
+        self._reasonings = list(reasonings)
         self.name = name
         self.model = model
         self.calls: list[list[LLMMessage]] = []
         self.closed = False
+
+    def _payload(self) -> Any:
+        return self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
+
+    def _reasoning(self) -> str | None:
+        index = len(self.calls) - 1
+        if index < len(self._reasonings):
+            return self._reasonings[index]
+        return None
 
     async def complete(
         self,
@@ -296,7 +312,7 @@ class FakeLLMBackend:
         timeout: float | None = None,
     ) -> LLMResponse:
         self.calls.append(list(messages))
-        payload = self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
+        payload = self._payload()
         if isinstance(payload, Exception):
             raise payload
         return LLMResponse(
@@ -304,6 +320,31 @@ class FakeLLMBackend:
             model=self.model,
             backend=self.name,
             usage=None,
+        )
+
+    async def stream(
+        self,
+        messages: Any,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: float | None = None,
+    ):
+        self.calls.append(list(messages))
+        payload = self._payload()
+        if isinstance(payload, Exception):
+            raise payload
+        reasoning = self._reasoning()
+        if reasoning:
+            yield LLMChunk(kind="reasoning", text=reasoning)
+        text = str(payload)
+        mid = len(text) // 2
+        if text[:mid]:
+            yield LLMChunk(kind="text", text=text[:mid])
+        if text[mid:]:
+            yield LLMChunk(kind="text", text=text[mid:])
+        yield LLMChunk(
+            kind="text", final=True, usage=None, model=self.model, backend=self.name
         )
 
     async def health(self) -> tuple[bool, None]:

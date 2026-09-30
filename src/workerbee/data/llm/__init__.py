@@ -21,6 +21,7 @@ from .backend import (
     LLMAuthError,
     LLMBackend,
     LLMBackendError,
+    LLMChunk,
     LLMConfigError,
     LLMError,
     LLMMessage,
@@ -46,6 +47,7 @@ __all__ = [
     # 协议与数据
     "LLMMessage",
     "LLMResponse",
+    "LLMChunk",
     "LLMBackend",
     "SecretResolver",
     # 后端

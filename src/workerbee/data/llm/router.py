@@ -18,7 +18,7 @@ D-05 的单向推进纪律同样适用：候选按顺序推进，**已失败的�
 
 from __future__ import annotations
 
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, AsyncIterator, Callable, Literal, Sequence
 
 from pydantic import Field, model_validator
 
@@ -28,9 +28,11 @@ from .anthropic import AnthropicBackend
 from .backend import (
     LLMAllBackendsFailed,
     LLMBackend,
+    LLMChunk,
     LLMError,
     LLMResponse,
     LLMMessage,
+    LLMResponseError,
     SecretResolver,
 )
 from .harness_cli import HarnessCLIBackend
@@ -236,6 +238,87 @@ class LLMRouter:
         if not allow_fallback and last_error is not None:
             # 用户显式要求「就用这个后端」：失败时抛出**原始分类**的错误，而不是
             # 包一层 all_failed——调用方需要按 D-05 的分类决定重试还是换配置。
+            raise last_error
+        raise LLMAllBackendsFailed(attempts, last_error)
+
+    # ---- 流式补全（带可见降级） ----
+
+    async def stream(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: float | None = None,
+        prefer: str | None = None,
+        allow_fallback: bool = True,
+    ) -> AsyncIterator[LLMChunk]:
+        """流式版本的有序降级。语义与 :meth:`complete` 一致，除了一条流式特有的
+        硬约束：
+
+        **只有第一个 chunk 到达之前的失败才允许换后端。** 第一个 chunk 一旦产出，
+        内容可能已经推给了用户界面——此刻再失败绝不能换后端把回答重发一遍
+        （用户会看到两份开头），只能把错误原样抛出。
+        """
+        order = self._order(prefer)
+        if not allow_fallback:
+            order = order[:1]
+        primary_name = order[0].name
+        attempts: list[str] = []
+        last_error: LLMError | None = None
+
+        for backend in order:
+            agen = backend.stream(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+            )
+            try:
+                first = await agen.__anext__()
+            except StopAsyncIteration:
+                # 空流 = 坏响应：什么都没产出，等价于取不到内容，允许换后端。
+                attempts.append(f"{backend.name}:bad_response")
+                last_error = LLMResponseError(
+                    f"流式补全没有产出任何 chunk（backend={backend.name}）",
+                    backend=backend.name,
+                    kind="bad_payload",
+                )
+                continue
+            except LLMError as exc:
+                attempts.append(exc.as_reason())
+                last_error = exc
+                continue
+            except Exception as exc:  # 未预期异常同样触发降级，但如实标注为 unexpected
+                attempts.append(f"{backend.name}:unexpected")
+                last_error = LLMError(f"{type(exc).__name__}: {exc}", kind="unexpected")
+                last_error.backend = backend.name
+                continue
+
+            degraded = [redact_text(a) for a in attempts]
+            fell_back = bool(attempts)
+            if fell_back and self.on_fallback is not None:
+                self.on_fallback(list(degraded), backend.name)
+
+            def stamp(chunk: LLMChunk) -> LLMChunk:
+                """降级标注只写在终帧上（降级可见性同 LLMResponse 的约定）。"""
+                if not fell_back or not chunk.final:
+                    return chunk
+                return chunk.model_copy(
+                    update={
+                        "backend": chunk.backend or backend.name,
+                        "fallback_from": primary_name,
+                        "degraded_reasons": degraded + list(chunk.degraded_reasons),
+                    }
+                )
+
+            yield stamp(first)
+            async for chunk in agen:
+                # 从这里开始的任何异常都原样向上抛：内容已发出，不能换后端重来。
+                yield stamp(chunk)
+            return
+
+        if not allow_fallback and last_error is not None:
             raise last_error
         raise LLMAllBackendsFailed(attempts, last_error)
 

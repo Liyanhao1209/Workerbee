@@ -15,7 +15,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+import json
+from typing import Any, AsyncIterator, Mapping, Sequence
 
 import httpx
 
@@ -23,6 +24,7 @@ from ..redact import Secret, redact_text
 from .backend import (
     LLMBackendError,
     LLMAuthError,
+    LLMChunk,
     LLMConfigError,
     LLMError,
     LLMResponse,
@@ -138,6 +140,30 @@ class OpenAICompatBackend:
 
     # ---- 补全 ----
 
+    def _build_body(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        max_tokens: int | None,
+        temperature: float | None,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [m.model_dump() for m in messages],
+        }
+        effective_max = max_tokens if max_tokens is not None else self.default_max_tokens
+        if effective_max is not None:
+            body["max_tokens"] = int(effective_max)
+        if temperature is not None:
+            body["temperature"] = float(temperature)
+        if stream:
+            body["stream"] = True
+            # 流式下 usage 默认不回传：显式要求带，否则终帧只能记「未知」。
+            body["stream_options"] = {"include_usage": True}
+        body.update(self.extra_body)
+        return body
+
     async def complete(
         self,
         messages: Sequence[LLMMessage],
@@ -149,16 +175,9 @@ class OpenAICompatBackend:
         base_url, key = await self._credentials()
         url = f"{base_url}/chat/completions"
 
-        body: dict[str, Any] = {
-            "model": self.model,
-            "messages": [m.model_dump() for m in messages],
-        }
-        effective_max = max_tokens if max_tokens is not None else self.default_max_tokens
-        if effective_max is not None:
-            body["max_tokens"] = int(effective_max)
-        if temperature is not None:
-            body["temperature"] = float(temperature)
-        body.update(self.extra_body)
+        body = self._build_body(
+            messages, max_tokens=max_tokens, temperature=temperature
+        )
 
         headers = {
             "Authorization": f"Bearer {key.reveal()}",
@@ -185,6 +204,121 @@ class OpenAICompatBackend:
         self._raise_for_status(resp, target=url)
         payload = self._decode_json(resp, target=url)
         return self._to_response(payload)
+
+    # ---- 流式补全（SSE） ----
+
+    async def stream(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: float | None = None,
+    ) -> AsyncIterator[LLMChunk]:
+        """SSE 流式补全。逐 delta yield，恰以一个 ``final=True`` 的终帧结束。
+
+        增量映射：``delta.content`` → text chunk；``delta.reasoning_content``
+        → reasoning chunk（DeepSeek 等兼容服务用这个字段名回传思维链）。
+        usage 只在 ``stream_options.include_usage`` 换来的最后一个空 choices
+        数据帧里出现，由终帧携带；对端不给时终帧 ``usage=None``（未知 ≠ 0）。
+
+        第一个 chunk 到达之前的失败（连不上、HTTP 错误、首帧解析失败）抛
+        :class:`LLMError` 子类，router 据此换后端；开始产出之后再失败原样抛出。
+        """
+        base_url, key = await self._credentials()
+        url = f"{base_url}/chat/completions"
+        body = self._build_body(
+            messages, max_tokens=max_tokens, temperature=temperature, stream=True
+        )
+        headers = {
+            "Authorization": f"Bearer {key.reveal()}",
+            "Content-Type": "application/json",
+            **self.extra_headers,
+        }
+
+        client = self._ensure_client()
+        try:
+            async with client.stream(
+                "POST", url, json=body, headers=headers,
+                timeout=float(timeout or self.timeout),
+            ) as resp:
+                if resp.status_code >= 400:
+                    # 流式响应的错误体要先读出来才能复用既有的分类逻辑。
+                    await resp.aread()
+                    self._raise_for_status(resp, target=url)
+                async for chunk in self._consume_sse(resp):
+                    yield chunk
+        except httpx.TimeoutException as exc:
+            raise LLMTimeoutError(
+                f"请求 {url} 超时（backend={self.name}）", backend=self.name
+            ) from exc
+        except httpx.TransportError as exc:
+            raise LLMBackendError(
+                f"请求 {url} 失败：{type(exc).__name__}（backend={self.name}）",
+                backend=self.name,
+                kind="network",
+            ) from exc
+
+    async def _consume_sse(self, resp: httpx.Response) -> AsyncIterator[LLMChunk]:
+        """解析 SSE 数据流：``data: <json>`` 逐行来，``data: [DONE]`` 终止。"""
+        model: str | None = None
+        usage = None
+        truncated = False
+        async for line in resp.aiter_lines():
+            if not line or line.startswith(":"):
+                continue  # 空行与 SSE 注释（keep-alive）
+            if not line.startswith("data:"):
+                continue  # event:/id:/retry: 等行对本协议没有意义
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError as exc:
+                raise LLMResponseError(
+                    f"流式数据帧不是合法 JSON（backend={self.name}）：{data[:200]}",
+                    backend=self.name,
+                    kind="bad_json",
+                ) from exc
+            if not isinstance(payload, dict):
+                continue
+            if isinstance(payload.get("model"), str):
+                model = payload["model"]
+
+            usage_raw = payload.get("usage")
+            if isinstance(usage_raw, dict):
+                # include_usage 换来的终帧：choices 为空、只有 usage。
+                def _int(key: str) -> int | None:
+                    v = usage_raw.get(key)
+                    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+                usage = usage_from_counts(_int("prompt_tokens"), _int("completion_tokens"))
+
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
+            reasoning = delta.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                yield LLMChunk(kind="reasoning", text=reasoning)
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                yield LLMChunk(kind="text", text=content)
+            if first.get("finish_reason") == "length":
+                # 与 complete 同一口径：截断即失败，不把半截文本当完整回复。
+                truncated = True
+
+        if truncated:
+            raise LLMResponseError(
+                f"补全被 max_tokens 截断（finish_reason=length，backend={self.name}）",
+                backend=self.name,
+                kind="output_truncated",
+            )
+        yield LLMChunk(
+            kind="text", final=True, usage=usage, model=model or self.model,
+            backend=self.name,
+        )
 
     def _raise_for_status(self, resp: httpx.Response, *, target: str) -> None:
         status = resp.status_code

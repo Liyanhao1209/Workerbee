@@ -17,7 +17,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+import json
+from typing import Any, AsyncIterator, Mapping, Sequence
 
 import httpx
 
@@ -25,6 +26,7 @@ from ..redact import Secret, redact_text
 from .backend import (
     LLMBackendError,
     LLMAuthError,
+    LLMChunk,
     LLMConfigError,
     LLMError,
     LLMResponse,
@@ -154,8 +156,14 @@ class AnthropicBackend:
         *,
         max_tokens: int | None,
         temperature: float | None,
+        stream: bool = False,
     ) -> dict[str, Any]:
-        """构造请求体。system 与 user/assistant 在此完成分流。"""
+        """构造请求体。system 与 user/assistant 在此完成分流。
+
+        ``stream=True`` 只加 ``"stream": True`` 开关——**不主动开启 extended
+        thinking**（请求体里不加 ``thinking`` 参数）：非思考模型收到该参数会
+        直接报错，而思考内容若服务端自然发出，流式解析会照常透传。
+        """
         body: dict[str, Any] = {
             "model": self.model,
             "max_tokens": int(max_tokens) if max_tokens is not None else self.default_max_tokens,
@@ -168,6 +176,8 @@ class AnthropicBackend:
             body["system"] = system
         if temperature is not None:
             body["temperature"] = float(temperature)
+        if stream:
+            body["stream"] = True
         body.update(self.extra_body)
         return body
 
@@ -216,6 +226,133 @@ class AnthropicBackend:
         self._raise_for_status(resp, target=url)
         payload = self._decode_json(resp, target=url)
         return self._to_response(payload)
+
+    # ---- 流式补全（SSE） ----
+
+    async def stream(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: float | None = None,
+    ) -> AsyncIterator[LLMChunk]:
+        """SSE 流式补全。逐事件 yield，恰以一个 ``final=True`` 的终帧结束。
+
+        事件映射（事件类型在 ``data`` 载荷的 ``type`` 字段里，``event:`` 行
+        不单独处理）：
+        - ``content_block_delta`` 的 ``text_delta`` → text chunk，
+          ``thinking_delta`` → reasoning chunk（**透传**服务端自然发出的
+          thinking；本后端不主动开启 extended thinking，见 build_request）；
+        - usage：``message_start`` 带 ``input_tokens``，``message_delta``
+          带 ``output_tokens``，合并进终帧；缺哪边哪边就是 ``None``（未知）；
+        - ``message_delta`` 的 ``stop_reason == "max_tokens"`` 与 complete
+          同一口径：截断即失败，抛 :class:`LLMResponseError`。
+
+        第一个 chunk 到达之前的失败抛 :class:`LLMError` 子类供 router 降级；
+        开始产出之后再失败原样抛出。
+        """
+        base_url, key = await self._credentials()
+        url = f"{base_url}/v1/messages"
+        body = self.build_request(
+            messages, max_tokens=max_tokens, temperature=temperature, stream=True
+        )
+
+        client = self._ensure_client()
+        try:
+            async with client.stream(
+                "POST", url, json=body, headers=self.build_headers(key),
+                timeout=float(timeout or self.timeout),
+            ) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    self._raise_for_status(resp, target=url)
+                async for chunk in self._consume_sse(resp):
+                    yield chunk
+        except httpx.TimeoutException as exc:
+            raise LLMTimeoutError(
+                f"请求 {url} 超时（backend={self.name}）", backend=self.name
+            ) from exc
+        except httpx.TransportError as exc:
+            raise LLMBackendError(
+                f"请求 {url} 失败：{type(exc).__name__}（backend={self.name}）",
+                backend=self.name,
+                kind="network",
+            ) from exc
+
+    async def _consume_sse(self, resp: httpx.Response) -> AsyncIterator[LLMChunk]:
+        input_tokens: int | None = None
+        output_tokens: int | None = None
+        model: str | None = None
+        truncated = False
+        async for line in resp.aiter_lines():
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError as exc:
+                raise LLMResponseError(
+                    f"流式数据帧不是合法 JSON（backend={self.name}）：{data[:200]}",
+                    backend=self.name,
+                    kind="bad_json",
+                ) from exc
+            if not isinstance(payload, dict):
+                continue
+            event = payload.get("type")
+
+            if event == "message_start":
+                message = payload.get("message")
+                if isinstance(message, dict) and isinstance(message.get("model"), str):
+                    model = message["model"]
+                usage_raw = (
+                    message.get("usage")
+                    if isinstance(message, dict) and isinstance(message.get("usage"), dict)
+                    else {}
+                )
+                v = usage_raw.get("input_tokens")
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    input_tokens = int(v)
+            elif event == "content_block_delta":
+                delta = payload.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                    if delta["text"]:
+                        yield LLMChunk(kind="text", text=delta["text"])
+                elif delta.get("type") == "thinking_delta" and isinstance(
+                    delta.get("thinking"), str
+                ):
+                    if delta["thinking"]:
+                        yield LLMChunk(kind="reasoning", text=delta["thinking"])
+            elif event == "message_delta":
+                delta = payload.get("delta")
+                if isinstance(delta, dict) and delta.get("stop_reason") == "max_tokens":
+                    truncated = True
+                usage_raw = (
+                    payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+                )
+                v = usage_raw.get("output_tokens")
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    output_tokens = int(v)
+            elif event == "message_stop":
+                break
+            # ping / content_block_start / content_block_stop 等事件不含增量，跳过。
+
+        if truncated:
+            raise LLMResponseError(
+                f"补全被 max_tokens 截断（stop_reason=max_tokens，backend={self.name}）："
+                f"框架拒绝把截断文本当作完整结果（DATA-03）",
+                backend=self.name,
+                kind="output_truncated",
+            )
+        yield LLMChunk(
+            kind="text", final=True,
+            usage=usage_from_counts(input_tokens, output_tokens),
+            model=model or self.model, backend=self.name,
+        )
 
     def _raise_for_status(self, resp: httpx.Response, *, target: str) -> None:
         status = resp.status_code

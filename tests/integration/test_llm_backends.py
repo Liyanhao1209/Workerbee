@@ -25,6 +25,7 @@ from workerbee.data.llm import (
     LLMAllBackendsFailed,
     LLMAuthError,
     LLMBackendError,
+    LLMChunk,
     LLMConfigError,
     LLMError,
     LLMMessage,
@@ -99,6 +100,331 @@ MSGS = [
     LLMMessage(role="system", content="你是摘要器"),
     LLMMessage(role="user", content="把这段材料摘一下"),
 ]
+
+
+# ===========================================================================
+# 流式补全（stream）：SSE 解析、reasoning 透传、降级边界
+#
+# 纪律同非流式：不发真实网络请求（MockTransport + 构造好的 SSE 字节流），
+# 断言**逐 chunk 到达的内容与顺序**——只断言「最终拼出来对」不算数。
+# ===========================================================================
+
+
+class _SSEStream(httpx.AsyncByteStream):
+    """把预置字节块按序吐给响应体（MockTransport 的流式响应夹具）。"""
+
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+def sse_response(*data_lines: str) -> httpx.Response:
+    """把若干 SSE data 载荷拼成一个 text/event-stream 响应。"""
+    body = "".join(f"data: {line}\n\n" for line in data_lines)
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=_SSEStream([body.encode("utf-8")]),
+    )
+
+
+async def collect(agen) -> list:
+    return [chunk async for chunk in agen]
+
+
+def openai_sse_delta(content=None, reasoning=None, finish=None, model="gpt-test-1"):
+    delta: dict = {}
+    if content is not None:
+        delta["content"] = content
+    if reasoning is not None:
+        delta["reasoning_content"] = reasoning
+    return json.dumps(
+        {"model": model, "choices": [{"delta": delta, "finish_reason": finish}]},
+        ensure_ascii=False,
+    )
+
+
+async def test_openai_stream_request_body_and_chunk_order():
+    rec = Recorder(
+        sse_response(
+            openai_sse_delta(reasoning="先想一"),
+            openai_sse_delta(reasoning="想二"),
+            openai_sse_delta(content="答"),
+            openai_sse_delta(content="案", finish="stop"),
+            json.dumps({"model": "gpt-test-1", "choices": [],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 4}}),
+            "[DONE]",
+        )
+    )
+    async with make_client(rec) as client:
+        backend = OpenAICompatBackend(
+            model="gpt-test-1", base_url="https://x/v1", api_key=KEY, client=client
+        )
+        chunks = await collect(backend.stream(MSGS, max_tokens=64, temperature=0.1))
+
+    body = rec.json_body()
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
+    assert body["max_tokens"] == 64
+
+    # 逐 chunk 的内容与顺序：reasoning 在前、正文在后、终帧收尾
+    assert [(c.kind, c.text) for c in chunks[:-1]] == [
+        ("reasoning", "先想一"),
+        ("reasoning", "想二"),
+        ("text", "答"),
+        ("text", "案"),
+    ]
+    final = chunks[-1]
+    assert final.final is True
+    assert final.backend == "openai-compat"
+    assert final.model == "gpt-test-1"
+    assert (final.usage.input_tokens, final.usage.output_tokens) == (10, 4)
+    assert final.streamed is True
+    assert final.fallback_from is None
+
+
+async def test_openai_stream_without_usage_frame_reports_unknown():
+    """对端不回 usage 帧时，终帧 usage 是 None（未知），不是 0。"""
+    rec = Recorder(
+        sse_response(openai_sse_delta(content="好", finish="stop", model=None), "[DONE]")
+    )
+    async with make_client(rec) as client:
+        backend = OpenAICompatBackend(
+            model="m", base_url="https://x/v1", api_key=KEY, client=client
+        )
+        chunks = await collect(backend.stream(MSGS))
+
+    assert chunks[-1].final is True
+    assert chunks[-1].usage is None
+    assert chunks[-1].model == "m"  # 帧里没带 model 时回退到配置值
+
+
+async def test_openai_stream_http_error_before_first_chunk_is_classified():
+    rec = Recorder(httpx.Response(429, json={"error": {"message": "slow down"}}))
+    async with make_client(rec) as client:
+        backend = OpenAICompatBackend(
+            model="m", base_url="https://x/v1", api_key=KEY, client=client
+        )
+        with pytest.raises(LLMBackendError) as info:
+            await collect(backend.stream(MSGS))
+
+    assert info.value.kind == "rate_limit"
+
+
+async def test_openai_stream_truncated_output_is_an_error():
+    rec = Recorder(
+        sse_response(openai_sse_delta(content="半截", finish="length"), "[DONE]")
+    )
+    async with make_client(rec) as client:
+        backend = OpenAICompatBackend(
+            model="m", base_url="https://x/v1", api_key=KEY, client=client
+        )
+        with pytest.raises(LLMResponseError) as info:
+            await collect(backend.stream(MSGS))
+
+    assert info.value.kind == "output_truncated"
+
+
+def anthropic_sse(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def test_anthropic_stream_thinking_text_usage_and_no_thinking_param():
+    rec = Recorder(
+        sse_response(
+            anthropic_sse({"type": "message_start", "message": {
+                "model": "claude-test-1", "usage": {"input_tokens": 21}}}),
+            anthropic_sse({"type": "content_block_start", "index": 0,
+                           "content_block": {"type": "thinking", "thinking": ""}}),
+            anthropic_sse({"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "thinking_delta", "thinking": "推一"}}),
+            anthropic_sse({"type": "content_block_stop", "index": 0}),
+            anthropic_sse({"type": "content_block_start", "index": 1,
+                           "content_block": {"type": "text", "text": ""}}),
+            anthropic_sse({"type": "content_block_delta", "index": 1,
+                           "delta": {"type": "text_delta", "text": "正"}}),
+            anthropic_sse({"type": "content_block_delta", "index": 1,
+                           "delta": {"type": "text_delta", "text": "文"}}),
+            anthropic_sse({"type": "message_delta",
+                           "delta": {"stop_reason": "end_turn"},
+                           "usage": {"output_tokens": 9}}),
+            anthropic_sse({"type": "message_stop"}),
+        )
+    )
+    async with make_client(rec) as client:
+        backend = AnthropicBackend(
+            model="claude-test-1", base_url="https://api.anthropic.com", api_key=KEY,
+            client=client,
+        )
+        chunks = await collect(backend.stream(MSGS))
+
+    body = rec.json_body()
+    assert body["stream"] is True
+    # 不主动开启 extended thinking：非思考模型收到 thinking 参数会报错；
+    # 这里只透传服务端自然发出的 thinking。
+    assert "thinking" not in body
+
+    assert [(c.kind, c.text) for c in chunks[:-1]] == [
+        ("reasoning", "推一"),
+        ("text", "正"),
+        ("text", "文"),
+    ]
+    final = chunks[-1]
+    assert final.final is True
+    assert final.backend == "anthropic"
+    assert final.model == "claude-test-1"
+    assert (final.usage.input_tokens, final.usage.output_tokens) == (21, 9)
+
+
+async def test_anthropic_stream_truncated_is_a_failure():
+    rec = Recorder(
+        sse_response(
+            anthropic_sse({"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "text_delta", "text": "半截"}}),
+            anthropic_sse({"type": "message_delta",
+                           "delta": {"stop_reason": "max_tokens"},
+                           "usage": {"output_tokens": 5}}),
+            anthropic_sse({"type": "message_stop"}),
+        )
+    )
+    async with make_client(rec) as client:
+        backend = AnthropicBackend(
+            model="m", base_url="https://api.anthropic.com", api_key=KEY, client=client
+        )
+        with pytest.raises(LLMResponseError) as info:
+            await collect(backend.stream(MSGS))
+
+    assert info.value.kind == "output_truncated"
+
+
+async def test_anthropic_stream_http_error_before_first_chunk_is_classified():
+    rec = Recorder(
+        httpx.Response(401, json={"type": "error", "error": {"type": "authentication_error"}})
+    )
+    async with make_client(rec) as client:
+        backend = AnthropicBackend(
+            model="m", base_url="https://api.anthropic.com", api_key=KEY, client=client
+        )
+        with pytest.raises(LLMAuthError):
+            await collect(backend.stream(MSGS))
+
+
+async def test_harness_cli_stream_is_an_honest_one_shot(tmp_path):
+    """CLI 后端不支持真流式：一次性给全，且终帧如实标 streamed=False。"""
+    payload = json.dumps({"type": "result", "subtype": "success", "result": "完整回答"})
+    binary = write_script(tmp_path, f"cat <<'EOF'\n{payload}\nEOF\n")
+    backend = HarnessCLIBackend(harness="claude", binary=binary)
+
+    chunks = await collect(backend.stream(MSGS))
+
+    assert len(chunks) == 1
+    assert chunks[0].final is True
+    assert chunks[0].text == "完整回答"
+    assert chunks[0].streamed is False
+    assert chunks[0].backend == "harness-cli:claude"
+
+
+class StreamFailBackend:
+    """第一个 chunk 之前就失败的流式假后端（允许降级的形态）。"""
+
+    def __init__(self, name: str, *, error: Exception):
+        self.name = name
+        self._error = error
+        self.started = 0
+
+    async def stream(self, messages, *, max_tokens=None, temperature=None, timeout=None):
+        self.started += 1
+        raise self._error
+        yield  # pragma: no cover - 让本方法成为异步生成器
+
+    async def complete(self, messages, **kwargs):
+        raise self._error
+
+    async def health(self):
+        return True, None
+
+
+class StreamScriptBackend:
+    """按脚本逐 chunk 产出（可指定中途失败）的流式假后端。"""
+
+    def __init__(
+        self, name: str, chunks: list[str], *, fail_after: int | None = None
+    ):
+        self.name = name
+        self._chunks = chunks
+        self._fail_after = fail_after
+        self.started = 0
+
+    async def stream(self, messages, *, max_tokens=None, temperature=None, timeout=None):
+        self.started += 1
+        for index, text in enumerate(self._chunks):
+            yield LLMChunk(kind="text", text=text)
+            if self._fail_after is not None and index + 1 == self._fail_after:
+                raise LLMBackendError("连接中断", backend=self.name, kind="network")
+        yield LLMChunk(kind="text", final=True, model="fake-model", backend=self.name)
+
+    async def complete(self, messages, **kwargs):  # pragma: no cover - 本测试只用 stream
+        raise AssertionError("不该被调用")
+
+    async def health(self):
+        return True, None
+
+
+async def test_router_stream_falls_back_only_before_the_first_chunk():
+    """第一个 chunk 之前失败：换后端，终帧带降级标注。"""
+    primary = StreamFailBackend(
+        "primary", error=LLMTimeoutError("超时", backend="primary")
+    )
+    backup = StreamScriptBackend("backup", ["备", "用"])
+
+    chunks = await collect(LLMRouter([primary, backup]).stream(MSGS))
+
+    assert [(c.kind, c.text) for c in chunks[:-1]] == [("text", "备"), ("text", "用")]
+    final = chunks[-1]
+    assert final.backend == "backup"
+    assert final.fallback_from == "primary"
+    assert final.degraded_reasons == ["primary:timeout"]
+    assert primary.started == 1 and backup.started == 1
+
+
+async def test_router_stream_never_falls_back_after_the_first_chunk():
+    """第一个 chunk 已发出后失败：错误原样抛出，**不**换后端重发。"""
+    primary = StreamScriptBackend("primary", ["已发出的开头"], fail_after=1)
+    backup = StreamScriptBackend("backup", ["备用"])
+
+    with pytest.raises(LLMBackendError, match="连接中断"):
+        await collect(LLMRouter([primary, backup]).stream(MSGS))
+
+    assert backup.started == 0  # 内容已发出，绝不能换后端重来
+
+
+async def test_router_stream_all_backends_failed_carries_attempt_chain():
+    router = LLMRouter([
+        StreamFailBackend("a", error=LLMTimeoutError("超时", backend="a")),
+        StreamFailBackend(
+            "b", error=LLMBackendError("500", backend="b", kind="server_error")
+        ),
+    ])
+    with pytest.raises(LLMAllBackendsFailed) as info:
+        await collect(router.stream(MSGS))
+
+    assert info.value.attempts == ["a:timeout", "b:server_error"]
+
+
+async def test_router_stream_marks_pseudo_streaming_honestly(tmp_path):
+    """harness_cli 兜底路径：路由透传终帧的 streamed=False，不包装成真流式。"""
+    payload = json.dumps({"type": "result", "subtype": "success", "result": "好"})
+    binary = write_script(tmp_path, f"cat <<'EOF'\n{payload}\nEOF\n")
+    router = LLMRouter([HarnessCLIBackend(harness="claude", binary=binary)])
+
+    chunks = await collect(router.stream(MSGS))
+
+    assert chunks[-1].final is True
+    assert chunks[-1].streamed is False
+    assert chunks[-1].text == "好"
 
 
 # ===========================================================================

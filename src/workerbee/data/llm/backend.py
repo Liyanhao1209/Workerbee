@@ -21,7 +21,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Literal, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, AsyncIterator, Iterable, Literal, Mapping, Protocol, Sequence, runtime_checkable
 
 from pydantic import Field
 
@@ -32,6 +32,7 @@ from ..redact import Secret, redact_text
 __all__ = [
     "LLMMessage",
     "LLMResponse",
+    "LLMChunk",
     "LLMBackend",
     "SecretResolver",
     "LLMError",
@@ -94,6 +95,41 @@ class LLMResponse(DomainModel):
 
     def degraded(self) -> bool:
         return self.fallback_from is not None
+
+
+class LLMChunk(DomainModel):
+    """一次流式补全的增量片段（``LLMBackend.stream`` 的产物）。
+
+    协议形状：
+    - 内容 chunk：``final=False``，``kind`` 区分正文增量（``"text"``）与推理过程
+      增量（``"reasoning"``，DeepSeek 的 ``reasoning_content``、Anthropic 的
+      ``thinking_delta`` 都归一到这里）；``text`` 是**增量**，不是累计值。
+    - 终帧：``final=True``，携带本次调用的 ``usage`` / ``model`` / ``backend``。
+      每个后端的流**恰好以一个终帧结束**——调用方据此取用量与实际后端名。
+      真流式后端的终帧 ``text`` 为空；伪流式后端（``streamed=False``）会把
+      全部正文放在这一个终帧上，调用方对 ``text`` 的处理不分帧种。
+    - 降级标注（``fallback_from`` / ``degraded_reasons``）只由 router 在终帧上
+      填写；单个后端自己不知道、也不该假装知道链上的事。
+    - ``streamed=False`` 表示「这个后端不支持流式，内容是一次性给全的」
+      （如 harness CLI 的兜底实现）——调用方据此如实标注，不假装是逐字流式。
+    """
+
+    kind: Literal["text", "reasoning"]
+    text: str = ""
+    final: bool = False
+
+    # ---- 以下字段只在终帧（final=True）上有意义 ----
+
+    usage: Usage | None = None
+    """用量。``None`` 表示不可取得（未知，不是 0，OBS-04）。"""
+
+    model: str | None = None
+    backend: str | None = None
+
+    fallback_from: str | None = None
+    degraded_reasons: list[str] = Field(default_factory=list)
+
+    streamed: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +349,12 @@ class LLMBackend(Protocol):
     """框架自身 LLM 能力的后端。
 
     实现必须满足：
-    - ``complete`` 失败时抛 :class:`LLMError` 的子类（分类如实），不要抛裸异常；
-      消息里不得含凭据。
+    - ``complete`` / ``stream`` 失败时抛 :class:`LLMError` 的子类（分类如实），
+      不要抛裸异常；消息里不得含凭据。
     - ``health`` 不产生副作用、不发补全请求（只做可用性探测）。
+    - ``stream`` 以恰好一个 ``final=True`` 的 :class:`LLMChunk` 终帧结束；
+      第一个 chunk（含终帧）**到达之前**的失败，router 允许换后端重试，
+      之后的失败必须原样抛出（内容已发出，不能换后端重发一遍）。
     """
 
     name: str
@@ -328,6 +367,15 @@ class LLMBackend(Protocol):
         temperature: float | None = None,
         timeout: float | None = None,
     ) -> LLMResponse: ...
+
+    def stream(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: float | None = None,
+    ) -> AsyncIterator[LLMChunk]: ...
 
     async def health(self) -> tuple[bool, str | None]:
         """``(是否可用, 说明)``。
