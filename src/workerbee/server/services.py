@@ -40,7 +40,7 @@ from ..core.domain import (
     now_iso,
 )
 from ..core.domain.task import StageState
-from ..core.domain.template import Template, TemplateKind
+from ..core.domain.template import MissingBinding, Template, TemplateKind
 from ..core.graph.validate import ValidationReport, validate
 from ..data.db import ConflictError
 from ..data.event_log import EventActor, EventScope, EventType
@@ -1072,6 +1072,7 @@ class RegistryService(_Service):
             kind=req.kind,
             secret_locator=locator,
             base_url=req.base_url,
+            default_model=req.default_model,
         )
         await self.store.registry.upsert_credential(cred)
         await self._event(
@@ -1173,7 +1174,8 @@ class RegistryService(_Service):
 
 
 class TemplateService(_Service):
-    """模板（TPL-01/02/03）。凭据被**结构性**剥离：模板载荷装不下密钥本体。"""
+    """模板（TPL-01/02/03）。密钥本体被**结构性**挡在模板外：载荷装不下它；
+    本机凭据的引用（只是 id）默认随模板保留，同机实例化自动绑定。"""
 
     async def list_templates(self, *, kind: TemplateKind | None = None) -> S.TemplateListResponse:
         items = await self.store.registry.list_templates(kind=kind)
@@ -1184,7 +1186,7 @@ class TemplateService(_Service):
             raise BadRequest(
                 "payload 与 from_workflow_id 必须二选一",
                 hint="给 payload 直接落一个模板；给 from_workflow_id 从既有流程生成"
-                "（后者会强制把凭据剥离为占位符）",
+                "（密钥永远不进模板；本机凭据的引用默认保留，可用 keep_credential_refs=False 剥离）",
             )
 
         if req.from_workflow_id:
@@ -1210,6 +1212,7 @@ class TemplateService(_Service):
                 description=req.description,
                 source_workflow_id=req.from_workflow_id,
                 source_revision=rev.revision_seq,
+                keep_credential_refs=req.keep_credential_refs,
             )
         else:
             template = Template(
@@ -1237,10 +1240,34 @@ class TemplateService(_Service):
     async def instantiate(
         self, template_id: str, req: S.TemplateInstantiateRequest
     ) -> S.TemplateInstantiateResponse:
-        """实例化。未绑定的必填槽位**不编造**，如实进入报告要求补齐（TPL-03）。"""
+        """实例化。未绑定的必填槽位**不编造**，如实进入报告要求补齐（TPL-03）。
+
+        模板保留的凭据引用在此刻对本机注册表做一次校验：引用在本机解析不到
+        （模板来自他机、或凭据已撤销/删除）时不能带病进入流程定义——清掉引用
+        并转为 missing binding，让界面要求用户显式重选。
+        """
         template = await self.get_template(template_id)
         nodes, edges, report = template.instantiate(
             dict(req.bindings), node_id_map=dict(req.node_id_map)
+        )
+        missing = list(report.missing_bindings)
+        for node in nodes:
+            for idx, profile in enumerate(node.profiles):
+                if not profile.credential_ref:
+                    continue
+                cred = await self.store.registry.get_credential(profile.credential_ref)
+                if cred is not None and cred.is_usable():
+                    continue
+                missing.append(
+                    MissingBinding(
+                        slot=f"{node.name}.profiles[{idx}].credential_ref",
+                        label=profile.credential_ref,
+                        reason="模板携带的凭据引用在本机不存在或已撤销，请重新绑定本机凭据",
+                    )
+                )
+                profile.credential_ref = None
+        report = InstantiationReport(
+            missing_bindings=missing, usable=not missing, notes=report.notes
         )
         return S.TemplateInstantiateResponse(
             template_id=template_id,

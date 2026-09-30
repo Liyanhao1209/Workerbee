@@ -163,6 +163,10 @@ class CredentialRef(Entity):
     base_url: str | None = None
     """非敏感元数据，可与 ``base_url_pair`` 搭配；不含密钥。"""
 
+    default_model: str | None = None
+    """该凭据对应的默认模型名。节点候选的 ``model_name`` 留空时回退到它，
+    让「url + key + model」可以作为一份完整接入配置整体复用。"""
+
     revoked: bool = False
     """撤销后影响面可见（引用它的 Workflow／节点／在途任务清单），
     且新 Attempt 必须重新绑定有效凭据，不得以钉扎快照绕过（§9.1、D-02）。"""

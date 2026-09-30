@@ -42,6 +42,7 @@ def node(
     compact_threshold: int | None = None,
     reasoning_effort: str | None = None,
     system_prompt: str | None = None,
+    model_name: str = "m1",
 ) -> NodeDefinition:
     profiles: list[ExecutionProfile] = []
     if with_profile:
@@ -52,6 +53,7 @@ def node(
                 credential=credential,
                 compact_threshold=compact_threshold,
                 reasoning_effort=reasoning_effort,
+                model_name=model_name,
             )
         )
     return NodeDefinition(

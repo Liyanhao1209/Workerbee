@@ -2,10 +2,12 @@
 
 模板的硬边界：
 - **不含任何运行时内容**：队列、活跃 session、审批状态、执行结果（``excludes``）。
-- **不携带明文凭据**：序列化时强制剥离为引用占位，实例化时要求重绑定（TPL-03、AC-09）。
+- **不携带明文凭据**：密钥本体永远进不了模板（TPL-03、AC-09）。本机凭据的
+  **引用**（credential_id，只是一个指针）默认保留在模板里，同机实例化时自动
+  重绑定；跨机使用时由服务层校验，引用解析不到再要求手动绑定。
 - 模板编辑不静默改写已创建流程；同步更新需 diff + 显式应用。
 
-本模块把「剥离」实现为**结构性保证**而非约定：模板载荷只接受
+本模块把「不含密钥」实现为**结构性保证**而非约定：模板载荷只接受
 ``TemplateNodeConfig``，它的凭据字段类型天生只能装引用，装不下密钥本体。
 """
 
@@ -41,7 +43,8 @@ class CredentialPlaceholder(DomainModel):
     """模板中的凭据占位。
 
     只记录「原流程此处的凭据叫什么」，不含 locator，更不含密钥。
-    实例化时必须重绑定到接收方本机已登记的凭据（TPL-03）。
+    引用保留在模板里时，实例化优先沿用原引用；引用在本机解析不到
+    （共享给他人的模板）时才要求重绑定到接收方已登记的凭据（TPL-03）。
     """
 
     slot: str
@@ -72,7 +75,8 @@ class TemplateNodeConfig(DomainModel):
 class TemplatePayload(DomainModel):
     """模板载荷：拓扑 + 配置快照。
 
-    ``sensitive_slots`` 是剥离凭据后留下的占位清单，实例化时逐项要求重绑定。
+    ``sensitive_slots`` 记录每个凭据槽位的来源；引用本身默认留在
+    ``profiles[].credential_ref`` 里供同机自动绑定。
     """
 
     nodes: list[TemplateNodeConfig] = Field(default_factory=list)
@@ -115,8 +119,13 @@ class Template(Entity):
         source_workflow_id: str | None = None,
         source_revision: int | None = None,
         description: str | None = None,
+        keep_credential_refs: bool = True,
     ) -> "Template":
-        """从定义层实体构造模板，**强制剥离凭据**。
+        """从定义层实体构造模板。**密钥本体永远进不了模板**（类型上装不下）。
+
+        ``keep_credential_refs=True``（默认）时把本机凭据的引用一并保留：
+        引用只是指向本机凭据库的 id，不含任何密钥材料，同机实例化即可自动
+        绑定，省去逐个重选。跨机分享模板时可传 False 退回全剥离形态。
 
         这是模板的唯一构造入口：绕过它无法产生含凭据的模板。
         """
@@ -133,7 +142,8 @@ class Template(Entity):
                             original_label=profile.credential_ref,
                         )
                     )
-                    profile.credential_ref = None
+                    if not keep_credential_refs:
+                        profile.credential_ref = None
             configs.append(
                 TemplateNodeConfig(
                     name=node.name,
@@ -171,11 +181,13 @@ class Template(Entity):
         """实例化为定义层实体。
 
         ``bindings`` 以 ``slot`` 或 ``原始 label`` 为键，值为本机 credential_id。
-        未绑定的必填槽位不会伪造，而是如实进入报告，要求用户补齐（TPL-03）。
+        显式绑定优先；没有显式绑定但模板保留了原引用时沿用原引用（同机复用）。
+        两者都没有的必填槽位不会伪造，而是如实进入报告，要求用户补齐（TPL-03）。
         """
         bindings = bindings or {}
         node_id_map = node_id_map or {}
         missing: list[MissingBinding] = []
+        carried: list[str] = []
 
         out_nodes: list[NodeDefinition] = []
         for cfg in self.payload.nodes:
@@ -190,12 +202,17 @@ class Template(Entity):
                 bound = bindings.get(slot)
                 if bound is None and placeholder.original_label is not None:
                     bound = bindings.get(placeholder.original_label)
+                if bound is None and profile.credential_ref:
+                    # 模板保留了原引用：同机实例化直接沿用。引用是否在本机
+                    # 可解析由服务层校验（域层不碰注册表）。
+                    carried.append(slot)
+                    continue
                 if bound is None:
                     missing.append(
                         MissingBinding(
                             slot=slot,
                             label=placeholder.original_label,
-                            reason="模板未携带凭据；实例化时必须重新绑定本机凭据",
+                            reason="模板未携带凭据引用；实例化时必须绑定本机凭据",
                         )
                     )
                     continue
@@ -220,7 +237,7 @@ class Template(Entity):
         report = InstantiationReport(
             missing_bindings=missing,
             usable=not missing,
-            notes=_template_notes(self),
+            notes=_template_notes(self, carried),
         )
         return out_nodes, out_edges, report
 
@@ -261,10 +278,13 @@ def _resolve(
     return node_id_map.get(configs[idx].name)
 
 
-def _template_notes(t: Template) -> list[str]:
+def _template_notes(t: Template, carried: list[str] | None = None) -> list[str]:
     notes: list[str] = []
-    if t.kind == TemplateKind.WORKFLOW and t.payload.sensitive_slots:
-        notes.append(f"模板含 {len(t.payload.sensitive_slots)} 处凭据占位，已要求重绑定")
+    if carried:
+        notes.append(f"{len(carried)} 处凭据引用已随模板保留，实例化时自动沿用")
+    unbound = len(t.payload.sensitive_slots) - len(carried or [])
+    if t.kind == TemplateKind.WORKFLOW and unbound > 0:
+        notes.append(f"模板含 {unbound} 处凭据占位，需要绑定本机凭据")
     return notes
 
 

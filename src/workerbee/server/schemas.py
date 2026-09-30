@@ -752,6 +752,8 @@ class CredentialCreateRequest(ApiRequest):
     ``harness_login`` 类型留空——凭据由 harness 自身登录态提供。
     提供 ``secret`` 时可省略，内核会按 credential_id 自动生成。"""
     base_url: str | None = None
+    default_model: str | None = None
+    """该凭据对应的默认模型名；节点候选留空模型时回退到它。"""
     secret: dict[str, str] | None = None
     """密钥本体（如 ``{"api_key": "sk-..."}``，base_url_pair 再加 ``"base_url"``）。
     只在请求体里出现一次，写库后即弃；不落日志、不进事件、不在响应里回显。"""
@@ -791,10 +793,10 @@ class ToolCreateRequest(ApiRequest):
 class TemplateCreateRequest(ApiRequest):
     """两种来源，二选一（都不允许携带明文凭据，TPL-03）：
 
-    - 直接给 ``payload``：已剥离凭据的模板载荷；
-    - 给 ``from_workflow_id``：从该 Workflow 当前修订构造。
-      这是唯一会**强制剥离**凭据为占位符的路径——委托给 ``Template.from_nodes``，
-      它天生装不下密钥本体，凭据只以 ``sensitive_slots`` 占位出现。
+    - 直接给 ``payload``：模板载荷（凭据只能是引用，类型上装不下密钥本体）；
+    - 给 ``from_workflow_id``：从该 Workflow 当前修订构造——委托给
+      ``Template.from_nodes``，密钥结构性进不了模板；本机凭据的**引用**
+      默认随模板保留（``keep_credential_refs``），同机实例化自动绑定。
     """
 
     name: str
@@ -803,6 +805,9 @@ class TemplateCreateRequest(ApiRequest):
     payload: TemplatePayload | None = None
     from_workflow_id: str | None = None
     from_revision_seq: int | None = None
+    keep_credential_refs: bool = True
+    """从流程生成时是否保留本机凭据的引用（只是 id，不含密钥）。
+    同机复用省去逐个重绑；要把模板分享给他机时置 False 全剥离。"""
 
 
 class TemplateListResponse(ApiResponse):

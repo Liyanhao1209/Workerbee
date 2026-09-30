@@ -441,6 +441,15 @@ class Scheduler:
 
         profile = node.profiles[fresh_stage.profile_cursor]
 
+        # 候选留空模型时回退到凭据上登记的默认模型：url/key/model 作为一份
+        # 完整接入配置整体复用。凭据查不到或没登记默认模型就保持原样，
+        # 由适配器用自己 harness 的默认（不在这里编造）。
+        model_name = profile.model_name
+        if not model_name and profile.credential_ref:
+            cred = await self.store.registry.get_credential(profile.credential_ref)
+            if cred is not None and cred.default_model:
+                model_name = cred.default_model
+
         attempt = Attempt(
             stage_id=fresh_stage.stage_id,
             task_id=fresh_task.task_id,
@@ -448,7 +457,7 @@ class Scheduler:
             attempt_seq=fresh_stage.current_attempt_seq + 1,
             profile_id=profile.profile_id,
             profile_snapshot={
-                "model_name": profile.model_name,
+                "model_name": model_name,
                 "harness_ref": profile.harness_ref,
                 "reasoning_effort": profile.reasoning_effort,
                 "compact_threshold": profile.compact_threshold,
@@ -498,7 +507,7 @@ class Scheduler:
                     harness_id=profile.harness_ref or "",
                     attempt=attempt,
                     stage=fresh_stage,
-                    model_name=profile.model_name,
+                    model_name=model_name,
                     reasoning_effort=profile.reasoning_effort,
                     system_prompt=context.system_prompt,
                     # 首轮输入随建会话给出：一次性 `-p` 型 harness 只能这样拿到输入。

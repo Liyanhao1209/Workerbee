@@ -29,7 +29,7 @@ from workerbee.core.domain import (
     WorkflowRevision,
     WorkflowStatus,
 )
-from workerbee.core.domain.registry import CredentialKind
+from workerbee.core.domain.registry import CredentialKind, CredentialRef
 from workerbee.data.event_log import EventScope, EventType
 from workerbee.security.secret_store import SecretRedactor, SecretStore
 from workerbee.server.app import create_app
@@ -1082,6 +1082,7 @@ async def test_credentials_never_appear_in_any_response(
         "kind",
         "secret_locator",
         "base_url",
+        "default_model",
         "revoked",
         "created_at",
         "updated_at",
@@ -1160,6 +1161,125 @@ async def test_template_instantiate_reports_missing_bindings(
     assert body["usable"] is True, "该流程没有凭据槽位，理应可直接实例化"
     assert [n["node_id"] for n in body["nodes"]]
     assert SECRET not in resp.text
+
+
+async def test_template_keeps_credential_ref_for_local_reuse(
+    client: Any, engine: Engine, publish: Any
+) -> None:
+    """模板默认保留本机凭据引用：同机实例化自动绑定，不用逐个重选。"""
+    from tests.helpers import graph as make_graph
+    from tests.helpers import node as make_node
+
+    await engine.store.registry.upsert_credential(_credential("cred-1", label="openai"))
+    spec = make_graph(
+        {"A": []}, nodes={"A": make_node("A", credential="cred-1")}
+    )
+    wf, _ = await publish(spec)
+
+    made = await client.post(
+        "/api/templates",
+        json={"name": "tpl", "kind": "workflow", "from_workflow_id": wf.workflow_id},
+    )
+    assert made.status_code == 200, made.text
+    template_id = made.json()["template_id"]
+    slots = made.json()["payload"]["sensitive_slots"]
+    assert len(slots) == 1, "槽位仍要登记，供跨机时提示重绑"
+
+    resp = await client.post(f"/api/templates/{template_id}/instantiate", json={})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["usable"] is True
+    assert body["report"]["missing_bindings"] == []
+    assert body["nodes"][0]["profiles"][0]["credential_ref"] == "cred-1"
+
+
+async def test_template_carried_ref_unresolvable_requires_rebind(
+    client: Any, engine: Engine, publish: Any
+) -> None:
+    """模板带到他机（引用在本机解析不到）时：清掉引用、如实要求重绑，不带病入库。"""
+    from tests.helpers import graph as make_graph
+    from tests.helpers import node as make_node
+
+    spec = make_graph(
+        {"A": []}, nodes={"A": make_node("A", credential="cred-ghost")}
+    )
+    wf, _ = await publish(spec)
+
+    made = await client.post(
+        "/api/templates",
+        json={"name": "tpl", "kind": "workflow", "from_workflow_id": wf.workflow_id},
+    )
+    assert made.status_code == 200, made.text
+    template_id = made.json()["template_id"]
+
+    resp = await client.post(f"/api/templates/{template_id}/instantiate", json={})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["usable"] is False
+    assert len(body["report"]["missing_bindings"]) == 1
+    assert body["nodes"][0]["profiles"][0]["credential_ref"] is None
+
+    # 显式绑定一个本机凭据后放行
+    await engine.store.registry.upsert_credential(_credential("cred-2", label="kimi"))
+    slot = body["report"]["missing_bindings"][0]["slot"]
+    resp2 = await client.post(
+        f"/api/templates/{template_id}/instantiate",
+        json={"bindings": {slot: "cred-2"}},
+    )
+    body2 = resp2.json()
+    assert body2["usable"] is True
+    assert body2["nodes"][0]["profiles"][0]["credential_ref"] == "cred-2"
+
+
+async def test_template_strip_credentials_opt_out(
+    client: Any, engine: Engine, publish: Any
+) -> None:
+    """keep_credential_refs=False 退回全剥离形态（跨机分享模板时用）。"""
+    from tests.helpers import graph as make_graph
+    from tests.helpers import node as make_node
+
+    await engine.store.registry.upsert_credential(_credential("cred-1", label="openai"))
+    spec = make_graph(
+        {"A": []}, nodes={"A": make_node("A", credential="cred-1")}
+    )
+    wf, _ = await publish(spec)
+
+    made = await client.post(
+        "/api/templates",
+        json={
+            "name": "tpl",
+            "kind": "workflow",
+            "from_workflow_id": wf.workflow_id,
+            "keep_credential_refs": False,
+        },
+    )
+    assert made.status_code == 200, made.text
+    template_id = made.json()["template_id"]
+
+    resp = await client.post(f"/api/templates/{template_id}/instantiate", json={})
+    body = resp.json()
+    assert body["usable"] is False, "引用已剥离，即使本机有同名凭据也必须显式绑定"
+    assert body["nodes"][0]["profiles"][0]["credential_ref"] is None
+
+
+async def test_credential_default_model_roundtrip(client: Any, engine: Engine) -> None:
+    """默认模型随凭据引用整体保存与回读（model_name 留空时派发回退到它）。"""
+    await engine.store.registry.upsert_credential(
+        CredentialRef(
+            credential_id="cred-m",
+            label="gpt",
+            kind=CredentialKind.API_KEY,
+            secret_locator="secret://gpt",
+            base_url="https://api.example.com/v1",
+            default_model="gpt-5",
+        )
+    )
+    got = await engine.store.registry.get_credential("cred-m")
+    assert got is not None and got.default_model == "gpt-5"
+
+    resp = await client.get("/api/credentials/cred-m")
+    assert resp.status_code == 200
+    assert resp.json()["default_model"] == "gpt-5"
 
 
 def _credential(credential_id: str, *, label: str) -> Any:

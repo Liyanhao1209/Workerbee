@@ -365,11 +365,12 @@ class RegistryRepository:
     async def upsert_credential(self, c: CredentialRef) -> None:
         await self.db.execute(
             """INSERT INTO credential_ref(credential_id, label, kind, secret_locator,
-                   base_url, revoked, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?)
+                   base_url, default_model, revoked, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?)
                ON CONFLICT(credential_id) DO UPDATE SET
                    label=excluded.label, kind=excluded.kind,
                    secret_locator=excluded.secret_locator, base_url=excluded.base_url,
+                   default_model=excluded.default_model,
                    revoked=excluded.revoked, updated_at=excluded.updated_at""",
             (
                 c.credential_id,
@@ -377,6 +378,7 @@ class RegistryRepository:
                 c.kind.value,
                 c.secret_locator,
                 c.base_url,
+                c.default_model,
                 1 if c.revoked else 0,
                 c.created_at.isoformat(),
                 c.updated_at.isoformat(),
@@ -574,6 +576,7 @@ class RegistryRepository:
             kind=CredentialKind(row["kind"]),
             secret_locator=row["secret_locator"],
             base_url=row["base_url"],
+            default_model=row["default_model"],
             revoked=bool(row["revoked"]),
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),

@@ -609,6 +609,43 @@ class TestCompletionCriteria:
         assert "完成了" in text
         assert "先想一下方案" not in text, "思考链不应混进交付产物"
 
+    async def test_credential_default_model_fills_empty_model_name(
+        self, store, sm, harness, scheduler, make_workflow, tick
+    ):
+        """候选留空模型时回退到凭据上登记的默认模型（接入配置整体复用）。"""
+        from workerbee.core.domain.registry import CredentialKind, CredentialRef
+
+        await _setup_harness(store)
+        await store.registry.upsert_credential(
+            CredentialRef(
+                credential_id="cred-1",
+                label="gpt",
+                kind=CredentialKind.API_KEY,
+                secret_locator="secret://gpt",
+                default_model="gpt-5",
+            )
+        )
+        g = graph({"A": []}, nodes={"A": node("A", credential="cred-1", model_name="")})
+        wf, _ = await make_workflow(g)
+        await launch_task(store=store, workflow_id=wf.workflow_id)
+
+        await tick(scheduler)
+
+        assert harness.created, "阶段应已派发"
+        assert harness.created[0]["model_name"] == "gpt-5"
+        await _finish_running(scheduler)
+        await tick(scheduler)
+
+        # 候选显式指定模型时，凭据默认值不得覆盖
+        g2 = graph(
+            {"A": []},
+            nodes={"A": node("A", credential="cred-1", model_name="claude-opus")},
+        )
+        wf2, _ = await make_workflow(g2)
+        await launch_task(store=store, workflow_id=wf2.workflow_id)
+        await tick(scheduler)
+        assert harness.created[-1]["model_name"] == "claude-opus"
+
 
 # ===========================================================================
 # 发射校验与幂等

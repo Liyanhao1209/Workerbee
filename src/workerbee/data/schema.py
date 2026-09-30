@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -410,6 +410,15 @@ ALTER TABLE approval ADD COLUMN action_fingerprint TEXT;
 -- 只能显示「未知节点」（DATA-02 的可辨认性在重启后失效）。
 ALTER TABLE artifact ADD COLUMN producer_node_id TEXT;
 ALTER TABLE artifact ADD COLUMN producer_attempt_id TEXT;
+""",
+    ),
+    (
+        6,
+        """
+-- 凭据引用携带默认模型：url/api_key/model 作为一份可复用的接入配置整体保存，
+-- 节点候选的 model_name 留空时回退到它。只存模型名（非敏感），密钥本体仍只在
+-- Secret Store。
+ALTER TABLE credential_ref ADD COLUMN default_model TEXT;
 """,
     ),
 ]
