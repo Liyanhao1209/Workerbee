@@ -67,6 +67,12 @@ class EventType(StrEnum):
     ATTEMPT_COMPACT = "attempt.compact"
     ATTEMPT_USAGE = "attempt.usage"
     ATTEMPT_DISCARDED_LATE = "attempt.discarded_late"
+    ATTEMPT_INPUT = "attempt.input"
+    """一次尝试实际发给 harness 的输入（有界截断，已过脱敏）。"""
+    ATTEMPT_REASONING = "attempt.reasoning"
+    """思考链片段（harness 上报的 thinking 块），与交付文本分开记录。"""
+    ATTEMPT_TOOL_USE = "attempt.tool_use"
+    ATTEMPT_TOOL_RESULT = "attempt.tool_result"
 
     # 交接与上下文
     CONTEXT_ASSEMBLED = "context.assembled"

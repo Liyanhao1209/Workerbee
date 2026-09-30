@@ -314,6 +314,49 @@ class EventPage(ApiResponse):
     note: str | None = None
 
 
+class ToolCallView(ApiResponse):
+    """一次工具调用的展示视图。``is_error`` 为 None 表示结果还没回来（仍在执行）。"""
+
+    tool_use_id: str | None = None
+    name: str | None = None
+    target: str | None = None
+    input_preview: str = ""
+    input_truncated: bool = False
+    is_error: bool | None = None
+    result_preview: str | None = None
+    result_truncated: bool = False
+
+
+class AttemptWorkResponse(ApiResponse):
+    """一次执行尝试的工作细节（OBS-03）：实际输入、推理过程、工具调用、涉及的文件。
+
+    全部来自事件日志的如实记录；没有任何一项时对应字段为空而不是编造。
+    """
+
+    task_id: str
+    attempt_id: str
+    stage_id: str | None = None
+    node_id: str | None = None
+    input: dict[str, Any] | None = None
+    reasoning: str | None = None
+    reasoning_truncated: bool = False
+    tool_calls: list[ToolCallView] = Field(default_factory=list)
+    files_written: list[str] = Field(default_factory=list)
+    files_read: list[str] = Field(default_factory=list)
+    commands: list[str] = Field(default_factory=list)
+    artifact_ids: list[str] = Field(default_factory=list)
+
+
+class ArtifactContentResponse(ApiResponse):
+    """产物正文。有界截断；内容过凭据脱敏后才离开内核。"""
+
+    artifact_id: str
+    text: str
+    truncated: bool = False
+    size_bytes: int | None = None
+    media_type: str | None = None
+
+
 class SchedulerStats(ApiResponse):
     enabled: bool = False
     """调度循环是否已装配。未装配时任务不会自动推进——界面必须如实显示。"""

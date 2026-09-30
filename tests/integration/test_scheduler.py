@@ -550,6 +550,65 @@ class TestCompletionCriteria:
         arts = await store.artifacts.list_by_task(task_id)
         assert arts and arts[0].covered_fields == []
 
+    async def test_work_detail_events_are_recorded(
+        self, store, sm, harness, scheduler, make_workflow, tick
+    ):
+        """工具调用、推理与实际输入都进事件日志，供任务详情回看（OBS-03）。
+
+        思考链是 harness 的内部过程，不是交付物：它进事件日志，不进产物正文。
+        """
+        await _setup_harness(store)
+        g = graph({"A": []})
+        wf, _ = await make_workflow(g)
+        task_id = (await launch_task(store=store, workflow_id=wf.workflow_id)).task.task_id
+
+        await tick(scheduler)
+        rt = _only_runtime(scheduler)
+        await scheduler.on_event(
+            session_ref=rt.session_ref,
+            kind="output",
+            payload={"text": "先想一下方案", "block": "thinking"},
+        )
+        await scheduler.on_event(
+            session_ref=rt.session_ref,
+            kind="tool_use",
+            payload={
+                "tool_name": "Edit",
+                "tool_use_id": "tu-1",
+                "input": {"file_path": "/tmp/a.py", "old_string": "x", "new_string": "y"},
+            },
+        )
+        await scheduler.on_event(
+            session_ref=rt.session_ref,
+            kind="tool_result",
+            payload={"tool_use_id": "tu-1", "content": "done", "is_error": False},
+        )
+        await scheduler.on_event(
+            session_ref=rt.session_ref, kind="output", payload={"text": "完成了"}
+        )
+        await scheduler.on_session_ended(session_ref=rt.session_ref, ok=True)
+        await tick(scheduler)
+
+        events = await store.events.for_task(task_id)
+        by_type: dict[str, list] = {}
+        for e in events:
+            by_type.setdefault(e["type"], []).append(e)
+        assert "attempt.input" in by_type, "实际发给 harness 的输入必须留档"
+        assert by_type["attempt.input"][0]["payload"]["user_input"]
+        reasoning = by_type.get("attempt.reasoning")
+        assert reasoning and reasoning[0]["payload"]["text"] == "先想一下方案"
+        use = by_type["attempt.tool_use"][0]["payload"]
+        assert use["tool_name"] == "Edit"
+        assert use["target"] == "/tmp/a.py"
+        result = by_type["attempt.tool_result"][0]["payload"]
+        assert result["is_error"] is False
+
+        arts = await store.artifacts.list_by_task(task_id)
+        assert arts and arts[0].producer and arts[0].producer.node_id == "A"
+        text = await store.artifacts.read_text(arts[0].artifact_id)
+        assert "完成了" in text
+        assert "先想一下方案" not in text, "思考链不应混进交付产物"
+
 
 # ===========================================================================
 # 发射校验与幂等

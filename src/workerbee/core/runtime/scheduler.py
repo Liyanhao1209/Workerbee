@@ -47,6 +47,30 @@ from .ports import AssembledContext
 
 __all__ = ["SchedulerConfig", "Scheduler", "TickReport", "AttemptRuntime"]
 
+#: 工具入参里承载「作用对象」的常见键名（claude / kimi 的工具集都覆盖到）。
+_TOOL_PATH_KEYS = ("file_path", "path", "notebook_path", "pattern")
+
+
+def _tool_target(tool_input: dict[str, Any]) -> str | None:
+    """从工具入参里挑出用户最关心的作用对象：文件路径、匹配模式或命令行。"""
+    for key in _TOOL_PATH_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            return value
+    command = tool_input.get("command")
+    if isinstance(command, str) and command:
+        return command.splitlines()[0][:200]
+    return None
+
+
+def dumps_compact(value: Any) -> str:
+    import json
+
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)
+
 
 class SchedulerConfig(DomainModel):
     """调度参数。取值刻意保守：单机部署下宁可慢一点也不要打满本机资源。"""
@@ -59,6 +83,19 @@ class SchedulerConfig(DomainModel):
     session_grace_seconds: float = 5.0
     default_max_output_chars: int = 200_000
     """单次尝试保留的输出上限。超出时截断并在事件里如实标注。"""
+
+    worklog_max_chars: int = 100_000
+    """一次尝试的工作记录（推理、工具调用、输入）写进事件日志的总字符上限。
+    超出后停止记录并写一条溢出说明——事件日志是高频表，不能无界增长。"""
+
+    input_record_chars: int = 20_000
+    """ATTEMPT_INPUT 里 system_prompt / user_input 各自的上限。"""
+
+    tool_preview_chars: int = 2_000
+    """工具调用参数在事件里的上限（Write 类工具的 input 可能是整份文件）。"""
+
+    tool_result_chars: int = 4_000
+    """工具结果在事件里的上限。"""
 
 
 class TickReport(DomainModel):
@@ -91,6 +128,12 @@ class AttemptRuntime:
     output: list[str] = field(default_factory=list)
     output_chars: int = 0
     truncated: bool = False
+    thinking: list[str] = field(default_factory=list)
+    """思考链片段。与交付文本分开：交接给下游的是 output，thinking 只用于回看。"""
+    thinking_chars: int = 0
+    worklog_chars: int = 0
+    """已写入事件日志的工作记录字符数，用于执行 worklog_max_chars 上限。"""
+    worklog_overflow: bool = False
     background: set[str] = field(default_factory=set)
     compact_events: list[CompactEvent] = field(default_factory=list)
     usage: Usage | None = None
@@ -632,6 +675,24 @@ class Scheduler:
                 payload=context.log_summary,
             )
 
+        # 实际发给 harness 的输入留个有界的副本，供任务详情页回看。
+        # 这段文本在组装时已过凭据脱敏，事件写入时还会再过一次。
+        limit = self.config.input_record_chars
+        await self.store.events.append(
+            scope=EventScope.ATTEMPT,
+            type=EventType.ATTEMPT_INPUT,
+            actor=EventActor.SYSTEM,
+            scope_id=attempt.attempt_id,
+            task_id=fresh_task.task_id,
+            stage_id=fresh_stage.stage_id,
+            payload={
+                "system_prompt": (context.system_prompt or "")[:limit],
+                "system_prompt_truncated": len(context.system_prompt or "") > limit,
+                "user_input": (context.user_input or "")[:limit],
+                "user_input_truncated": len(context.user_input or "") > limit,
+            },
+        )
+
         await self._notify_state(fresh_task.task_id, fresh_stage.stage_id)
         return True
 
@@ -726,8 +787,19 @@ class Scheduler:
             return
         if kind == "output":
             text = payload.get("text") or ""
-            rt.output.append(text)
-            rt.output_chars += len(text)
+            if payload.get("block") == "thinking":
+                # 思考链不是交付物：不进 rt.output（它会成为产物正文），
+                # 单独留存供任务详情页回看。
+                rt.thinking.append(text)
+                rt.thinking_chars += len(text)
+                await self._record_work_event(rt, EventType.ATTEMPT_REASONING, text)
+            else:
+                rt.output.append(text)
+                rt.output_chars += len(text)
+        elif kind == "tool_use":
+            await self._record_tool_use(rt, payload)
+        elif kind == "tool_result":
+            await self._record_tool_result(rt, payload)
         elif kind == "background_task_started":
             rt.background.add(str(payload.get("id", "unknown")))
         elif kind == "background_task_ended":
@@ -749,6 +821,96 @@ class Scheduler:
         elif kind == "error":
             rt.error_detail = str(payload.get("message", "未知错误"))
             rt.error_kind = payload.get("kind")
+
+    async def _record_work_event(self, rt: AttemptRuntime, type_: EventType, text: str) -> None:
+        """把一段工作记录（推理）写进事件日志，执行单次与总量上限。
+
+        上限触顶后停止记录——宁可少记也不让事件表无界增长；溢出本身写一条事件，
+        否则界面会把「没记全」看成「只有这些」。
+        """
+        if rt.worklog_overflow:
+            return
+        budget = self.config.worklog_max_chars - rt.worklog_chars
+        truncated = len(text) > budget
+        if budget <= 0:
+            truncated = True
+            text = ""
+        await self.store.events.append(
+            scope=EventScope.ATTEMPT,
+            type=type_,
+            actor=EventActor.ADAPTER,
+            scope_id=rt.attempt_id,
+            task_id=rt.task_id,
+            stage_id=rt.stage_id,
+            payload={"text": text[:budget], "truncated": truncated},
+        )
+        rt.worklog_chars += min(len(text), max(budget, 0))
+        if truncated:
+            rt.worklog_overflow = True
+            await self.store.events.append(
+                scope=EventScope.ATTEMPT,
+                type=type_,
+                actor=EventActor.SYSTEM,
+                scope_id=rt.attempt_id,
+                task_id=rt.task_id,
+                stage_id=rt.stage_id,
+                payload={
+                    "text": "",
+                    "truncated": True,
+                    "note": f"工作记录超过 {self.config.worklog_max_chars} 字，之后的内容未记录",
+                },
+            )
+
+    async def _record_tool_use(self, rt: AttemptRuntime, payload: dict[str, Any]) -> None:
+        if rt.worklog_overflow:
+            return
+        raw_input = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+        preview = dumps_compact(raw_input)
+        truncated = False
+        if len(preview) > self.config.tool_preview_chars:
+            preview = preview[: self.config.tool_preview_chars]
+            truncated = True
+        await self.store.events.append(
+            scope=EventScope.ATTEMPT,
+            type=EventType.ATTEMPT_TOOL_USE,
+            actor=EventActor.ADAPTER,
+            scope_id=rt.attempt_id,
+            task_id=rt.task_id,
+            stage_id=rt.stage_id,
+            payload={
+                "tool_name": payload.get("tool_name"),
+                "tool_use_id": payload.get("tool_use_id"),
+                "target": _tool_target(raw_input),
+                "input_preview": preview,
+                "truncated": truncated,
+            },
+        )
+        rt.worklog_chars += len(preview)
+
+    async def _record_tool_result(self, rt: AttemptRuntime, payload: dict[str, Any]) -> None:
+        if rt.worklog_overflow:
+            return
+        content = payload.get("content")
+        text = content if isinstance(content, str) else dumps_compact(content)
+        truncated = False
+        if len(text) > self.config.tool_result_chars:
+            text = text[: self.config.tool_result_chars]
+            truncated = True
+        await self.store.events.append(
+            scope=EventScope.ATTEMPT,
+            type=EventType.ATTEMPT_TOOL_RESULT,
+            actor=EventActor.ADAPTER,
+            scope_id=rt.attempt_id,
+            task_id=rt.task_id,
+            stage_id=rt.stage_id,
+            payload={
+                "tool_use_id": payload.get("tool_use_id"),
+                "is_error": bool(payload.get("is_error", False)),
+                "content": text,
+                "truncated": truncated,
+            },
+        )
+        rt.worklog_chars += len(text)
 
     async def _maybe_complete(self, rt: AttemptRuntime) -> bool:
         """三合一完成判据（RUN-06）。三者缺一，不发出完成事件。"""

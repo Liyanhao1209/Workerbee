@@ -798,11 +798,129 @@ class TaskService(_Service):
             after_id=after_id, limit=limit, task_id=task_id
         )
 
+    async def attempt_work(self, task_id: str, attempt_id: str) -> S.AttemptWorkResponse:
+        """一次执行尝试的工作细节：输入、推理、工具调用、涉及的文件（OBS-03）。"""
+        await self._require_task(task_id)
+        attempt = await self.engine.store.tasks.get_attempt(attempt_id)
+        if attempt is None or attempt.task_id != task_id:
+            raise NotFound(f"执行尝试不存在: {attempt_id}")
+        rows = await self.engine.store.events.by_scope(
+            EventScope.ATTEMPT, attempt_id, limit=2000
+        )
+        stage_artifacts = await self.engine.store.artifacts.list_by_stage(attempt.stage_id)
+        artifact_ids = [
+            a.artifact_id
+            for a in stage_artifacts
+            if a.producer is not None and a.producer.attempt_id == attempt_id
+        ]
+        return _assemble_attempt_work(task_id, attempt, rows, artifact_ids)
+
+    async def artifact_content(self, task_id: str, artifact_id: str) -> S.ArtifactContentResponse:
+        await self._require_task(task_id)
+        try:
+            result = await self.engine.artifact_content(task_id, artifact_id)
+        except KeyError as exc:
+            raise NotFound(f"产物不存在或已被清理: {artifact_id}") from exc
+        return S.ArtifactContentResponse.model_validate(result)
+
+
+#: 按工具名推断「这个调用对文件做了什么」。只是展示层归类，不影响任何状态。
+_WRITE_TOOL_HINTS = ("write", "edit", "create", "notebook", "delete", "remove")
+_READ_TOOL_HINTS = ("read", "view", "glob", "grep", "ls")
+_COMMAND_TOOL_HINTS = ("bash", "shell", "cmd", "run")
+
+
+def _assemble_attempt_work(
+    task_id: str,
+    attempt: Any,
+    rows: list[dict[str, Any]],
+    artifact_ids: list[str],
+) -> S.AttemptWorkResponse:
+    """把一次尝试的事件流水组装成「它干了什么」的视图。
+
+    只呈现事件里真实记录的内容：没有推理记录就是 None，工具结果没回来
+    （尝试还在跑或被中断）就是 is_error=None。
+    """
+    input_payload: dict[str, Any] | None = None
+    reasoning_parts: list[str] = []
+    reasoning_truncated = False
+    calls: list[dict[str, Any]] = []
+    by_use_id: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        type_ = row["type"]
+        payload = row["payload"]
+        if type_ == EventType.ATTEMPT_INPUT.value:
+            input_payload = payload
+        elif type_ == EventType.ATTEMPT_REASONING.value:
+            reasoning_parts.append(str(payload.get("text") or ""))
+            reasoning_truncated = reasoning_truncated or bool(payload.get("truncated"))
+        elif type_ == EventType.ATTEMPT_TOOL_USE.value:
+            call = {
+                "tool_use_id": payload.get("tool_use_id"),
+                "name": payload.get("tool_name"),
+                "target": payload.get("target"),
+                "input_preview": payload.get("input_preview") or "",
+                "input_truncated": bool(payload.get("truncated")),
+                "is_error": None,
+                "result_preview": None,
+                "result_truncated": False,
+            }
+            calls.append(call)
+            if call["tool_use_id"]:
+                by_use_id[call["tool_use_id"]] = call
+        elif type_ == EventType.ATTEMPT_TOOL_RESULT.value:
+            call = by_use_id.get(payload.get("tool_use_id") or "")
+            if call is None:
+                call = {
+                    "tool_use_id": payload.get("tool_use_id"),
+                    "name": None,
+                    "target": None,
+                    "input_preview": "",
+                    "input_truncated": False,
+                    "is_error": None,
+                    "result_preview": None,
+                    "result_truncated": False,
+                }
+                calls.append(call)
+            call["is_error"] = bool(payload.get("is_error"))
+            call["result_preview"] = payload.get("content") or ""
+            call["result_truncated"] = bool(payload.get("truncated"))
+
+    files_written: list[str] = []
+    files_read: list[str] = []
+    commands: list[str] = []
+    for call in calls:
+        name = (call["name"] or "").lower()
+        target = call["target"]
+        if not target:
+            continue
+        if any(h in name for h in _COMMAND_TOOL_HINTS):
+            commands.append(target)
+        elif any(h in name for h in _WRITE_TOOL_HINTS):
+            files_written.append(target)
+        elif any(h in name for h in _READ_TOOL_HINTS):
+            files_read.append(target)
+
+    return S.AttemptWorkResponse(
+        task_id=task_id,
+        attempt_id=attempt.attempt_id,
+        stage_id=attempt.stage_id,
+        node_id=attempt.node_id,
+        input=input_payload,
+        reasoning="".join(reasoning_parts) or None,
+        reasoning_truncated=reasoning_truncated,
+        tool_calls=[S.ToolCallView.model_validate(c) for c in calls],
+        files_written=list(dict.fromkeys(files_written)),
+        files_read=list(dict.fromkeys(files_read)),
+        commands=list(dict.fromkeys(commands)),
+        artifact_ids=artifact_ids,
+    )
+
 
 # ===========================================================================
 # 注册表
 # ===========================================================================
-
 #: 明显像凭据的环境变量名。与 ``ToolLaunch`` 的构造期防线同一条规则（AUTH-02）：
 #: 顺手粘一个 key 进配置应当在**写入时**失败，而不是等它进了日志、模板和事件历史。
 _SUSPICIOUS_ENV = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")

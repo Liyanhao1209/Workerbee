@@ -118,16 +118,19 @@ class ArtifactStore:
     async def _insert(self, art: Artifact) -> None:
         await self.db.execute(
             """INSERT INTO artifact(artifact_id, digest, producer_task_id, producer_stage_id,
-                   producer_attempt_seq, kind, summary, summary_ok, covered_fields,
+                   producer_attempt_seq, producer_node_id, producer_attempt_id,
+                   kind, summary, summary_ok, covered_fields,
                    token_estimate, sensitivity, lineage, ref_count, tombstoned, size_bytes,
                    storage_path, media_type, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 art.artifact_id,
                 art.digest,
                 art.producer.task_id if art.producer else None,
                 art.producer.stage_id if art.producer else None,
                 art.producer.attempt_seq if art.producer else None,
+                art.producer.node_id if art.producer else None,
+                art.producer.attempt_id if art.producer else None,
                 art.kind.value,
                 art.summary,
                 1 if art.summary_ok else 0,
@@ -335,7 +338,8 @@ class ArtifactStore:
                 task_id=row["producer_task_id"],
                 stage_id=row["producer_stage_id"],
                 attempt_seq=row["producer_attempt_seq"] or 0,
-                attempt_id=None,
+                node_id=row["producer_node_id"],
+                attempt_id=row["producer_attempt_id"],
             )
         return Artifact(
             artifact_id=row["artifact_id"],

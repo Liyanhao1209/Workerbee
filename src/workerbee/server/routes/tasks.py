@@ -109,3 +109,25 @@ async def task_events(
     limit: Annotated[int, Query(ge=1, le=2000)] = 200,
 ) -> S.EventPage:
     return await services.tasks.events(task_id, after_id=after_id, limit=limit)
+
+
+@router.get(
+    "/api/tasks/{task_id}/attempts/{attempt_id}/work",
+    response_model=S.AttemptWorkResponse,
+    summary="单次执行尝试的工作细节：输入、推理、工具调用、涉及的文件",
+)
+async def attempt_work(
+    services: ServicesDep, task_id: str, attempt_id: str
+) -> S.AttemptWorkResponse:
+    return await services.tasks.attempt_work(task_id, attempt_id)
+
+
+@router.get(
+    "/api/tasks/{task_id}/artifacts/{artifact_id}/content",
+    response_model=S.ArtifactContentResponse,
+    summary="产物正文（有界、已脱敏）",
+)
+async def artifact_content(
+    services: ServicesDep, task_id: str, artifact_id: str
+) -> S.ArtifactContentResponse:
+    return await services.tasks.artifact_content(task_id, artifact_id)

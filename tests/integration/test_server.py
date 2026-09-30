@@ -361,6 +361,93 @@ async def test_submit_idempotency_key_returns_same_task(
     assert len((await client.get("/api/tasks")).json()["tasks"]) == 1
 
 
+async def test_attempt_work_and_artifact_content_endpoints(
+    client: Any, engine: Engine, publish: Any
+) -> None:
+    """任务详情要能回看单次尝试的输入/推理/工具调用/涉及文件，以及产物正文。"""
+    from workerbee.core.domain.artifact import ArtifactProducer
+    from workerbee.core.domain.task import Attempt
+
+    wf, _ = await publish()
+    task_id = (
+        await client.post(f"/api/workflows/{wf.workflow_id}/tasks", json={})
+    ).json()["task_id"]
+    stage = (await engine.store.tasks.list_stages(task_id))[0]
+    attempt = await engine.store.tasks.create_attempt(
+        Attempt(
+            stage_id=stage.stage_id,
+            task_id=task_id,
+            node_id=stage.node_id,
+            attempt_seq=1,
+            profile_id="p1",
+        )
+    )
+
+    base = dict(scope=EventScope.ATTEMPT, scope_id=attempt.attempt_id,
+                task_id=task_id, stage_id=stage.stage_id)
+    await engine.store.events.append(
+        type=EventType.ATTEMPT_INPUT,
+        payload={
+            "system_prompt": "你是编码者",
+            "system_prompt_truncated": False,
+            "user_input": "修改 a.py",
+            "user_input_truncated": False,
+        },
+        **base,
+    )
+    await engine.store.events.append(
+        type=EventType.ATTEMPT_REASONING,
+        payload={"text": "想清楚了", "truncated": False},
+        **base,
+    )
+    await engine.store.events.append(
+        type=EventType.ATTEMPT_TOOL_USE,
+        payload={
+            "tool_name": "Edit",
+            "tool_use_id": "tu-1",
+            "target": "/tmp/a.py",
+            "input_preview": '{"file_path":"/tmp/a.py"}',
+            "truncated": False,
+        },
+        **base,
+    )
+    await engine.store.events.append(
+        type=EventType.ATTEMPT_TOOL_RESULT,
+        payload={"tool_use_id": "tu-1", "is_error": False, "content": "done", "truncated": False},
+        **base,
+    )
+    art = await engine.store.artifacts.put(
+        "产物正文",
+        producer=ArtifactProducer(
+            task_id=task_id,
+            stage_id=stage.stage_id,
+            attempt_seq=1,
+            node_id=stage.node_id,
+            attempt_id=attempt.attempt_id,
+        ),
+    )
+
+    work = await client.get(f"/api/tasks/{task_id}/attempts/{attempt.attempt_id}/work")
+    assert work.status_code == 200
+    body = work.json()
+    assert body["node_id"] == stage.node_id
+    assert body["input"]["user_input"] == "修改 a.py"
+    assert body["reasoning"] == "想清楚了"
+    assert body["tool_calls"][0]["name"] == "Edit"
+    assert body["tool_calls"][0]["is_error"] is False
+    assert body["files_written"] == ["/tmp/a.py"]
+    assert body["artifact_ids"] == [art.artifact_id]
+
+    content = await client.get(f"/api/tasks/{task_id}/artifacts/{art.artifact_id}/content")
+    assert content.status_code == 200
+    assert content.json()["text"] == "产物正文"
+
+    missing = await client.get(f"/api/tasks/{task_id}/attempts/nope/work")
+    assert missing.status_code == 404
+    gone = await client.get(f"/api/tasks/{task_id}/artifacts/nope/content")
+    assert gone.status_code == 404
+
+
 # ===========================================================================
 # 生命周期三态（LIFE-06）
 # ===========================================================================

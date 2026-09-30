@@ -1276,6 +1276,25 @@ class Engine:
             "approvals": [a.model_dump(mode="json") for a in approvals],
         }
 
+    async def artifact_content(self, task_id: str, artifact_id: str) -> dict[str, Any]:
+        """读取产物正文（有界、过脱敏）。越任务归属、已清理或内容缺失都按不存在处理。"""
+        art = await self.store.artifacts.get(artifact_id)
+        if art is None or art.producer is None or art.producer.task_id != task_id:
+            raise KeyError(artifact_id)
+        if art.tombstoned:
+            raise KeyError(artifact_id)
+        text = await self.store.artifacts.read_text(artifact_id)
+        if self._redactor is not None:
+            text = self._redactor.redact_text(text)
+        cap = 100_000
+        return {
+            "artifact_id": artifact_id,
+            "text": text[:cap],
+            "truncated": len(text) > cap,
+            "size_bytes": art.size_bytes,
+            "media_type": art.media_type,
+        }
+
     async def node_queue(self, node_id: str) -> dict[str, Any]:
         """节点队列投影（RUN-04）：权威队列在 Task/TaskStage 表，这里是只读视图。"""
         pending = await self.store.tasks.list_stages_by_node(

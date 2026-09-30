@@ -60,6 +60,20 @@ async def test_derive_inherits_kind_and_sensitivity(artifacts):
     assert child.sensitivity == "sensitive"
 
 
+async def test_producer_node_and_attempt_survive_persistence(artifacts):
+    """DATA-02：产出者的 node_id / attempt_id 落库后回读不丢（界面「产出者」靠它）。"""
+    art = await artifacts.put(
+        "x",
+        producer=ArtifactProducer(
+            task_id="t1", stage_id="s1", attempt_seq=2, node_id="node-A", attempt_id="att-1"
+        ),
+    )
+    back = await artifacts.get(art.artifact_id)
+    assert back is not None and back.producer is not None
+    assert back.producer.node_id == "node-A"
+    assert back.producer.attempt_id == "att-1"
+
+
 async def test_sensitivity_propagates_to_max_along_lineage(artifacts):
     """§9.4：敏感级沿血缘取最高级。"""
     public_parent = await artifacts.put("p", producer=_producer(1), sensitivity="public")

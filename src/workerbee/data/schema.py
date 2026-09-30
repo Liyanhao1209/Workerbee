@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -401,6 +401,15 @@ ALTER TABLE artifact ADD COLUMN summary_ok INTEGER NOT NULL DEFAULT 1;
 --                         比较结果恒为「没变」）。
 ALTER TABLE approval ADD COLUMN tool_name TEXT;
 ALTER TABLE approval ADD COLUMN action_fingerprint TEXT;
+""",
+    ),
+    (
+        5,
+        """
+-- 产出者的 node_id / attempt_id 此前只在内存里，落库时被丢掉，回读后界面
+-- 只能显示「未知节点」（DATA-02 的可辨认性在重启后失效）。
+ALTER TABLE artifact ADD COLUMN producer_node_id TEXT;
+ALTER TABLE artifact ADD COLUMN producer_attempt_id TEXT;
 """,
     ),
 ]
