@@ -480,7 +480,10 @@ class Scheduler:
         )
 
         try:
-            context = await self._build_context(fresh_task, fresh_stage, attempt, node)
+            refs = await self._resolve_node_refs(node)
+            context = await self._build_context(
+                fresh_task, fresh_stage, attempt, node, refs=refs
+            )
         except Exception as exc:  # noqa: BLE001
             await self._fail_stage(
                 fresh_task,
@@ -490,6 +493,13 @@ class Scheduler:
                 error_kind="context",
             )
             return True
+
+        # 引用解析出的 Skill / 工具随 extra 带给适配器：kimi 据此落成会话级
+        # skills 目录，claude 据此渲染 --mcp-config。节点没配引用时保持 None，
+        # 不改变既有行为。ToolLaunch.credential_ref 不在此解析——机密库在
+        # server 层且要口令，调度器够不到；工具的 env 已由领域校验器保证
+        # 不含明文凭据。
+        extra = _session_extra(refs[0], refs[1])
 
         await self.store.tasks.create_attempt(attempt)
         await self.store.tasks.update_stage(
@@ -519,6 +529,7 @@ class Scheduler:
                     # 不传的话候选上的选择会被静默忽略——用户以为换了身份，实际没有。
                     credential_ref=profile.credential_ref,
                     cwd=self.node_cwd,
+                    extra=extra,
                 ),
                 timeout=self.config.dispatch_timeout,
             )
@@ -705,15 +716,66 @@ class Scheduler:
         await self._notify_state(fresh_task.task_id, fresh_stage.stage_id)
         return True
 
+    async def _resolve_node_refs(self, node: Any) -> tuple[list[Any], list[Any], list[str]]:
+        """把节点的 skill_refs / tool_refs 解析成注册表实体。
+
+        返回 ``(skills, tools, notes)``。存储只保留每项的最新版本，version
+        钉扎拿不到旧版本——照常注入最新版；钉扎版本与最新版不一致时在
+        notes 里如实标注。找不到或已停用的引用跳过并记 notes：降级必须
+        可见，不允许「配了没生效」却毫无痕迹。
+        """
+        skills: list[Any] = []
+        tools: list[Any] = []
+        notes: list[str] = []
+        for ref in getattr(node, "skill_refs", []) or []:
+            skill = await self.store.registry.get_skill(ref.ref_id)
+            if skill is None:
+                notes.append(f"引用的 Skill {ref.ref_id} 不存在，未注入")
+                continue
+            if not skill.enabled:
+                notes.append(f"引用的 Skill {skill.name} 已停用，未注入")
+                continue
+            if ref.version is not None and ref.version != skill.version:
+                notes.append(
+                    f"Skill {skill.name} 钉扎在 v{ref.version}，但存储只保留最新版，"
+                    f"实际注入 v{skill.version}"
+                )
+            skills.append(skill)
+        for ref in getattr(node, "tool_refs", []) or []:
+            tool = await self.store.registry.get_tool(ref.ref_id)
+            if tool is None:
+                notes.append(f"引用的工具 {ref.ref_id} 不存在，未注入")
+                continue
+            if not tool.enabled:
+                notes.append(f"引用的工具 {tool.name} 已停用，未注入")
+                continue
+            if ref.version is not None and ref.version != tool.version:
+                notes.append(
+                    f"工具 {tool.name} 钉扎在 v{ref.version}，但存储只保留最新版，"
+                    f"实际注入 v{tool.version}"
+                )
+            tools.append(tool)
+        return skills, tools, notes
+
     async def _build_context(
-        self, task: Task, stage: TaskStage, attempt: Attempt, node: Any
+        self,
+        task: Task,
+        stage: TaskStage,
+        attempt: Attempt,
+        node: Any,
+        *,
+        refs: tuple[list[Any], list[Any], list[str]],
     ) -> AssembledContext:
+        skills, tools, notes = refs
         if self.context_builder is None:
-            # 没有组装器时的最小可用上下文：仍然遵守 §7.3 的「留空仍能执行」
+            # 没有组装器时的最小可用上下文：仍然遵守 §7.3 的「留空仍能执行」。
+            # 引用到的 Skill 正文与工具说明追加在节点 system_prompt 之后，
+            # 保持「引用多少都能生效」的语义一致。
             return AssembledContext(
-                system_prompt=node.system_prompt or "",
+                system_prompt=_fallback_system_prompt(node, skills, tools),
                 user_input=_fallback_input(task, node),
                 partitions={"P1": {"mode": "fallback"}},
+                degraded=list(notes),
             )
 
         contracts = [
@@ -727,14 +789,19 @@ class Scheduler:
                 if art is not None and not art.tombstoned:
                     artifacts.append(art)
 
-        return await self.context_builder.build(
+        context = await self.context_builder.build(
             task=task,
             stage=stage,
             attempt=attempt,
             node=node,
             contracts=contracts,
             artifacts=artifacts,
+            skills=skills,
+            tools=tools,
         )
+        if notes:
+            context.degraded = [*notes, *context.degraded]
+        return context
 
     # ------------------------------------------------------------------
     # 完成路径（由适配器事件驱动）
@@ -1438,6 +1505,52 @@ def _usage_from_payload(payload: dict[str, Any]) -> Usage:
         cost_basis=basis,
         notes=pick("notes"),
     )
+
+
+def _fallback_system_prompt(node: Any, skills: Sequence[Any], tools: Sequence[Any]) -> str:
+    """无组装器时的 system_prompt：节点原文 + 引用到的 Skill 正文与工具说明。"""
+    parts = [node.system_prompt or ""]
+    if skills:
+        blocks = [f"## {s.name}（v{s.version}）\n{s.content or '（无正文）'}" for s in skills]
+        parts.append("【Skills（执行指导）】\n\n" + "\n\n".join(blocks))
+    if tools:
+        lines = ["【工具（MCP）】"]
+        for t in tools:
+            lines.append(f"- {t.name}：{t.description or '（无说明）'}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(p for p in parts if p)
+
+
+def _session_extra(
+    skills: Sequence[Any], tools: Sequence[Any]
+) -> dict[str, Any] | None:
+    """构造 create_session 的 extra。节点没配引用时返回 None，保持现状行为。
+
+    - ``skills``：所有 harness 都传；kimi 适配器据此落成会话级 skills 目录。
+    - ``mcp_tools``：仅当节点引用了工具时传；claude 适配器据此渲染
+      ``--mcp-config``。ToolLaunch.credential_ref 不在此解析（见 dispatch 注释）。
+    """
+    if not skills and not tools:
+        return None
+    extra: dict[str, Any] = {}
+    if skills:
+        extra["skills"] = [
+            {"name": s.name, "content": s.content, "version": s.version} for s in skills
+        ]
+    if tools:
+        extra["mcp_tools"] = [
+            {
+                "name": t.name,
+                "transport": t.launch.transport.value,
+                "command": t.launch.command,
+                "args": list(t.launch.args),
+                "env": dict(t.launch.env),
+                "cwd": t.launch.cwd,
+                "url": t.launch.url,
+            }
+            for t in tools
+        ]
+    return extra
 
 
 def _fallback_input(task: Task, node: Any) -> str:

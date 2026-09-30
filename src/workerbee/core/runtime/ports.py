@@ -234,7 +234,12 @@ class ContextBuilderPort(Protocol):
         node: Any,
         contracts: Sequence[Any],
         artifacts: Sequence[Any],
+        skills: Sequence[Any] = (),
+        tools: Sequence[Any] = (),
     ) -> AssembledContext: ...
+    """``skills`` / ``tools`` 是节点的 ``skill_refs`` / ``tool_refs`` 在注册表中
+    解析出的实体（SkillDoc / ToolSpec），由调度器在派发时解析并传入；
+    组装器把它们渲染进 P4 分区。"""
 
 
 class SummarizerPort(Protocol):

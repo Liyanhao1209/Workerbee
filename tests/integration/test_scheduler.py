@@ -781,3 +781,111 @@ async def _finish_node(scheduler: Scheduler, store, node_id: str, *, ok: bool = 
             await scheduler.on_session_ended(session_ref=rt.session_ref, ok=ok)
             return
     raise AssertionError(f"节点 {node_id} 没有在途尝试")
+
+
+# ===========================================================================
+# 节点 Skill / MCP 工具引用的派发接线（EXT-01/02）
+# ===========================================================================
+
+
+class TestNodeRefsDispatch:
+    """引用必须真的到达 harness：system_prompt（经组装器 P4）与 extra 两条通道。
+
+    这是历史上「配了不生效、全程不报错」那根线的集成测试——
+    单测只证明各段各自对，这里证明它们被接在了一起。
+    """
+
+    async def _scheduler_with_real_assembler(self, store, sm, harness, ledger):
+        from workerbee.core.runtime.scheduler import SchedulerConfig
+        from workerbee.data.context_assembler import ContextAssembler
+
+        return Scheduler(
+            store=store, sm=sm, harness=harness, ledger=ledger,
+            context_builder=ContextAssembler(),
+            config=SchedulerConfig(poll_interval=60.0, max_dispatch_per_tick=4),
+        )
+
+    async def test_refs_reach_harness_via_prompt_and_extra(
+        self, store, sm, harness, ledger, make_workflow, tick
+    ):
+        from workerbee.core.domain import SkillDoc, ToolLaunch, ToolSpec, VersionedRef
+
+        await _setup_harness(store)
+        await store.registry.upsert_skill(
+            SkillDoc(skill_id="sk1", name="代码审查", content="先跑测试再下结论", version=2)
+        )
+        await store.registry.upsert_tool(
+            ToolSpec(
+                tool_id="tl1", name="pgsql", description="查询只读库",
+                launch=ToolLaunch(command="mcp-pgsql", args=["--ro"], env={"PGHOST": "db"}),
+            )
+        )
+        n = node("A")
+        n.skill_refs = [VersionedRef(ref_id="sk1")]
+        n.tool_refs = [VersionedRef(ref_id="tl1")]
+        wf, _ = await make_workflow(graph({"A": []}, nodes={"A": n}))
+        scheduler = await self._scheduler_with_real_assembler(store, sm, harness, ledger)
+
+        task_id = (await launch_task(store=store, workflow_id=wf.workflow_id)).task.task_id
+        await tick(scheduler)
+
+        assert len(harness.created) == 1
+        created = harness.created[0]
+        # 通道一：Skill 正文与工具说明经组装器 P4 进入 system_prompt
+        assert "代码审查" in created["system_prompt"]
+        assert "先跑测试再下结论" in created["system_prompt"]
+        assert "pgsql" in created["system_prompt"]
+        # 通道二：extra 携带结构化引用，供适配器落 skills 目录 / 渲染 --mcp-config
+        extra = created["extra"]
+        assert extra is not None
+        assert extra["skills"] == [{"name": "代码审查", "content": "先跑测试再下结论", "version": 2}]
+        assert extra["mcp_tools"] == [
+            {
+                "name": "pgsql", "transport": "stdio", "command": "mcp-pgsql",
+                "args": ["--ro"], "env": {"PGHOST": "db"}, "cwd": None, "url": None,
+            }
+        ]
+        task = await store.tasks.get_task(task_id)
+        assert task is not None and task.observed_state == TaskState.RUNNING
+
+    async def test_missing_ref_degrades_visibly_and_still_dispatches(
+        self, store, sm, harness, ledger, make_workflow, tick
+    ):
+        from workerbee.core.domain import SkillDoc, VersionedRef
+
+        await _setup_harness(store)
+        await store.registry.upsert_skill(
+            SkillDoc(skill_id="sk1", name="代码审查", content="正文", version=1)
+        )
+        # 发射校验不允许引用不存在的项：先注册 ghost 通过校验，再删掉它，
+        # 模拟「发射后注册表项被删除」的运行时场景。
+        await store.registry.upsert_skill(SkillDoc(skill_id="ghost", name="ghost", content="x"))
+        n = node("A")
+        n.skill_refs = [VersionedRef(ref_id="sk1"), VersionedRef(ref_id="ghost")]
+        wf, _ = await make_workflow(graph({"A": []}, nodes={"A": n}))
+        scheduler = await self._scheduler_with_real_assembler(store, sm, harness, ledger)
+
+        task_id = (await launch_task(store=store, workflow_id=wf.workflow_id)).task.task_id
+        await store.registry.delete_skill("ghost")
+        await tick(scheduler)
+
+        # 缺失的引用不阻断派发：有效引用照常注入，缺失进入 degraded
+        assert len(harness.created) == 1
+        extra = harness.created[0]["extra"]
+        assert [s["name"] for s in extra["skills"]] == ["代码审查"]
+
+        events = await store.events.for_task(task_id)
+        started = [e for e in events if e["type"] == "attempt.started"]
+        assert started, "attempt_started 事件应存在"
+        degraded = started[0]["payload"]["context_degraded"]
+        assert any("ghost" in d and "不存在" in d for d in degraded)
+
+    async def test_no_refs_keeps_extra_none(
+        self, store, sm, harness, scheduler, make_workflow, tick
+    ):
+        """节点没配引用：extra 为 None，既有行为不变。"""
+        await _setup_harness(store)
+        wf, _ = await make_workflow(graph({"A": []}))
+        await launch_task(store=store, workflow_id=wf.workflow_id)
+        await tick(scheduler)
+        assert harness.created[0]["extra"] is None

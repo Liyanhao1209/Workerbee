@@ -77,6 +77,7 @@ class FakeHarness:
                 "initial_input": initial_input,
                 "permission_mode": permission_mode,
                 "credential_ref": credential_ref,
+                "extra": extra,
                 "stage_id": stage.stage_id,
                 "node_id": stage.node_id,
             }
@@ -191,7 +192,8 @@ class FakeContextBuilder:
         self.user_input = user_input
         self.degraded = degraded or []
 
-    async def build(self, *, task, stage, attempt, node, contracts, artifacts) -> AssembledContext:
+    async def build(self, *, task, stage, attempt, node, contracts, artifacts,
+                    skills=(), tools=()) -> AssembledContext:
         self.calls.append(
             {
                 "task_id": task.task_id,
@@ -200,6 +202,8 @@ class FakeContextBuilder:
                 "contracts": list(contracts),
                 "artifact_ids": [a.artifact_id for a in artifacts],
                 "node_name": getattr(node, "name", None),
+                "skills": list(skills),
+                "tools": list(tools),
             }
         )
         return AssembledContext(
