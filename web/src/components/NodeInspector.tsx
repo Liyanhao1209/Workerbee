@@ -249,6 +249,8 @@ function ProfileEditor({
   const patch = (changes: Partial<ExecutionProfile>): void => onChange({ ...profile, ...changes });
 
   const harness = harnesses.find((h) => h.harness_id === profile.harness_ref);
+  const selectedCredential = credentials.find((c) => c.credential_id === profile.credential_ref);
+  const effectiveModel = profile.model_name || selectedCredential?.default_model || null;
   const capabilities = harness?.capabilities_snapshot ?? null;
   const supportsCompact = capabilities ? capabilities['compact'] === true : null;
   const efforts = capList(capabilities, 'reasoning_efforts');
@@ -335,6 +337,20 @@ function ProfileEditor({
             </select>
             <CredentialQuickCreate onCreated={onCredentialsChanged} />
           </Field>
+
+          <div className="text-sm">
+            实际使用模型：
+            {profile.model_name ? (
+              <span className="mono">{profile.model_name}</span>
+            ) : effectiveModel ? (
+              <>
+                <span className="mono">{effectiveModel}</span>
+                <span className="dim">（凭据默认值）</span>
+              </>
+            ) : (
+              <span className="dim">harness 登录态的默认模型</span>
+            )}
+          </div>
 
           {!harness ? (
             <Field label="Reasoning effort" hint="选择 harness 后，这里会列出它支持的取值。">
