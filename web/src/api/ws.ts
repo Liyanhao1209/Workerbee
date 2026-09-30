@@ -156,7 +156,13 @@ export class KernelSocket {
 
       // notification：唯一会变成界面推送的帧。其余帧（pong / error）忽略。
       const kind = asString(parsed['kind']);
-      if (kind !== 'state_changed' && kind !== 'attention' && kind !== 'assistant_message') return;
+      if (
+        kind !== 'state_changed' &&
+        kind !== 'attention' &&
+        kind !== 'assistant_message' &&
+        kind !== 'assistant_chunk'
+      )
+        return;
       this.handlers.onPush({
         kind,
         task_id: typeof parsed['task_id'] === 'string' ? parsed['task_id'] : null,

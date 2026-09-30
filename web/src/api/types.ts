@@ -1012,6 +1012,8 @@ export interface AssistantMessage {
   tokens_out: number | null;
   /** true = 这条回复发生过降级（备用后端、快照裁剪、指引缺失等）。 */
   degraded: boolean;
+  /** 助手的推理过程（思维链）；null = 这次回答没有推理内容。 */
+  reasoning: string | null;
   created_at: string;
 }
 
@@ -1061,7 +1063,7 @@ export interface AssistantConfigUpdate {
 // ===========================================================================
 
 export interface WsPush {
-  kind: 'state_changed' | 'attention' | 'assistant_message';
+  kind: 'state_changed' | 'attention' | 'assistant_message' | 'assistant_chunk';
   task_id: string | null;
   stage_id: string | null;
   payload: Record<string, unknown>;

@@ -2,8 +2,9 @@
  * 基础助手（AI-01）聊天面板的状态。
  *
  * 与本项目其他 store 同一条纪律：**推送只是提醒，事实始终从 REST 拉。**
- * `assistant_message` 推送到达时重新拉线程与当前消息；重连成功后连配置
- * 一起对账——断连期间的问答不会丢，只是推送没送到。
+ * 唯一的例外是 `assistant_chunk`：它是逐字增量，REST 里没有对应物，
+ * 只累积到「正在生成」的临时气泡；最终 `assistant_message` 推送到达时
+ * 仍以重拉消息列表对账。重连成功后连配置一起对账——断连期间的问答不会丢。
  */
 
 import { create } from 'zustand';
@@ -23,6 +24,15 @@ export interface AssistantFailure {
   hint: string | null;
 }
 
+/** 正在生成中的助手回复：chunk 推送逐条累积，text 与 reasoning 分开。 */
+export interface AssistantStreaming {
+  /** 关联 id = 后端预生成的回复 message_id；assistant_message 对账时用它确认。 */
+  messageId: string;
+  threadId: string;
+  text: string;
+  reasoning: string;
+}
+
 function asFailure(err: unknown, fallback: string): AssistantFailure {
   if (err instanceof ApiError) return { detail: err.detail, hint: err.hint };
   return { detail: fallback, hint: null };
@@ -38,6 +48,8 @@ interface AssistantStore {
   messagesLoaded: boolean;
 
   sending: boolean;
+  /** 正在生成中的回复（流式累积）。null = 没有正在生成的回复。 */
+  streaming: AssistantStreaming | null;
   /** 最近一次发送/整理的失败。错误体里的 hint 是后端给的引导文案，原样展示。 */
   sendError: AssistantFailure | null;
   /** 最近一次发送因窗口限制未带上的更早消息条数（截断不产生额外调用）。 */
@@ -56,6 +68,7 @@ interface AssistantStore {
   refreshThreads: () => Promise<void>;
   selectThread: (threadId: string) => Promise<void>;
   newThread: () => Promise<void>;
+  renameThread: (title: string) => Promise<boolean>;
   reloadMessages: () => Promise<void>;
   send: (content: string) => Promise<boolean>;
   compact: () => Promise<AssistantCompactResult | null>;
@@ -74,6 +87,7 @@ export const useAssistant = create<AssistantStore>((set, get) => ({
   messagesLoaded: false,
 
   sending: false,
+  streaming: null,
   sendError: null,
   lastDropped: 0,
   degradedReasons: {},
@@ -108,6 +122,7 @@ export const useAssistant = create<AssistantStore>((set, get) => ({
       messagesLoaded: false,
       sendError: null,
       lastDropped: 0,
+      streaming: null, // 生成中的增量属于旧线程，切走即丢弃（那边完成后靠重拉对账）
     });
     await get().reloadMessages();
   },
@@ -115,12 +130,26 @@ export const useAssistant = create<AssistantStore>((set, get) => ({
   newThread: async () => {
     try {
       const thread = await assistantApi.createThread();
-      set({ sendError: null, lastDropped: 0 });
+      set({ sendError: null, lastDropped: 0, streaming: null });
       await get().refreshThreads();
       // refreshThreads 会把新线程顶到最前并选中；此处兜底确保选中它。
       await get().selectThread(thread.thread_id);
     } catch (err) {
       set({ sendError: asFailure(err, '新建对话失败。') });
+    }
+  },
+
+  renameThread: async (title) => {
+    const threadId = get().activeThreadId;
+    if (!threadId) return false;
+    try {
+      await assistantApi.renameThread(threadId, title);
+      set({ sendError: null });
+      await get().refreshThreads();
+      return true;
+    } catch (err) {
+      set({ sendError: asFailure(err, '重命名对话失败。') });
+      return false;
     }
   },
 
@@ -158,12 +187,12 @@ export const useAssistant = create<AssistantStore>((set, get) => ({
       if (result.degraded && result.degraded_reasons.length > 0) {
         reasons[result.message.message_id] = result.degraded_reasons;
       }
-      set({ sending: false, lastDropped: result.dropped, degradedReasons: reasons });
+      set({ sending: false, streaming: null, lastDropped: result.dropped, degradedReasons: reasons });
       // 回复已在响应里，但线程排序与消息列表仍以服务端为准重拉一次。
       await get().refreshThreads();
       return true;
     } catch (err) {
-      set({ sending: false, sendError: asFailure(err, '发送失败。') });
+      set({ sending: false, streaming: null, sendError: asFailure(err, '发送失败。') });
       return false;
     }
   },
@@ -205,12 +234,40 @@ export const useAssistant = create<AssistantStore>((set, get) => ({
 
 let wired = false;
 
-/** 订阅推送：新回复到达时重拉当前线程；重连成功后连配置一起对账。 */
+/** 订阅推送：chunk 逐条累积到「正在生成」气泡；最终 assistant_message 到达时
+ * 重拉对账；重连成功后连配置一起对账。 */
 export function wireAssistant(): void {
   if (wired) return;
   wired = true;
   onKernelPush((push) => {
-    if (push.kind === 'assistant_message') void useAssistant.getState().refreshThreads();
+    const state = useAssistant.getState();
+    if (push.kind === 'assistant_chunk') {
+      // 只收「当前线程且正在生成」的增量：其它线程的 chunk 丢弃，
+      // 那边的回复完成后由 assistant_message 触发重拉，不会丢内容。
+      const threadId = typeof push.payload['thread_id'] === 'string' ? push.payload['thread_id'] : null;
+      const messageId = typeof push.payload['message_id'] === 'string' ? push.payload['message_id'] : null;
+      const kind = push.payload['kind'];
+      const text = typeof push.payload['text'] === 'string' ? push.payload['text'] : '';
+      if (!state.sending || !threadId || threadId !== state.activeThreadId || !messageId || !text)
+        return;
+      const prev = state.streaming && state.streaming.messageId === messageId ? state.streaming : null;
+      const next: AssistantStreaming = {
+        messageId,
+        threadId,
+        text: (prev?.text ?? '') + (kind === 'text' ? text : ''),
+        reasoning: (prev?.reasoning ?? '') + (kind === 'reasoning' ? text : ''),
+      };
+      useAssistant.setState({ streaming: next });
+      return;
+    }
+    if (push.kind === 'assistant_message') {
+      // 对账通知：若它确认的就是正在累积的那条，清掉临时气泡，以 REST 重拉为准。
+      const messageId = typeof push.payload['message_id'] === 'string' ? push.payload['message_id'] : null;
+      if (state.streaming && state.streaming.messageId === messageId) {
+        useAssistant.setState({ streaming: null });
+      }
+      void state.refreshThreads();
+    }
   });
   // 断连期间的问答不会有推送补给我们（推送是尽力而为的），重连后必须重拉一次。
   onKernelReconnect(() => {

@@ -432,6 +432,13 @@ export const assistant = {
       body: title ? { title } : {},
     }),
 
+  /** 重命名对话。 */
+  renameThread: (threadId: string, title: string) =>
+    request<AssistantThread>(`/api/assistant/threads/${encodeURIComponent(threadId)}`, {
+      method: 'PATCH',
+      body: { title },
+    }),
+
   messages: (threadId: string) =>
     request<{ messages: AssistantMessage[]; returned: number }>(
       `/api/assistant/threads/${encodeURIComponent(threadId)}/messages`,
