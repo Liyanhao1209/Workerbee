@@ -56,12 +56,12 @@
     'PingFang SC', 'Microsoft YaHei', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace;
 
-  --fs-xs: 12px;
-  --fs-sm: 13px;
-  --fs-md: 14px;
-  --fs-lg: 17px;
-  --fs-xl: 20px;
-  --fs-2xl: 24px;
+  --fs-xs: 14px;
+  --fs-sm: 15px;
+  --fs-md: 17px;
+  --fs-lg: 20px;
+  --fs-xl: 24px;
+  --fs-2xl: 30px;
 
   --sp-1: 4px;
   --sp-2: 8px;
@@ -73,9 +73,9 @@
   --radius: 3px;
   --radius-lg: 5px;
 
-  --h-row: 26px;
-  --h-control: 28px;
-  --h-topbar: 46px;
+  --h-row: 32px;
+  --h-control: 34px;
+  --h-topbar: 54px;
 
   --shadow-pop: 0 8px 28px rgba(0, 0, 0, 0.55);
   --shadow-panel: 0 2px 10px rgba(0, 0, 0, 0.4);
