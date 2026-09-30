@@ -13,7 +13,6 @@ import { useCallback, useEffect, useMemo } from 'react';
 import {
   Background,
   BackgroundVariant,
-  Controls,
   Handle,
   MarkerType,
   MiniMap,
@@ -370,11 +369,10 @@ function CanvasInner({
       style={{ background: 'var(--bg-0)' }}
     >
       <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#1f2630" />
-      <Controls showInteractive={false} />
       <MiniMap
         pannable
         zoomable
-        style={{ background: 'var(--bg-1)', border: '1px solid var(--line)' }}
+        style={{ background: 'var(--bg-1)', border: '1px solid var(--line)', width: 132, height: 88 }}
         maskColor="rgba(6,8,12,0.7)"
         nodeColor={(n) => {
           const data = n.data as WfNodeData | undefined;
