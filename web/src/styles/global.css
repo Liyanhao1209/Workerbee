@@ -442,9 +442,13 @@ kbd,
   min-width: 0;
 }
 .field__label {
-  font-size: var(--fs-xs);
-  color: var(--fg-2);
+  font-size: var(--fs-sm);
+  color: var(--fg-1);
   letter-spacing: 0.02em;
+}
+.field__req {
+  color: var(--st-danger);
+  margin-left: 2px;
 }
 .field__hint {
   font-size: var(--fs-xs);
@@ -944,10 +948,10 @@ kbd,
 }
 
 .section-title {
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
   font-weight: 600;
   letter-spacing: 0.06em;
-  color: var(--fg-2);
+  color: var(--fg-1);
   text-transform: uppercase;
   margin-bottom: var(--sp-2);
 }
