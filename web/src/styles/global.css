@@ -884,6 +884,126 @@ kbd,
   resize: none;
 }
 
+/* 面板左缘的拖拽手柄：调宽度（min 340 / max 720，宽度存 localStorage）。 */
+.sidepanel__resize {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 7px;
+  cursor: col-resize;
+  z-index: 1;
+}
+.sidepanel__resize:hover {
+  background: var(--accent-dim);
+}
+
+/* 助手消息的推理过程（思维链）：默认折叠。 */
+.chat-reasoning {
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  padding: var(--sp-1) var(--sp-2);
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--fg-2);
+}
+.chat-reasoning summary {
+  cursor: pointer;
+  color: var(--fg-3);
+  user-select: none;
+}
+.chat-reasoning__body {
+  margin-top: var(--sp-1);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 助手消息的 markdown 排版：气泡的 pre-wrap 只服务纯文本，富文本回到正常流。 */
+.chat-md {
+  white-space: normal;
+}
+.chat-md > :first-child {
+  margin-top: 0;
+}
+.chat-md > :last-child {
+  margin-bottom: 0;
+}
+.chat-md p,
+.chat-md ul,
+.chat-md ol,
+.chat-md pre,
+.chat-md blockquote,
+.chat-md table {
+  margin: var(--sp-2) 0;
+}
+.chat-md h1,
+.chat-md h2,
+.chat-md h3,
+.chat-md h4 {
+  margin: var(--sp-3) 0 var(--sp-1);
+  line-height: 1.35;
+  color: var(--fg-0);
+}
+.chat-md h1 { font-size: var(--fs-lg); }
+.chat-md h2 { font-size: var(--fs-md); }
+.chat-md h3,
+.chat-md h4 { font-size: var(--fs-sm); }
+.chat-md ul,
+.chat-md ol {
+  padding-left: var(--sp-5);
+}
+.chat-md li + li {
+  margin-top: var(--sp-1);
+}
+.chat-md code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--bg-0);
+  border: 1px solid var(--line-faint);
+  border-radius: var(--radius);
+  padding: 0 var(--sp-1);
+}
+/* 代码块复用 .code-block 的样式口径（同一个 token 组合）。 */
+.chat-md pre {
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--sp-2);
+  max-height: 340px;
+  overflow: auto;
+}
+.chat-md pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: var(--fs-sm);
+}
+.chat-md blockquote {
+  border-left: 3px solid var(--line-strong);
+  padding-left: var(--sp-3);
+  color: var(--fg-2);
+}
+.chat-md table {
+  border-collapse: collapse;
+  font-size: var(--fs-xs);
+}
+.chat-md th,
+.chat-md td {
+  border: 1px solid var(--line);
+  padding: var(--sp-1) var(--sp-2);
+}
+.chat-md th {
+  background: var(--bg-3);
+}
+.chat-md a {
+  color: var(--accent);
+}
+.chat-md hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: var(--sp-3) 0;
+}
+
 /* 助手入口：右下角圆形悬浮按钮。z-index 低于 .sidepanel（40）——
    面板打开时按钮本身不渲染，不存在叠放冲突。 */
 .assistant-fab {

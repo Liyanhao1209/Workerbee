@@ -5,14 +5,30 @@
  * 它只输出文字与操作路径，不替用户改任何配置、不碰凭据、不提交任务。
  *
  * 布局不复用 sidepanel__body：消息区与输入区要分开——前者滚动，后者固定。
+ * 面板左缘有拖拽手柄可调宽度（localStorage 记住，重开保持）。
+ * 助手消息以 markdown 渲染（marked + dompurify 消毒），推理过程折叠展示。
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { registry } from '../api/endpoints';
 import type { AssistantConfigUpdate, AssistantMessage, CredentialRef } from '../api/types';
+import { renderMarkdown } from '../lib/markdown';
 import { useAssistant, type AssistantFailure } from '../store/assistant';
 import { Banner, Empty, Field, Loading, Modal } from './common';
+
+/** 面板宽度的本地记忆键（workerbee 前缀）与拖拽上下限。 */
+const WIDTH_KEY = 'workerbee.assistant.width';
+const PANEL_MIN_WIDTH = 340;
+const PANEL_MAX_WIDTH = 720;
+const PANEL_DEFAULT_WIDTH = 460;
+
+function readStoredWidth(): number {
+  const raw = window.localStorage.getItem(WIDTH_KEY);
+  const parsed = raw === null ? NaN : Number(raw);
+  if (!Number.isFinite(parsed)) return PANEL_DEFAULT_WIDTH;
+  return Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, parsed));
+}
 
 export function AssistantPanel({ onClose }: { onClose: () => void }): JSX.Element {
   const state = useAssistant();
@@ -20,9 +36,13 @@ export function AssistantPanel({ onClose }: { onClose: () => void }): JSX.Elemen
   const [confirmCompact, setConfirmCompact] = useState(false);
   const [compactNote, setCompactNote] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
+  const [renaming, setRenaming] = useState(false);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [width, setWidth] = useState(readStoredWidth);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottom = useRef(true);
+  const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
   // 面板打开时与内核重新对账一次；平时靠 wireAssistant 的推送与重连兜底。
   useEffect(() => {
@@ -34,10 +54,37 @@ export function AssistantPanel({ onClose }: { onClose: () => void }): JSX.Elemen
   useEffect(() => {
     const el = scrollRef.current;
     if (el && pinnedToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [state.messages, state.sending]);
+  }, [state.messages, state.sending, state.streaming]);
+
+  /** 左缘拖拽：跟随 mousemove 调宽，松手时写进 localStorage。拖拽期间禁止文本选择。 */
+  const onResizeStart = (e: React.MouseEvent<HTMLDivElement>): void => {
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startWidth: width };
+    document.body.style.userSelect = 'none';
+    const onMove = (ev: MouseEvent): void => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      // 手柄在面板左缘：向左拖变宽，向右拖变窄。
+      const next = drag.startWidth + (drag.startX - ev.clientX);
+      setWidth(Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, next)));
+    };
+    const onUp = (): void => {
+      dragRef.current = null;
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      setWidth((current) => {
+        window.localStorage.setItem(WIDTH_KEY, String(current));
+        return current;
+      });
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
 
   const config = state.config;
   const configured = config !== null && config.enabled && config.credential_ref !== null;
+  const activeThread = state.threads.find((t) => t.thread_id === state.activeThreadId) ?? null;
 
   const send = async (): Promise<void> => {
     const text = draft.trim();
@@ -45,6 +92,13 @@ export function AssistantPanel({ onClose }: { onClose: () => void }): JSX.Elemen
     pinnedToBottom.current = true;
     const ok = await state.send(text);
     if (ok) setDraft('');
+  };
+
+  const saveRename = async (): Promise<void> => {
+    const title = renameDraft.trim();
+    if (!title) return;
+    const ok = await state.renameThread(title);
+    if (ok) setRenaming(false);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -67,23 +121,73 @@ export function AssistantPanel({ onClose }: { onClose: () => void }): JSX.Elemen
   };
 
   return (
-    <div className="sidepanel">
+    <div className="sidepanel" style={{ width }}>
+      <div
+        className="sidepanel__resize"
+        title="拖拽调整面板宽度"
+        onMouseDown={onResizeStart}
+      />
       <div className="sidepanel__head">
         <strong>助手</strong>
-        {state.threads.length > 0 ? (
-          <select
-            className="select input--sm"
-            style={{ maxWidth: 140 }}
-            value={state.activeThreadId ?? ''}
-            onChange={(e) => void state.selectThread(e.target.value)}
-            title="切换对话"
-          >
-            {state.threads.map((t) => (
-              <option key={t.thread_id} value={t.thread_id}>
-                {t.title || `对话 ${t.thread_id.slice(0, 8)}`}
-              </option>
-            ))}
-          </select>
+        {renaming && activeThread ? (
+          <>
+            <input
+              className="input input--sm"
+              style={{ maxWidth: 180 }}
+              value={renameDraft}
+              autoFocus
+              maxLength={100}
+              placeholder="对话名"
+              onChange={(e) => setRenameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void saveRename();
+                if (e.key === 'Escape') setRenaming(false);
+              }}
+            />
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              disabled={!renameDraft.trim()}
+              onClick={() => void saveRename()}
+            >
+              保存
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              onClick={() => setRenaming(false)}
+            >
+              取消
+            </button>
+          </>
+        ) : state.threads.length > 0 ? (
+          <>
+            <select
+              className="select input--sm"
+              style={{ maxWidth: 140 }}
+              value={state.activeThreadId ?? ''}
+              onChange={(e) => void state.selectThread(e.target.value)}
+              title="切换对话"
+            >
+              {state.threads.map((t) => (
+                <option key={t.thread_id} value={t.thread_id}>
+                  {t.title || `对话 ${t.thread_id.slice(0, 8)}`}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              disabled={!state.activeThreadId}
+              title="给当前对话起个名字"
+              onClick={() => {
+                setRenameDraft(activeThread?.title ?? '');
+                setRenaming(true);
+              }}
+            >
+              改名
+            </button>
+          </>
         ) : null}
         <button
           type="button"
@@ -177,7 +281,24 @@ export function AssistantPanel({ onClose }: { onClose: () => void }): JSX.Elemen
             {state.messages.map((m) => (
               <ChatMessage key={m.message_id} message={m} reasons={state.degradedReasons[m.message_id]} />
             ))}
-            {state.sending ? <div className="chat-meta">正在生成…</div> : null}
+            {state.streaming ? (
+              <div className="chat-row">
+                <div style={{ maxWidth: '88%' }}>
+                  <div className="chat-bubble chat-bubble--assistant">
+                    {state.streaming.reasoning ? (
+                      <ReasoningBlock text={state.streaming.reasoning} />
+                    ) : null}
+                    {state.streaming.text ? (
+                      <MarkdownContent text={state.streaming.text} />
+                    ) : (
+                      <span className="chat-meta">正在生成…</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : state.sending ? (
+              <div className="chat-meta">正在生成…</div>
+            ) : null}
           </div>
 
           <div className="chat-composer">
@@ -239,6 +360,22 @@ export function AssistantPanel({ onClose }: { onClose: () => void }): JSX.Elemen
   );
 }
 
+/** 助手消息正文：marked 渲染 + dompurify 消毒后的 HTML。 */
+function MarkdownContent({ text }: { text: string }): JSX.Element {
+  const html = useMemo(() => renderMarkdown(text), [text]);
+  return <div className="chat-md" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+/** 推理过程（思维链）：默认折叠的可展开区，内容按纯文本展示。 */
+function ReasoningBlock({ text }: { text: string }): JSX.Element {
+  return (
+    <details className="chat-reasoning">
+      <summary>思考过程</summary>
+      <div className="chat-reasoning__body">{text}</div>
+    </details>
+  );
+}
+
 function ChatMessage({
   message,
   reasons,
@@ -259,7 +396,14 @@ function ChatMessage({
     <div className={isUser ? 'chat-row chat-row--user' : 'chat-row'}>
       <div style={{ maxWidth: '88%' }}>
         <div className={isUser ? 'chat-bubble chat-bubble--user' : 'chat-bubble chat-bubble--assistant'}>
-          {message.content}
+          {isUser ? (
+            message.content
+          ) : (
+            <>
+              {message.reasoning ? <ReasoningBlock text={message.reasoning} /> : null}
+              <MarkdownContent text={message.content} />
+            </>
+          )}
         </div>
         {!isUser ? (
           <div className="chat-meta">
