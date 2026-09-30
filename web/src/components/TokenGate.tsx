@@ -31,7 +31,7 @@ export function TokenGate({ children }: { children: React.ReactNode }): JSX.Elem
       if (err instanceof ApiError) {
         if (err.kind === 'unauthorized') {
           setState('need-token');
-          setError(storedToken ? '当前令牌无效或已轮换。' : null);
+          setError(storedToken ? '已保存的令牌无效，请重新输入。' : null);
           return;
         }
         // 连接层面失败：交给外壳的横幅，不在这里拦。
@@ -69,8 +69,7 @@ export function TokenGate({ children }: { children: React.ReactNode }): JSX.Elem
         <div className="panel__head">访问令牌</div>
         <div className="panel__body col">
           <p className="muted text-sm" style={{ margin: 0 }}>
-            内核要求访问令牌（默认绑 loopback，不把控制能力开放给任意网络来访者）。
-            令牌在内核启动时打印在启动横幅里，也可以由部署方另行配置。
+            连接本机内核需要访问令牌。令牌在内核启动时打印在终端里，也可以由部署方另行配置。
           </p>
 
           {error ? (
@@ -79,7 +78,7 @@ export function TokenGate({ children }: { children: React.ReactNode }): JSX.Elem
             </Banner>
           ) : null}
 
-          <Field label="X-Workerbee-Token" hint="仅保存在本机浏览器 localStorage，不写入日志或页面其它位置。">
+          <Field label="访问令牌" hint="仅保存在本机浏览器中，不会写入日志。">
             <input
               className="input input--mono"
               type="password"
@@ -114,8 +113,7 @@ export function TokenGate({ children }: { children: React.ReactNode }): JSX.Elem
           </div>
 
           <div className="text-xs dim">
-            令牌为空时内核可能未启用鉴权（仅当显式绑定了非 loopback 地址才应如此）。
-            此时直接点「重新检测」即可。
+            如果内核启动时没有开启访问令牌，直接点「重新检测」即可进入。
           </div>
         </div>
       </div>

@@ -8,11 +8,11 @@ import { Empty } from '../components/common';
 /** 与 AppShell 顶栏的一级入口保持一致（顶层路由清单的唯一展示处）。 */
 const TOP_LEVEL_ROUTES: { to: string; label: string; hint: string }[] = [
   { to: '/workflows', label: '流程', hint: '定义与修订' },
-  { to: '/tasks', label: '任务', hint: '提交与生命周期' },
-  { to: '/execution', label: '执行图', hint: '实际执行的节点与连线' },
+  { to: '/tasks', label: '任务', hint: '提交与执行' },
+  { to: '/execution', label: '执行图', hint: '任务实际执行到哪一步' },
   { to: '/registry', label: '注册表', hint: 'harness / 凭据 / 技能 / 工具' },
   { to: '/templates', label: '模板', hint: '可复用的流程与节点' },
-  { to: '/storage', label: '存储', hint: '数据目录与清理' },
+  { to: '/storage', label: '存储', hint: '占用与清理' },
 ];
 
 export function NotFoundPage(): JSX.Element {

@@ -97,7 +97,7 @@ export function TaskControls({
           }}
           title={
             fromNodeName
-              ? `暂停整次任务（从节点「${fromNodeName}」发起，范围仍是整任务）`
+              ? `暂停整次任务（从节点「${fromNodeName}」发起，作用于整个任务）`
               : '暂停整次任务'
           }
         >
@@ -152,20 +152,19 @@ export function TaskControls({
           }
         >
           <Banner variant="info" title="暂停范围：整次任务">
-            暂停默认作用于<strong>整次任务</strong>，覆盖它的所有并行分支。
+            暂停作用于<strong>整次任务</strong>，覆盖它的所有并行分支。
             {fromNodeName ? (
               <>
                 {' '}
-                本次操作从节点「{fromNodeName}」发起，该节点只是定位任务与记录来源的入口，
-                <strong>不表示只暂停该节点</strong>。
+                本次操作从节点「{fromNodeName}」发起，暂停的仍是整次任务。
               </>
             ) : null}
             其他提交不受影响。
           </Banner>
           <ul className="list-reset text-sm">
-            <li>· 未启动的阶段会被直接置为暂停，零成本。</li>
-            <li>· 在途阶段按 harness 能力处理：支持原位暂停则原地停；否则协作停止并尽量保留断点。</li>
-            <li>· 协作停止可能造成<strong>重复工作</strong>——恢复时会提示哪些阶段要重做。</li>
+            <li>· 未启动的阶段直接暂停，没有额外代价。</li>
+            <li>· 正在运行的阶段：harness 支持原地暂停的就原地停；不支持的会协商停止，并尽量保留断点。</li>
+            <li>· 协商停止可能造成<strong>重复工作</strong>——恢复时会提示哪些阶段要重做。</li>
             <li>· 已完成的上游结果保留，不被改写为失败。</li>
           </ul>
           {submit.error ? (
@@ -203,7 +202,7 @@ export function TaskControls({
             </label>
             <div className="text-xs muted">
               默认只恢复被暂停的部分。<strong>已成功的阶段不会被重跑</strong>；
-              被协作停止的阶段会创建新执行尝试（从断点或从头重建，恢复后会告知）。
+              协商停止的阶段会重新执行（有断点则续跑，没有则从头再来，恢复后会告知）。
             </div>
             {submit.error ? (
               <Banner variant="danger" title="恢复失败">
@@ -230,14 +229,14 @@ export function TaskControls({
             </>
           }
         >
-          <Banner variant="danger" title="删除不是暂停：没有续跑入口">
-            停止该任务所有排队、重试与执行，清理归属运行资源，保留必要历史。
-            迟到的输出不会推进它。再次提交相同输入是<strong>新任务</strong>，不是恢复。
+          <Banner variant="danger" title="删除后不能续跑">
+            将停止该任务的所有排队、重试与执行，并清理运行资源，保留必要历史。
+            再次提交相同输入会作为<strong>新任务</strong>执行。
           </Banner>
           <ul className="list-reset text-sm">
             <li>· 已完成的阶段保留原有结果，不会被改写成失败。</li>
-            <li>· 删除只终止后续执行，<strong>不承诺撤销</strong>已经写入的项目文件或已发生的外部副作用。</li>
-            <li>· 完成判据分三件事：已接受删除 / 执行已停止 / 资源清理完成——清理失败会保持可见。</li>
+            <li>· 删除只停止后续执行；已写入的项目文件和已产生的外部操作<strong>不会被撤销</strong>。</li>
+            <li>· 进度分三步显示：已受理 / 执行已停止 / 资源清理完成；清理失败会一直显示。</li>
           </ul>
           {submit.error ? (
             <Banner variant="danger" title="删除失败">
@@ -252,15 +251,15 @@ export function TaskControls({
         <ResultModal title="暂停结果" onClose={() => setPauseResult(null)}>
           <TriState outcome={pauseResult} />
           <div style={{ marginTop: 'var(--sp-3)' }}>
-            <DetailList title="未启动即暂停（零成本）" ids={pauseResult.paused_immediately} />
+            <DetailList title="未启动，直接暂停" ids={pauseResult.paused_immediately} />
             <DetailList title="原位暂停" ids={pauseResult.paused_in_place} />
             <DetailList
-              title="协作停止（可能重复工作）"
+              title="协商停止（可能重复工作）"
               ids={pauseResult.stopped_cooperatively}
               tone="warn"
             />
             <DetailList
-              title="harness 不支持暂停，命令已被拒绝"
+              title="harness 不支持暂停（这些阶段仍在运行）"
               ids={pauseResult.unsupported}
               tone="danger"
             />
@@ -289,8 +288,8 @@ export function TaskControls({
         <ResultModal title="恢复结果" onClose={() => setResumeResult(null)}>
           <TriState outcome={resumeResult} />
           <div style={{ marginTop: 'var(--sp-3)' }}>
-            <DetailList title="重新入队" ids={resumeResult.requeued} />
-            <DetailList title="需要重做（从断点或从头重建）" ids={resumeResult.restarted} tone="warn" />
+            <DetailList title="重新排队" ids={resumeResult.requeued} />
+            <DetailList title="需要重做（有断点则续跑，没有则从头再来）" ids={resumeResult.restarted} tone="warn" />
             <DetailList title="复用原会话" ids={resumeResult.reused_sessions} />
           </div>
         </ResultModal>
@@ -309,8 +308,8 @@ export function TaskControls({
             <DetailList title="已取消的阶段" ids={deleteResult.cancelled_stages} />
             <DetailList title="保留真实结果的已完成阶段" ids={deleteResult.preserved_succeeded} />
           </div>
-          <Banner variant="info" title="任务已进入终态">
-            它不会因为迟到事件或恢复流程复活。历史仍可在任务列表中回看。
+          <Banner variant="info" title="任务已删除">
+            已删除的任务不会再被启动，历史记录仍可在任务列表中查看。
           </Banner>
         </ResultModal>
       ) : null}
@@ -378,7 +377,7 @@ export function OriginOfControlText({ task }: { task: Task }): JSX.Element | nul
 export function ErrorBanner({ error }: { error: ApiError | null }): JSX.Element | null {
   if (!error) return null;
   return (
-    <Banner variant="danger" title={error.unreachable ? '无法连接内核' : '请求失败'}>
+    <Banner variant="danger" title={error.unreachable ? '无法连接后台服务' : '请求失败'}>
       {error.detail}
       {error.hint ? <div className="banner__hint">{error.hint}</div> : null}
     </Banner>

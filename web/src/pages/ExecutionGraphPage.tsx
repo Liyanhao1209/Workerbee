@@ -79,7 +79,7 @@ function TaskPicker(): JSX.Element {
         <div className="page-head__titles">
           <h1>实际执行图</h1>
           <div className="page-head__sub">
-            选一个任务看它<strong>pinned</strong>的那张有效图与实时状态。这里画的是执行记录，不是可编辑的定义。
+            选一个任务，查看它实际执行的流程和实时状态。这里展示的是执行记录，不能编辑。
           </div>
         </div>
         <div className="page-head__actions">
@@ -106,7 +106,7 @@ function TaskPicker(): JSX.Element {
                   <th>流程</th>
                   <th>状态</th>
                   <th>运行中分支</th>
-                  <th>修订 / 有效图版本</th>
+                  <th>修订 / 图版本</th>
                   <th>提交时间</th>
                 </tr>
               </thead>
@@ -203,7 +203,7 @@ function ExecutionView({ taskId }: { taskId: string }): JSX.Element {
   if (!task) {
     return (
       <div className="page">
-        <Empty title="没有读到任务" hint="内核返回了空内容。刷新试试。" />
+        <Empty title="没有读到任务" hint="后台服务返回了空内容，请刷新重试。" />
       </div>
     );
   }
@@ -227,9 +227,9 @@ function ExecutionView({ taskId }: { taskId: string }): JSX.Element {
               </span>
             </h1>
             <div className="page-head__sub">
-              {task.workflow_name ?? <ShortId id={task.workflow_id} />} · pinned 修订 #{task.revision_seq} ·
-              有效图版本 {task.effective_graph_version} · 控制意图：{DESIRED_LABELS[task.desired_state]} ·
-              控制纪元 {task.control_epoch}
+              {task.workflow_name ?? <ShortId id={task.workflow_id} />} · 修订 #{task.revision_seq} ·
+              图版本 {task.effective_graph_version} · 目标状态：{DESIRED_LABELS[task.desired_state]} ·
+              操作序号 {task.control_epoch}
             </div>
             <OriginOfControlText task={task} />
           </div>
@@ -254,8 +254,8 @@ function ExecutionView({ taskId }: { taskId: string }): JSX.Element {
           </Banner>
         ) : null}
 
-        <Banner variant="info" title="这张图是 pinned 快照" hint="之后对流程定义的修改不会改变它。">
-          虚线节点 = 过渡态（正在收敛，尚未停住） · 绿色描边 = 仍在运行的分支 · 虚线边 = 内核派生的绕过边。
+        <Banner variant="info" title="这张图记录的是任务提交时的流程版本" hint="之后对流程定义的修改不会改变它。">
+          虚线节点 = 状态还在变化中 · 绿色描边 = 仍在运行的分支 · 虚线边 = 实际执行中绕过的连线。
         </Banner>
 
         {task.failure_summary ? (
@@ -293,7 +293,7 @@ function ExecutionView({ taskId }: { taskId: string }): JSX.Element {
           }}
         >
           {snapshot.graph.nodes.length === 0 ? (
-            <Empty title="pinned 快照里没有节点" hint="这次任务发射时的有效图为空。这通常说明发射校验应该先拦下它。" />
+            <Empty title="该任务的流程图为空" hint="任务提交时的流程版本里没有任何节点。" />
           ) : (
             <ExecutionCanvas
               pinnedGraph={snapshot.graph}
@@ -377,7 +377,7 @@ function FailurePanel({
       <div className="grid grid--2" style={{ gap: 'var(--sp-3)' }}>
         <div>
           <div className="section-title">为什么失败</div>
-          <div className="text-sm">{reason ?? '内核未提供原因'}</div>
+          <div className="text-sm">{reason ?? '没有记录失败原因'}</div>
           {detail ? <div className="text-xs muted" style={{ marginTop: 3 }}>{detail}</div> : null}
           {failedStages.length > 0 ? (
             <div className="chips" style={{ marginTop: 6 }}>
@@ -399,7 +399,7 @@ function FailurePanel({
           ) : null}
         </div>
         <div>
-          <div className="section-title">仍在运行的分支（不会因为主链失败而自动停）</div>
+          <div className="section-title">仍在运行的分支（任务失败不会自动停止它们）</div>
           {runningBranches.length === 0 ? (
             <div className="text-sm dim">没有仍在运行的阶段。</div>
           ) : (
@@ -412,7 +412,7 @@ function FailurePanel({
                 ))}
               </div>
               <div className="text-xs muted" style={{ marginTop: 4 }}>
-                这些分支仍在占用资源。若要一并停下，用「暂停」或「删除任务」——范围是整次任务。
+                这些分支仍在运行并占用资源。要全部停下，请使用「暂停」或「删除任务」（作用于整个任务）。
               </div>
             </>
           )}
@@ -436,7 +436,7 @@ function Legend({
   const present = new Set(stages.map((s) => s.observed_state));
   return (
     <div>
-      <div className="section-title">状态图例（与内核枚举一一对应）</div>
+      <div className="section-title">状态图例</div>
       <div className="col" style={{ gap: 3 }}>
         {STAGE_STATES.map((state: StageState) => {
           const label = stageStateLabel(state);
@@ -464,7 +464,7 @@ function Legend({
                 }}
               />
               <span className="text-sm">{label.text}</span>
-              {transitioning ? <span className="chip chip--warn">过渡态</span> : null}
+              {transitioning ? <span className="chip chip--warn">变化中</span> : null}
               <span className="spacer" />
               <span className="mono text-xs">{count}</span>
             </div>
@@ -475,7 +475,7 @@ function Legend({
       <div className="divider" />
       <div className="section-title">本次任务的阶段</div>
       {stages.length === 0 ? (
-        <Empty title="还没有阶段记录" hint="任务刚提交、调度尚未领取时可能还没有阶段行。" />
+        <Empty title="还没有阶段记录" hint="任务刚提交、还没来得及调度时，这里会暂时为空。" />
       ) : (
         <div className="col" style={{ gap: 3 }}>
           {stages.map((stage) => (
@@ -528,7 +528,7 @@ function StagePanel({
     return (
       <Empty
         title={`节点「${nodeName ?? '（未知）'}」还没有阶段记录`}
-        hint="它可能是被停用的节点，或者依赖尚未满足因而还没被创建阶段。"
+        hint="该节点可能被停用，或还没轮到它执行。"
       />
     );
   }
@@ -541,9 +541,7 @@ function StagePanel({
     setResumeError(null);
     try {
       const result = await taskApi.resumeStage(taskId, stage.node_id);
-      setResumeNote(
-        `${result.note}${result.had_checkpoint ? '（从断点继续）' : '（没有断点，本阶段会从头重跑）'}`,
-      );
+      setResumeNote(result.note);
       onChanged();
     } catch (err) {
       setResumeError(err instanceof Error ? err.message : String(err));
@@ -565,13 +563,13 @@ function StagePanel({
         items={[
           { k: '节点', v: nodeName ?? <ShortId id={stage.node_id} /> },
           { k: '阶段', v: <ShortId id={stage.stage_id} len={12} /> },
-          { k: '控制意图', v: DESIRED_LABELS[stage.desired_state] },
-          { k: '控制纪元', v: <span className="mono">{stage.control_epoch}</span> },
+          { k: '目标状态', v: DESIRED_LABELS[stage.desired_state] },
+          { k: '操作序号', v: <span className="mono">{stage.control_epoch}</span> },
           {
-            k: '队列权重',
+            k: '优先级',
             v: (
               <span className="mono">
-                node {stage.node_priority} · task {stage.task_priority}
+                节点 {stage.node_priority} · 任务 {stage.task_priority}
               </span>
             ),
           },
@@ -580,7 +578,7 @@ function StagePanel({
             k: '尝试次数',
             v: (
               <span className="mono">
-                {stage.attempt_count}（当前第 {stage.current_attempt_seq} 次 · 候选游标 {stage.profile_cursor}）
+                {stage.attempt_count}（当前第 {stage.current_attempt_seq} 次 · 候选配置 {stage.profile_cursor}）
               </span>
             ),
           },
@@ -590,10 +588,10 @@ function StagePanel({
           },
           {
             k: '需要核对',
-            v: stage.requires_reconcile ? <span className="text-warn">是。系统无法确认是否还在运行，需要人工核对</span> : '否',
+            v: stage.requires_reconcile ? <span className="text-warn">是——无法确认它是否还在运行，请人工核对</span> : '否',
           },
           {
-            k: '上游 pinned',
+            k: '上游产物',
             v:
               Object.keys(stage.upstream_pins).length === 0 ? (
                 <span className="dim">无上游</span>
@@ -618,7 +616,7 @@ function StagePanel({
 
       {stage.origin_of_control ? (
         <div className="text-xs muted">
-          控制来源：{stage.origin_of_control.op} · 范围 {stage.origin_of_control.scope} ·{' '}
+          操作来源：{stage.origin_of_control.op} · 范围 {stage.origin_of_control.scope} ·{' '}
           {stage.origin_of_control.from_node_id ? `来自节点 ${stage.origin_of_control.from_node_id.slice(0, 8)}` : '任务级'} ·{' '}
           {new Date(stage.origin_of_control.at).toLocaleString('zh-CN', { hour12: false })}
           {stage.origin_of_control.detail ? ` · ${stage.origin_of_control.detail}` : ''}
@@ -674,7 +672,7 @@ function StagePanel({
                     {SENSITIVITY_LABELS[a.sensitivity].text}
                   </Chip>
                   {!a.summary_ok ? (
-                    <Chip variant="danger" title="摘要未覆盖边输出契约的必填要点，下游会被显式受阻">
+                    <Chip variant="danger" title="摘要缺少下游要求的内容，下游节点会被暂停等待处理">
                       摘要不完整
                     </Chip>
                   ) : null}
@@ -688,7 +686,7 @@ function StagePanel({
                   </div>
                 ) : (
                   <div className="text-xs dim" style={{ marginTop: 3 }}>
-                    没有摘要——下游只能拿到指针。
+                    没有摘要，下游只能拿到产物引用。
                   </div>
                 )}
                 {a.covered_fields.length > 0 ? (
@@ -738,11 +736,11 @@ export function AttemptCard({ attempt }: { attempt: Attempt }): JSX.Element {
       <div className="row row--tight">
         <span className="chip">#{attempt.attempt_seq}</span>
         <span className="mono text-xs" title={attempt.profile_id}>
-          {model ?? '（快照未记录模型名）'}
+          {model ?? '（未记录模型）'}
         </span>
         {harness ? <span className="dim mono text-xs">@{harness}</span> : null}
         {effort ? <Chip>effort {effort}</Chip> : null}
-        {attempt.reattached ? <Chip variant="warn">重新接管</Chip> : null}
+        {attempt.reattached ? <Chip variant="warn">重启后接回</Chip> : null}
         {attempt.resume_from_checkpoint ? <Chip variant="accent">从断点续跑</Chip> : null}
         <span className="spacer" />
         {outcome ? (
@@ -799,7 +797,7 @@ export function AttemptCard({ attempt }: { attempt: Attempt }): JSX.Element {
 
       {threshold !== null ? (
         <div className="text-xs dim" style={{ marginTop: 2 }}>
-          实际 compact 触发点：{threshold}（= min(用户阈值, harness 上限) − 安全余量）
+          上下文整理触发点：{threshold}（取用户阈值与 harness 上限中较小的值，再留安全余量）
         </div>
       ) : null}
 

@@ -78,7 +78,7 @@ export function AppShell(): JSX.Element {
       <header className="topbar">
         <div className="topbar__brand">
           Workerbee
-          <span className="topbar__brand-sub">多 agent harness 协作</span>
+          <span className="topbar__brand-sub">多 agent 流程编排</span>
         </div>
         <nav className="topbar__nav">
           {NAV.map((item) => (
@@ -127,9 +127,8 @@ export function AppShell(): JSX.Element {
             title="无法连接内核"
             hint={
               <>
-                网页会继续重试。请确认 <span className="mono">workerbee-core</span> 已启动并监听
-                127.0.0.1:8765；开发模式下由 Vite 代理转发（可改 WORKERBEE_KERNEL 环境变量）。
-                在内核恢复之前，下面显示的都不是实时状态。
+                网页会自动重试。请确认本机的 <span className="mono">workerbee-core</span> 服务已启动
+                （默认监听 127.0.0.1:8765）。服务恢复前，页面显示的不是实时状态。
               </>
             }
             actions={
@@ -150,9 +149,8 @@ export function AppShell(): JSX.Element {
         ) : null}
 
         {schedulerOff ? (
-          <Banner variant="warn" title="调度循环未装配">
-            内核的调度循环没有启用，任务不会自动推进——你看到的排队与就绪阶段会一直停在那里。
-            这通常是启动配置问题，不是任务失败。
+          <Banner variant="warn" title="任务不会自动推进">
+            内核的调度器没有启动，排队和就绪的阶段会一直停在原地。请检查内核的启动配置并重启内核。
           </Banner>
         ) : null}
 
@@ -203,7 +201,7 @@ function KernelIndicator({
   resumedCount: number;
 }): JSX.Element {
   const kernelText =
-    kernel === 'ok' ? '内核在线' : kernel === 'unreachable' ? '内核离线' : kernel === 'unauthorized' ? '未授权' : '检测中';
+    kernel === 'ok' ? '内核在线' : kernel === 'unreachable' ? '内核离线' : kernel === 'unauthorized' ? '需要访问令牌' : '检测中';
   const kernelCls =
     kernel === 'ok' ? 'pill pill--success' : kernel === 'unreachable' ? 'pill pill--danger' : 'pill pill--pending';
 
@@ -230,7 +228,7 @@ function KernelIndicator({
         className={wsCls}
         title={
           resumedCount > 0
-            ? `${wsDetail ? `${wsDetail}\n` : ''}重连后已按 after_event_id 补齐 ${resumedCount} 条事件；推送仍是提醒，权威状态以各页面的 REST 拉取为准。`
+            ? `${wsDetail ? `${wsDetail}\n` : ''}连接中断期间错过的 ${resumedCount} 条更新已在重连后补齐；页面数据以刷新时从内核拉取的为准。`
             : (wsDetail ?? undefined)
         }
       >

@@ -194,7 +194,7 @@ export const REVISION_SOURCE_LABELS: Record<RevisionSource, string> = {
   manual: '手动建图',
   ai_generated: 'AI 生成',
   graph_capture: 'Graph Capture',
-  template: '模板实例化',
+  template: '从模板创建',
 };
 
 export const ERROR_CLASS_LABELS: Record<ErrorClass, { text: string; tone: Tone }> = {

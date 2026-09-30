@@ -35,12 +35,12 @@ export function TriState({ outcome, resourceNote }: TriStateProps): JSX.Element 
   return (
     <div>
       <div className="tristate">
-        <Cell label="① 已接受操作" value={outcome.accepted} yes="已落库" no="未接受" />
+        <Cell label="① 已接受操作" value={outcome.accepted} yes="已记录" no="未接受" />
         <Cell
           label="② 执行已停止"
           value={outcome.execution_stopped}
           yes="已确认终止"
-          no="仍在收敛"
+          no="仍在停止中"
         />
         <div className={`tristate__cell tristate__cell--${pendingResources.length > 0 ? 'no' : 'yes'}`}>
           <div className="tristate__label">③ 资源清理完成</div>

@@ -298,7 +298,7 @@ export function durationBetween(start: string | null, end: string | null): numbe
  * 未知 ≠ 零（OBS-04）。用量不可取得时显示「未知」，不显示 0。
  */
 export function CountOrUnknown({ value }: { value: number | null | undefined }): JSX.Element {
-  if (value === null || value === undefined) return <span className="dim" title="不可取得">未知</span>;
+  if (value === null || value === undefined) return <span className="dim" title="无法获取">未知</span>;
   return <span className="mono">{value.toLocaleString('zh-CN')}</span>;
 }
 

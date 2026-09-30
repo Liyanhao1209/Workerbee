@@ -73,7 +73,7 @@ export function ApprovalCard({
       {/* 操作内容 */}
       <div className="field__label">操作内容</div>
       <pre className="code-block" style={{ maxHeight: 150 }}>
-        {approval.action || '（内核未提供操作内容）'}
+        {approval.action || '（未提供操作内容）'}
       </pre>
 
       <div className="kv" style={{ marginTop: 'var(--sp-2)' }}>
@@ -117,13 +117,13 @@ export function ApprovalCard({
 
         <div className="kv__k">风险信息</div>
         <div className="kv__v">
-          {approval.risk ? approval.risk : <span className="dim">内核未提供风险分级</span>}
+          {approval.risk ? approval.risk : <span className="dim">未提供风险信息</span>}
         </div>
 
         <div className="kv__k">超时策略</div>
         <div className="kv__v">
           <span className="mono">{approval.timeout_policy}</span>
-          <span className="dim text-xs"> · 超时拒绝该动作</span>
+          <span className="dim text-xs"> · 超时未处理将自动拒绝</span>
         </div>
 
         {approval.expires_at ? (
@@ -213,7 +213,7 @@ export function ApprovalCard({
               </button>
               {approval.status === 'undeliverable' ? (
                 <button type="button" className="btn btn--sm" disabled={submit.busy} onClick={() => void retry()}>
-                  重试回注
+                  重新送达
                 </button>
               ) : null}
               {submit.busy ? <span className="spin" /> : null}
@@ -225,15 +225,15 @@ export function ApprovalCard({
           {/* 已决定但回注失败的仍可重试；已生效的只提供追溯。 */}
           {approval.status === 'undeliverable' ? (
             <>
-              <Banner variant="danger" title="决定已产生，但回注原会话失败">
-                该决定尚未生效。可重试回注，或排查该会话在内核侧的状态。
+              <Banner variant="danger" title="决定已记录，但没能送达对应的会话">
+                决定尚未生效。可点击「重新送达」重试；若多次失败，请到会话页确认该会话是否还在运行。
               </Banner>
               <button type="button" className="btn btn--sm" disabled={submit.busy} onClick={() => void retry()}>
-                重试回注
+                重新送达
               </button>
             </>
           ) : (
-            <span className="dim text-xs">该审批已不再等待处理，仅可追溯。</span>
+            <span className="dim text-xs">该审批已处理完毕，此处仅保留记录。</span>
           )}
         </div>
       )}
@@ -243,6 +243,6 @@ export function ApprovalCard({
 
 /** 提交决定后可能出现的「实际生效结果」提示（重复决定不报错，返回真实状态）。 */
 export function describeDelivery(err: ApiError): string {
-  if (err.kind === 'unreachable') return '无法连接内核，决定未送达。';
+  if (err.kind === 'unreachable') return '无法连接后台服务，决定未送达。';
   return err.detail;
 }

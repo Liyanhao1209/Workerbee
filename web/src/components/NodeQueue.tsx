@@ -138,7 +138,7 @@ export function NodeQueue({ nodeId, nodeName }: { nodeId: string; nodeName?: str
     return (
       <Banner
         variant="danger"
-        title={error.unreachable ? '无法连接内核' : '无法读取节点队列'}
+        title={error.unreachable ? '无法连接后台服务' : '无法读取节点队列'}
         actions={
           <button type="button" className="btn btn--sm" onClick={reload}>
             重试
@@ -157,7 +157,7 @@ export function NodeQueue({ nodeId, nodeName }: { nodeId: string; nodeName?: str
           节点「{nodeName ?? <ShortId id={nodeId} />}」的待执行阶段
         </span>
         <span className="chip">待执行 {pending.length}</span>
-        {running.length > 0 ? <span className="chip chip--accent">占槽中 {running.length}</span> : null}
+        {running.length > 0 ? <span className="chip chip--accent">执行中 {running.length}</span> : null}
         <span className="spacer" />
         <button type="button" className="btn btn--sm" onClick={reload}>
           刷新
@@ -187,7 +187,7 @@ export function NodeQueue({ nodeId, nodeName }: { nodeId: string; nodeName?: str
         >
           {lastResult.rejected.length > 0 ? (
             <div>
-              <div>以下阶段被拒绝，原因如下（下面显示的是实际生效顺序，不是你的操作）：</div>
+              <div>以下阶段的调序未生效，原因如下。列表显示的是实际生效顺序：</div>
               <ul className="list-reset text-xs" style={{ marginTop: 4 }}>
                 {lastResult.rejected.map((item, i) => (
                   <li key={i} className="mono">
@@ -207,7 +207,7 @@ export function NodeQueue({ nodeId, nodeName }: { nodeId: string; nodeName?: str
       {orderedItems.length === 0 ? (
         <Empty
           title="该节点当前没有待执行阶段"
-          hint="只有「等待依赖」与「就绪排队」的阶段参与调序；已占槽、已完成、失败的阶段不在此列。"
+          hint="只有等待依赖和排队就绪的阶段可以调序；正在执行、已完成或已失败的不在列表中。"
         />
       ) : (
         <div className="table-wrap">
@@ -219,11 +219,11 @@ export function NodeQueue({ nodeId, nodeName }: { nodeId: string; nodeName?: str
                 <th>阶段</th>
                 <th>所属任务</th>
                 <th>状态</th>
-                <th className="table__num" title="node_priority（本节点队列内的调序结果）">
-                  node_pri
+                <th className="table__num" title="本节点队列内的优先级，数值大者先执行">
+                  节点优先级
                 </th>
-                <th className="table__num" title="task_priority（发射时从任务优先级拷贝）">
-                  task_pri
+                <th className="table__num" title="任务提交时的优先级，数值大者先执行">
+                  任务优先级
                 </th>
                 <th>入队时间</th>
               </tr>
@@ -277,7 +277,7 @@ export function NodeQueue({ nodeId, nodeName }: { nodeId: string; nodeName?: str
 
       {running.length > 0 ? (
         <div style={{ marginTop: 'var(--sp-3)' }}>
-          <div className="section-title">占用执行槽（不参与普通调序，D-03）· {running.length}</div>
+          <div className="section-title">正在执行（不参与调序）· {running.length}</div>
           <div className="table-wrap">
             <table className="table table--dense">
               <tbody>
@@ -321,8 +321,8 @@ export function NodeQueue({ nodeId, nodeName }: { nodeId: string; nodeName?: str
       ) : null}
 
       <div className="text-xs dim" style={{ marginTop: 6 }}>
-        默认顺序 (node_priority, task_priority, enqueued_at)，大者优先。调序只作用于本节点队列，
-        不破坏任务依赖，也不会抢占已运行的阶段；与派发并发时以 CAS 仲裁并返回实际生效结果。
+        默认按节点优先级、任务优先级、入队时间排序，数值大者优先。调序只影响本节点队列，
+        不改变任务依赖，也不打断正在执行的阶段；应用后以上方显示的实际生效顺序为准。
       </div>
     </div>
   );

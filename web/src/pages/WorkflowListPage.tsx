@@ -140,7 +140,7 @@ export function WorkflowListPage(): JSX.Element {
         <div className="page-head__titles">
           <h1>流程</h1>
           <div className="page-head__sub">
-            流程是任务的执行定义。点名称进入编辑器改图；删除只停控制面，历史仍可回看。
+            流程定义任务按什么步骤执行。点名称进入编辑器修改流程图；删除流程不会删除历史任务记录。
           </div>
         </div>
         <div className="page-head__actions">
@@ -161,7 +161,7 @@ export function WorkflowListPage(): JSX.Element {
         error.unreachable ? (
           <Banner
             variant="danger"
-            title="无法连接内核"
+            title="无法连接后台服务"
             hint={error.hint}
             actions={
               <button type="button" className="btn btn--sm" onClick={reload}>
@@ -219,7 +219,7 @@ export function WorkflowListPage(): JSX.Element {
             {workflows.length === 0 ? (
               <Empty
                 title="还没有流程"
-                hint="流程由节点与连线组成。新建后先加节点、再发布修订，才能提交任务。"
+                hint="流程由节点和连线组成。新建后在编辑器里添加节点并发布，然后才能提交任务。"
                 action={
                   <button
                     type="button"
@@ -238,15 +238,15 @@ export function WorkflowListPage(): JSX.Element {
                       <th>名称</th>
                       <th>状态</th>
                       <th>描述</th>
-                      <th className="table__num" title="当前修订序号。编辑器保存修订后递增">
-                        修订序号
+                      <th className="table__num" title="当前版本号，每次在编辑器中保存修改后递增">
+                        版本
                       </th>
                       <th className="table__num" title="该流程同时运行的任务数上限">
                         并发上限
                       </th>
                       <th
                         className="table__num"
-                        title="未结束（非终态）任务数 / 该流程任务总数。终态为 已成功・已失败・已删除"
+                        title="正在运行的任务数 / 该流程的任务总数"
                       >
                         运行中/总任务
                       </th>
@@ -298,7 +298,7 @@ export function WorkflowListPage(): JSX.Element {
                                 …
                               </span>
                             ) : (
-                              <span className="mono" title={`未结束 ${live} 个，任务共 ${total} 个`}>
+                              <span className="mono" title={`正在运行 ${live} 个，共 ${total} 个任务`}>
                                 {live} / {total}
                               </span>
                             )}
@@ -400,9 +400,9 @@ export function WorkflowListPage(): JSX.Element {
             <DeleteResultBody result={deleteResult} />
           ) : (
             <div className="col">
-              <Banner variant="danger" title="删除会立即改变控制面">
-                删除会停止接受新提交、终止其所有未结束任务并清理归属资源；定义与任务历史保留供回看；
-                仍被其他 Workflow 引用的共享配置不会被删除。
+              <Banner variant="danger" title="删除后立即生效">
+                删除后将不再接受新任务，正在运行的任务会被终止；流程定义和历史任务记录会保留，
+                仍可查看；被其他流程共用的配置不会被删除。
               </Banner>
               <div className="text-sm">
                 即将删除：<strong>{deleting.name || '（未命名）'}</strong>{' '}
@@ -416,7 +416,7 @@ export function WorkflowListPage(): JSX.Element {
               {remove.error ? (
                 <Banner
                   variant="danger"
-                  title={remove.error.unreachable ? '无法连接内核' : '删除失败'}
+                  title={remove.error.unreachable ? '无法连接后台服务' : '删除失败'}
                   hint={remove.error.hint}
                 >
                   <span className="mono text-xs">{remove.error.detail}</span>
@@ -439,15 +439,15 @@ function DeleteResultBody({ result }: { result: WorkflowDeleteResponse }): JSX.E
   const kept = asArray<string>(result.shared_configs_kept);
   return (
     <div className="col">
-      <Banner variant="info" title="三个结论相互独立，请不要当成一个「删除成功」">
-        ① 已接受只表示控制意图已落库；② 执行是否真的停下；③ 归属资源是否清理干净——
-        任一项未达成都会在下面标出。
+      <Banner variant="info" title="删除结果分三步确认">
+        ① 删除请求是否被接受；② 正在运行的任务是否已停止；③ 相关资源是否已清理。
+        哪一步没有完成，下面会标出来。
       </Banner>
       <TriState outcome={result} />
       <div>
         <div className="section-title">已终止的任务（{terminated.length}）</div>
         {terminated.length === 0 ? (
-          <span className="dim text-sm">无在途任务需要终止</span>
+          <span className="dim text-sm">没有正在运行的任务需要终止</span>
         ) : (
           <div className="chips">
             {terminated.map((taskId) => (
@@ -461,7 +461,7 @@ function DeleteResultBody({ result }: { result: WorkflowDeleteResponse }): JSX.E
       <div>
         <div className="section-title">保留的共享配置（{kept.length}）</div>
         {kept.length === 0 ? (
-          <span className="dim text-sm">无被其他流程引用的共享配置</span>
+          <span className="dim text-sm">没有被其他流程共用的配置</span>
         ) : (
           <div className="chips">
             {kept.map((ref) => (
@@ -472,7 +472,7 @@ function DeleteResultBody({ result }: { result: WorkflowDeleteResponse }): JSX.E
           </div>
         )}
         <div className="text-xs muted" style={{ marginTop: 'var(--sp-1)' }}>
-          这些共享配置仍被其他 Workflow 引用，因此不会被删除。
+          这些配置仍被其他流程使用，因此保留。
         </div>
       </div>
     </div>
@@ -580,7 +580,7 @@ function WorkflowFormModal({
           hint={
             isEdit
               ? '留空表示不修改。限制该流程同时运行的任务数，超出部分排队'
-              : '留空表示使用内核默认值。限制该流程同时运行的任务数，超出部分排队'
+              : '留空表示使用默认值。限制该流程同时运行的任务数，超出部分排队等待'
           }
         >
           <input
@@ -596,7 +596,7 @@ function WorkflowFormModal({
         {submit.error ? (
           <Banner
             variant="danger"
-            title={submit.error.unreachable ? '无法连接内核' : isEdit ? '保存失败' : '创建失败'}
+            title={submit.error.unreachable ? '无法连接后台服务' : isEdit ? '保存失败' : '创建失败'}
             hint={submit.error.hint}
           >
             <span className="mono text-xs">{submit.error.detail}</span>

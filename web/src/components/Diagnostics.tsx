@@ -70,19 +70,18 @@ export function Diagnostics({
               cursor: clickable ? 'pointer' : 'default',
               background: selected ? 'var(--bg-sel)' : undefined,
             }}
-            title={clickable ? '点击在画布上定位' : '全局项，无法定位到节点或连线'}
+            title={clickable ? '点击在画布上定位' : '这是整体问题，不针对某个节点或连线'}
           >
             <SeverityMark severity={d.severity} />
             <div style={{ minWidth: 0, flex: '1 1 auto' }}>
               <div className="row row--tight" style={{ alignItems: 'baseline' }}>
                 <span>{d.message}</span>
                 <span className="dim mono text-xs">{d.code}</span>
-                {d.requirement ? <span className="dim text-xs">{d.requirement}</span> : null}
               </div>
               <div className="row row--tight text-xs dim" style={{ marginTop: 2 }}>
                 <LocationText diagnostic={d} />
                 {d.slot ? <span className="mono">{d.slot}</span> : null}
-                {!target ? <span>（全局项）</span> : null}
+                {!target ? <span>（整体问题）</span> : null}
               </div>
               {d.hint ? <div className="text-xs muted" style={{ marginTop: 2 }}>建议：{d.hint}</div> : null}
             </div>
@@ -123,8 +122,8 @@ export function DiagnosticsGrouped({
   selectedKey?: string | null;
 }): JSX.Element {
   const groups: { severity: Severity; title: string }[] = [
-    { severity: 'error', title: '错误（阻断发布 / 发射）' },
-    { severity: 'warning', title: '警告（可继续，但需知悉）' },
+    { severity: 'error', title: '错误（必须先解决才能发布或运行）' },
+    { severity: 'warning', title: '警告（可以继续，但建议处理）' },
     { severity: 'info', title: '说明' },
   ];
   const total = diagnostics.length;
@@ -142,7 +141,7 @@ export function DiagnosticsGrouped({
           </div>
         );
       })}
-      {total === 0 ? <div className="empty text-sm">校验通过，没有结论。</div> : null}
+      {total === 0 ? <div className="empty text-sm">校验通过，没有发现问题。</div> : null}
     </div>
   );
 }

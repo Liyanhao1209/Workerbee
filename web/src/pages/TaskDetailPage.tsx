@@ -93,7 +93,7 @@ export function TaskDetailPage(): JSX.Element {
   if (!task) {
     return (
       <div className="page">
-        <Empty title="没有读到任务" hint="内核返回了空内容，或这个任务已被清理。" />
+        <Empty title="没有读到任务" hint="服务返回了空内容，或这个任务已被清理。" />
       </div>
     );
   }
@@ -121,7 +121,7 @@ export function TaskDetailPage(): JSX.Element {
             </span>
           </h1>
           <div className="page-head__sub">
-            {task.workflow_name ?? <ShortId id={task.workflow_id} />} · pinned 修订 #{task.revision_seq} · 有效图版本{' '}
+            {task.workflow_name ?? <ShortId id={task.workflow_id} />} · 修订 #{task.revision_seq} · 图版本{' '}
             {task.effective_graph_version} · 优先级 {task.priority} · 提交者 {task.submitted_by} ·{' '}
             <TimeText value={task.created_at ?? null} />
           </div>
@@ -199,12 +199,12 @@ export function TaskDetailPage(): JSX.Element {
         <div className="panel__head">
           执行尝试 · {attempts.length}
           <div className="panel__head-actions">
-            <span className="text-xs dim">按阶段分组；用量未知显示「未知」，不显示 0</span>
+            <span className="text-xs dim">按阶段分组；用量未知时显示「未知」</span>
           </div>
         </div>
         <div className="panel__body">
           {attempts.length === 0 ? (
-            <Empty title="还没有执行尝试" hint="阶段被派发后才会创建尝试。" />
+            <Empty title="还没有执行尝试" hint="阶段开始执行后才会产生记录。" />
           ) : (
             <div className="col" style={{ gap: 'var(--sp-4)' }}>
               {stages.map((stage) => {
@@ -289,7 +289,7 @@ export function TaskDetailPage(): JSX.Element {
           {queueNode ? (
             <NodeQueue nodeId={queueNode.node_id} nodeName={queueNode.name} />
           ) : (
-            <Empty title="pinned 快照里没有节点" />
+            <Empty title="任务快照里没有节点" />
           )}
         </div>
       </div>
@@ -302,16 +302,16 @@ export function TaskDetailPage(): JSX.Element {
 
       {/* ------------------------------ 输入与 pinned 快照 ------------------------------ */}
       <div className="panel">
-        <div className="panel__head">输入与 pinned 快照</div>
+        <div className="panel__head">输入与执行快照</div>
         <div className="panel__body">
           <KV
             items={[
               { k: '去重标识', v: task.idempotency_key ? <span className="mono">{task.idempotency_key}</span> : <span className="dim">未提供</span> },
-              { k: '控制意图', v: DESIRED_LABELS[task.desired_state] },
-              { k: '控制纪元', v: <span className="mono">{task.control_epoch}</span> },
+              { k: '期望状态', v: DESIRED_LABELS[task.desired_state] },
+              { k: '控制版本号', v: <span className="mono">{task.control_epoch}</span> },
               { k: '最后更新', v: <TimeText value={task.updated_at ?? null} /> },
               {
-                k: 'pinned 的有效边',
+                k: '执行快照的边',
                 v: (
                   <span className="mono">
                     {snapshot.effective_edges.length} 条（有效图版本 {snapshot.effective_graph_version}）
@@ -319,7 +319,7 @@ export function TaskDetailPage(): JSX.Element {
                 ),
               },
               {
-                k: 'pinned 的节点',
+                k: '执行快照的节点',
                 v: (
                   <span className="mono">
                     {snapshot.graph.nodes.length} 个（其中停用{' '}
@@ -337,7 +337,7 @@ export function TaskDetailPage(): JSX.Element {
             {JSON.stringify(task.input_payload, null, 2)}
           </pre>
           <div className="text-xs dim" style={{ marginTop: 4 }}>
-            这张图与这些边是发射时 pinned 的：之后对流程定义的修改不会改变本次执行的依赖关系。
+            任务启动时锁定了当时的流程图与依赖关系；之后再修改流程定义，不会影响本次执行。
           </div>
         </div>
       </div>
@@ -412,14 +412,14 @@ function RunOverview({
                     {ERROR_CLASS_LABELS[errorClass as keyof typeof ERROR_CLASS_LABELS]?.text ?? errorClass}
                   </Chip>
                 ) : null}
-                <div style={{ marginTop: 4 }}>{reason ?? '内核未给出文字原因。'}</div>
+                <div style={{ marginTop: 4 }}>{reason ?? '未给出文字原因。'}</div>
                 {detail ? <div className="text-xs muted">{detail}</div> : null}
               </div>
             ) : (
               <div className="text-sm dim">
                 {task.observed_state === 'succeeded'
                   ? '任务已成功结束，没有失败记录。'
-                  : '内核没有提供失败摘要，请看下方的阶段明细。'}
+                  : '没有失败摘要，请看下方的阶段明细。'}
               </div>
             )}
             {failedStages.length > 0 ? (
@@ -429,7 +429,7 @@ function RunOverview({
                     <StageStatePill state={stage.observed_state} />{' '}
                     <span>{stage.node_name ?? stage.node_id.slice(0, 8)}</span>
                     <div className="muted" style={{ marginLeft: 2 }}>
-                      {stage.blocked_reason ?? '（内核未提供原因）'}
+                      {stage.blocked_reason ?? '（未提供原因）'}
                     </div>
                   </div>
                 ))}
@@ -456,7 +456,7 @@ function RunOverview({
                   })}
                 </div>
                 <div className="text-xs muted" style={{ marginTop: 6 }}>
-                  失败的主链不会自动停掉它们，它们仍在占用执行槽与资源。
+                  这些分支不会因主链失败而自动停止，仍在占用执行资源。
                 </div>
               </>
             )}
@@ -543,7 +543,7 @@ function StageRow({
       <td className="table__num">
         {stage.attempt_count}
         {stage.requires_reconcile ? (
-          <div className="text-xs text-warn" title="系统无法确认真实状态，需人工核对">
+          <div className="text-xs text-warn" title="后台服务无法确认该阶段的实际状态，请人工核对">
             需核对
           </div>
         ) : null}
@@ -611,7 +611,7 @@ function ArtifactRow({ artifact }: { artifact: ArtifactRecord }): JSX.Element {
           {SENSITIVITY_LABELS[artifact.sensitivity].text}
         </Chip>
         {bad ? <Chip variant="danger">摘要不合格 · 交接失败</Chip> : <Chip variant="accent">摘要合格</Chip>}
-        {artifact.tombstoned ? <Chip variant="off">已清理（tombstone）</Chip> : null}
+        {artifact.tombstoned ? <Chip variant="off">已清理</Chip> : null}
         <span className="spacer" />
         <span className="text-xs dim">
           被引用 <CountOrUnknown value={artifact.ref_count ?? null} /> 次 · <Bytes value={artifact.size_bytes} /> · ~
@@ -639,7 +639,7 @@ function ArtifactRow({ artifact }: { artifact: ArtifactRecord }): JSX.Element {
             {artifact.producer.stage_id.slice(0, 8)} · 第 {artifact.producer.attempt_seq} 次尝试
           </>
         ) : (
-          '产出者：内核未记录'
+          '产出者：未记录'
         )}
         {artifact.covered_fields.length > 0 ? ` · 已覆盖字段：${artifact.covered_fields.join(', ')}` : ''}
         {artifact.media_type ? ` · ${artifact.media_type}` : ''}
@@ -653,7 +653,7 @@ function ArtifactRow({ artifact }: { artifact: ArtifactRecord }): JSX.Element {
 
       {lineage.length > 0 ? (
         <div className="text-xs dim" style={{ marginTop: 2 }}>
-          血缘：{lineage.map((l) => l.slice(0, 8)).join(' → ')}
+          来源链：{lineage.map((l) => l.slice(0, 8)).join(' → ')}
         </div>
       ) : null}
     </div>
@@ -791,26 +791,26 @@ function ContextPackagePanel({ taskId }: { taskId: string }): JSX.Element {
   return (
     <div className="panel">
       <div className="panel__head">
-        ContextPackage 组装记录（P1–P5）
+        发给模型的材料 · 组装记录
         <div className="panel__head-actions">
           {records.length > 0 ? <span className="chip">{records.length} 次组装</span> : null}
           {page?.has_more ? <span className="chip chip--warn">事件未读全，记录可能不全</span> : null}
         </div>
       </div>
       <div className="panel__hint">
-        每次派发阶段时写给模型的上下文。「降级」一栏不为空，说明这次材料被压缩过。
+        每次开始执行一个阶段时，发给模型的材料。「降级」不为空，说明这次材料被压缩过。
       </div>
       <div className="panel__body">
         {loading ? (
           <Loading label="加载组装记录" />
         ) : error ? (
           <Banner variant="danger" title="无法读取事件日志">
-            组装记录来自事件日志。读不到时不显示推测内容。
+            组装记录来自事件日志，当前读取失败，请稍后重试。
           </Banner>
         ) : records.length === 0 ? (
           <Empty
             title="没有组装记录"
-            hint="任务还没有派发过阶段，或历史记录已被清理。"
+            hint="任务还没有开始执行任何阶段，或历史记录已被清理。"
           />
         ) : (
           <div className="col" style={{ gap: 'var(--sp-3)' }}>
@@ -840,9 +840,9 @@ function ContextPackagePanel({ taskId }: { taskId: string }): JSX.Element {
                     ) : null}
                     <span className="spacer" />
                     {record.systemPromptSource === 'node' ? (
-                      <Chip>系统段来自节点自填 prompt</Chip>
+                      <Chip>系统提示词：节点自定义</Chip>
                     ) : (
-                      <Chip>系统段由 P1/P3/P4 组装</Chip>
+                      <Chip>系统提示词：默认组装</Chip>
                     )}
                     {record.contentRecorded ? <Chip variant="accent">正文已留档</Chip> : <Chip variant="off">未留正文</Chip>}
                   </div>
@@ -861,7 +861,7 @@ function ContextPackagePanel({ taskId }: { taskId: string }): JSX.Element {
                     <table className="table table--dense">
                       <thead>
                         <tr>
-                          <th style={{ width: 44 }}>分区</th>
+                          <th style={{ width: 44 }}>段</th>
                           <th>名称</th>
                           <th className="table__num">占比</th>
                           <th className="table__num">预算 token</th>
@@ -888,7 +888,7 @@ function ContextPackagePanel({ taskId }: { taskId: string }): JSX.Element {
                                 {over ? <Chip variant="danger">超支</Chip> : null}
                                 {p.truncated ? <Chip variant="warn">已截断</Chip> : null}
                                 {p.borrowed_from_reserve ? (
-                                  <Chip variant="warn">向 P5 借用 {p.borrowed_from_reserve}</Chip>
+                                  <Chip variant="warn">借用预留额度 {p.borrowed_from_reserve}</Chip>
                                 ) : null}
                                 {p.degraded.length > 0 ? (
                                   <Chip variant="warn" title={p.degraded.join('；')}>
@@ -1025,10 +1025,10 @@ function EventTimeline({
         事件时间线 · 已加载 {events.length}
         <div className="panel__head-actions">
           {unseen > 0 ? <span className="chip chip--warn">还有 {unseen} 条更新的事件未加载</span> : null}
-          {page?.has_more ? <span className="chip">内核还有更早的记录未读取</span> : null}
+          {page?.has_more ? <span className="chip">还有更早的记录未读取</span> : null}
         </div>
       </div>
-      <div className="panel__hint">按写入顺序分页拉取，每页 200 条。</div>
+      <div className="panel__hint">事件按发生顺序分页加载。</div>
       <div className="panel__body">
         <div className="row row--tight" style={{ marginBottom: 'var(--sp-2)' }}>
           <input
@@ -1063,7 +1063,7 @@ function EventTimeline({
         </div>
 
         {error ? (
-          <Banner variant="danger" title={error.unreachable ? '无法连接内核' : '无法读取事件'}>
+          <Banner variant="danger" title={error.unreachable ? '无法连接后台服务' : '无法读取事件'}>
             {error.detail}
           </Banner>
         ) : null}
@@ -1126,7 +1126,7 @@ function EventTimeline({
           </div>
         )}
         <div className="text-xs dim" style={{ marginTop: 6 }}>
-          点任意一行展开原始载荷。恢复入口在阶段的「续跑」按钮上；这里只做回看，不改变状态。
+          点任意一行展开详情；恢复入口在阶段行的「续跑」按钮上。
         </div>
       </div>
     </div>
@@ -1168,7 +1168,7 @@ function SourceDisclosure({ sources }: { sources: SourceRecord[] }): JSX.Element
   return (
     <div style={{ marginTop: 4 }}>
       <button type="button" className="btn btn--xs" onClick={() => setOpen((v) => !v)}>
-        {open ? '▾' : '▸'} 注入来源 · {sources.length}（沿引用可看到「交接了什么、来自哪里」）
+        {open ? '▾' : '▸'} 材料来源 · {sources.length}（每条材料来自哪里、交给了谁）
       </button>
       {open ? (
         <ul className="list-reset text-xs mono" style={{ marginTop: 4 }}>

@@ -55,7 +55,7 @@ export function AttentionDrawer({ onClose }: { onClose: () => void }): JSX.Eleme
         {!state.loaded ? (
           <Loading />
         ) : openApprovals.length === 0 ? (
-          <Empty title="没有等待处理的审批" hint="受保护操作在执行前会出现在这里，断连期间也不会自动通过。" />
+          <Empty title="没有等待处理的审批" hint="需要人工确认的操作在执行前会出现在这里。" />
         ) : (
           openApprovals.map((approval) => (
             <ApprovalCard
@@ -94,7 +94,7 @@ export function AttentionDrawer({ onClose }: { onClose: () => void }): JSX.Eleme
                 </div>
                 <div className="text-xs muted truncate">
                   {task.workflow_name ?? task.workflow_id} ·{' '}
-                  {task.failure_summary?.reason ?? task.blocked_reason ?? '内核未提供失败原因'}
+                  {task.failure_summary?.reason ?? task.blocked_reason ?? '未提供失败原因'}
                 </div>
               </li>
             ))}
@@ -103,7 +103,7 @@ export function AttentionDrawer({ onClose }: { onClose: () => void }): JSX.Eleme
 
         <div className="divider" />
 
-        <div className="section-title">状态不明的阶段（LOST） · {state.lostStages.length}</div>
+        <div className="section-title">状态不明的阶段 · {state.lostStages.length}</div>
         {state.lostStages.length === 0 ? (
           <div className="empty text-sm">没有无法确认状态的阶段。</div>
         ) : (
@@ -124,7 +124,7 @@ export function AttentionDrawer({ onClose }: { onClose: () => void }): JSX.Eleme
                   <ShortId id={stage.task_id} />
                 </div>
                 <div className="text-xs muted">
-                  {stage.blocked_reason ?? stage.status_reason ?? '需人工核对，系统不会盲目重放。'}
+                  {stage.blocked_reason ?? stage.status_reason ?? '无法确认该阶段的执行结果，请人工核对后再决定是否重跑。'}
                 </div>
               </li>
             ))}
@@ -135,7 +135,7 @@ export function AttentionDrawer({ onClose }: { onClose: () => void }): JSX.Eleme
 
         <div className="section-title">未清理资源 · {state.unresolvedResources.length}</div>
         {state.unresolvedResources.length === 0 ? (
-          <div className="empty text-sm">台账中没有待处理的资源。</div>
+          <div className="empty text-sm">没有待清理的资源。</div>
         ) : (
           <ul className="list-reset">
             {/* 台账字段由 `ResourceLedger.teardown_failed()` 固定：
@@ -152,13 +152,13 @@ export function AttentionDrawer({ onClose }: { onClose: () => void }): JSX.Eleme
                   </span>
                   {typeof res['owner_task_id'] === 'string' && res['owner_task_id'] ? (
                     <>
-                      {' · 归属 '}
+                      {' · 所属任务 '}
                       <a href={`#/tasks/${res['owner_task_id']}`} className="mono">
                         {res['owner_task_id'].slice(0, 8)}
                       </a>
                     </>
                   ) : (
-                    <span className="dim"> · 无归属任务</span>
+                    <span className="dim"> · 无所属任务</span>
                   )}
                 </div>
                 {typeof res['last_error'] === 'string' && res['last_error'] ? (

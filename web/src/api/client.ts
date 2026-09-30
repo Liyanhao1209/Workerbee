@@ -193,7 +193,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       kind: 'unreachable',
       status: 0,
       detail: err instanceof Error ? err.message : String(err),
-      hint: '内核可能未启动。请确认 workerbee-core 已运行并可访问。',
+      hint: '后台服务可能没有启动。请确认 workerbee-core 已运行。',
     });
   }
 

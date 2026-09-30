@@ -37,7 +37,7 @@ function RunningBranchesChip({ task }: { task: Task }): JSX.Element | null {
   const branches = asArray<string>(task.failure_summary?.running_branches);
   if (branches.length === 0) return null;
   return (
-    <Chip variant="warn" title={`尚在运行的分支（node_id）：${branches.join('、')}`}>
+    <Chip variant="warn" title={`仍在运行的分支：${branches.join('、')}`}>
       运行中分支 {branches.length}
     </Chip>
   );
@@ -96,7 +96,7 @@ export function TaskListPage(): JSX.Element {
       。换一个筛选条件试试。
     </>
   ) : (
-    '内核里还没有任何提交。到「流程」页选一个流程并提交任务。'
+    '还没有提交过任务。到「流程」页选一个流程并提交任务。'
   );
 
   return (
@@ -105,7 +105,7 @@ export function TaskListPage(): JSX.Element {
         <div className="page-head__titles">
           <h1>任务</h1>
           <div className="page-head__sub">
-            内核已接受的提交。每行显示任务 pinned 的图版本；失败或受阻的任务同时显示尚在运行的分支。
+            已提交的任务。失败或受阻的任务会同时标出仍在运行的分支。
           </div>
         </div>
       </div>
@@ -176,7 +176,7 @@ export function TaskListPage(): JSX.Element {
           <div className="panel__body">
             <Banner
               variant="danger"
-              title={error.unreachable ? '无法连接内核' : '无法获取任务列表'}
+              title={error.unreachable ? '无法连接后台服务' : '无法获取任务列表'}
               hint={
                 data
                   ? '下表是最近一次成功读取的结果，可能已经过期。'
@@ -204,13 +204,13 @@ export function TaskListPage(): JSX.Element {
                     <th>任务</th>
                     <th>流程</th>
                     <th>状态</th>
-                    <th className="table__num" title="优先级：大者先派发">
+                    <th className="table__num" title="数值大的先执行">
                       优先级
                     </th>
-                    <th className="table__num" title="提交时的流程修订号 revision_seq">
+                    <th className="table__num" title="任务提交时的流程修订号">
                       修订
                     </th>
-                    <th title="任务 pinned 的图版本，决定它按哪一版规则运行">
+                    <th title="任务提交时锁定的流程版本，任务按这一版执行">
                       规则版本
                     </th>
                     <th>提交时间</th>
@@ -294,14 +294,14 @@ export function TaskListPage(): JSX.Element {
 
             {hasMore ? (
               <div className="text-xs muted" style={{ padding: '6px var(--sp-3)' }}>
-                仅显示前 {tasks.length} 条（内核分页）
+                仅显示前 {tasks.length} 条
               </div>
             ) : null}
           </>
         ) : null}
 
         <div className="panel__hint">
-          规则版本指任务 pinned 的图版本，节点启停等后续修订不会改写它。运行中分支一栏为空可能是没有分支在跑，也可能是内核没有上报。
+          规则版本是任务提交时锁定的流程版本，之后的修改不会影响它。「运行中分支」为空表示没有分支在跑，或后台服务没有上报。
         </div>
       </div>
     </div>

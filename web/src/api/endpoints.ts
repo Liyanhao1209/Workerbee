@@ -260,8 +260,8 @@ async function listRequest<T>(path: string, key: string): Promise<T[]> {
   throw new ApiError({
     kind: 'parse',
     status: 200,
-    detail: `内核返回的列表形状无法识别（期望数组，或 {${key}: [...]} 这样的信封）`,
-    hint: '多半是内核与前端版本不一致，请对照 workerbee/server 的响应模型',
+    detail: '后台服务返回的数据格式无法识别',
+    hint: '通常是前后端版本不一致；请把后台服务和页面都更新到同一版本后重试',
   });
 }
 

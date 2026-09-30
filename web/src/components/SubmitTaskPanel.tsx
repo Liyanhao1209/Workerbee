@@ -83,7 +83,7 @@ type Mode = 'json' | 'text';
 const VALIDATION_MODE_TEXT: Record<ValidationMode, string> = {
   draft: '草稿校验',
   publish: '发布校验',
-  launch: '发射校验',
+  launch: '提交校验',
 };
 
 type PayloadBuild = { ok: true; payload: Record<string, unknown> } | { ok: false; error: string };
@@ -145,8 +145,8 @@ function renderSubmitError(
     const nodeNames = involvedNodeIds(diagnostics).map(nameOf);
     return (
       <div>
-        <Banner variant="danger" title="提交被拒绝：任务内容不可执行">
-          <div>请求本身合法，但当前定义图/配置不可执行。下面每条都能定位到具体节点或连线。</div>
+        <Banner variant="danger" title="提交被拒绝：当前流程无法执行">
+          <div>流程的定义或配置有问题，暂时无法执行。下面列出了具体原因，点击可定位到对应的节点或连线。</div>
           {report ? (
             <div className="text-xs" style={{ marginTop: 2 }}>
               校验模式：{VALIDATION_MODE_TEXT[report.mode]}（{report.mode}）
@@ -154,8 +154,7 @@ function renderSubmitError(
           ) : null}
           {nodeNames.length > 0 ? (
             <div className="text-xs" style={{ marginTop: 2 }}>
-              本次拒绝涉及节点：{nodeNames.join('、')}
-            </div>
+              涉及节点：{nodeNames.join('、')}            </div>
           ) : null}
           {diagnostics.length === 0 ? (
             <div style={{ marginTop: 2 }}>
@@ -173,7 +172,7 @@ function renderSubmitError(
   return (
     <Banner
       variant="danger"
-      title={error.unreachable ? '无法连接内核' : '提交失败'}
+      title={error.unreachable ? '无法连接后台服务' : '提交失败'}
       hint={error.hint ?? undefined}
     >
       {error.detail}
@@ -196,12 +195,12 @@ function renderSubmitResult(
         <Banner
           variant="info"
           title="提交已接受"
-          hint="内核没有返回 created，无法判断本次是新建任务还是命中已有提交。"
+          hint="无法确认这次是新建了任务，还是匹配到了之前的提交。"
         />
       )}
       {!result.accepted ? (
         <Banner variant="danger" title="提交未被接受">
-          内核没有为这次提交创建任务。以下是可定位的原因。
+          这次提交没有创建任务，原因如下（点击可定位到对应位置）。
         </Banner>
       ) : null}
       {taskId ? (
@@ -214,12 +213,12 @@ function renderSubmitResult(
         </div>
       ) : (
         <div className="text-sm dim" style={{ marginBottom: 'var(--sp-2)' }}>
-          内核没有返回任务 ID。
+          未返回任务 ID。
         </div>
       )}
       {result.report ? (
         <div style={{ marginTop: 'var(--sp-2)' }}>
-          <div className="section-title">内核校验结论 · {result.report.diagnostics.length}</div>
+          <div className="section-title">校验结果 · {result.report.diagnostics.length}</div>
           <DiagnosticsGrouped diagnostics={result.report.diagnostics} onLocate={onLocate} />
         </div>
       ) : null}
@@ -342,7 +341,7 @@ export function SubmitTaskPanel({
       {mode === 'json' ? (
         <Field
           label="输入内容（JSON 对象）"
-          hint="原样作为内核的 input_payload 提交；留空表示提交空对象 {}。"
+          hint="将作为任务输入原样提交；留空表示提交空对象 {}。"
           error={jsonError}
         >
           <textarea
@@ -370,8 +369,7 @@ export function SubmitTaskPanel({
           label="输入内容（纯文本）"
           hint={
             <span>
-              提交时打包成 <code className="mono">{'{ "text": "…" }'}</code> ——内核的 input_payload 是 JSON
-              对象，没有裸字符串形式。
+              提交时会打包成 <code className="mono">{'{ "text": "…" }'}</code> 的形式。
             </span>
           }
           error={jsonError}
@@ -414,7 +412,7 @@ export function SubmitTaskPanel({
         </Field>
         <Field
           label="优先级（0–100）"
-          hint="数值越大越先执行；同一节点队列内按 (node_priority, task_priority, enqueued_at) 排序。"
+          hint="数值越大越先执行；同一节点的队列里，依次按节点优先级、任务优先级、提交先后排序。"
           error={priorityError}
         >
           <input
@@ -435,14 +433,14 @@ export function SubmitTaskPanel({
       </div>
 
       <div>
-        <div className="section-title">发射前预检（本地提示，内核才是权威）</div>
+        <div className="section-title">提交前检查（本地预检，以实际提交结果为准）</div>
         {graph === null ? (
-          <div className="text-sm dim">无法读取当前图，跳过入口预检</div>
+          <div className="text-sm dim">无法读取当前流程图，跳过入口检查</div>
         ) : entries.length === 0 ? (
           <Banner
             variant="warn"
-            title="当前没有可执行的入口节点，内核会拒绝这次提交。"
-            hint="入口 = 已启用、且没有来自已启用节点的入边的节点；停用节点会被绕过，请检查节点启停状态。"
+            title="当前没有可执行的入口节点，提交会被拒绝。"
+            hint="入口节点是「已启用、且没有已启用的上游节点」的节点。请检查各节点的启用状态。"
           />
         ) : (
           <div className="row row--tight">
@@ -470,7 +468,7 @@ export function SubmitTaskPanel({
         </button>
         {submit.busy ? <span className="text-sm muted">正在提交…</span> : null}
         <span className="spacer" />
-        <span className="text-xs dim">内核会对整张图做发射校验；被拒绝时下面给的是可定位的结论。</span>
+        <span className="text-xs dim">提交时会对整个流程做检查；如果被拒绝，下面会列出具体原因，点击可定位。</span>
       </div>
     </div>
   );

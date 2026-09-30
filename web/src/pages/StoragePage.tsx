@@ -67,7 +67,7 @@ function GenericValue({ name, value }: { name: string; value: unknown }): JSX.El
   }
   if (value === undefined) {
     return (
-      <span className="dim" title="内核未返回该值">
+      <span className="dim" title="后台服务没有返回这个值">
         —
       </span>
     );
@@ -94,10 +94,7 @@ function GenericValue({ name, value }: { name: string; value: unknown }): JSX.El
 function KeyValueTable({ what, rows }: { what: string; rows: [string, unknown][] }): JSX.Element {
   if (rows.length === 0) {
     return (
-      <Empty
-        title={`内核未返回「${what}」的任何字段`}
-        hint="前端不假设键名，也不编造缺省值；这里只显示内核真正给了什么。"
-      />
+      <Empty title={`没有「${what}」的数据`} hint="后台服务没有返回这部分数据。" />
     );
   }
   return (
@@ -182,10 +179,10 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
   const notifierDropped = numField(nested(status, 'notifier_dropped'));
 
   const accessBoundary = status.loopback_only
-    ? '仅本机（loopback）'
+    ? '仅本机'
     : status.allow_remote
-      ? '已开放远端访问，注意 UI-02'
-      : '既未限定本机、也未声明开放远端——以内核声明为准';
+      ? '已开放远端访问，请确认这是有意的'
+      : '未明确限定访问范围，以启动配置为准';
 
   return (
     <div className="col" style={{ gap: 'var(--sp-3)' }}>
@@ -216,7 +213,7 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
 
       <KV
         items={[
-          { k: '内核版本', v: <span className="mono">{status.version}</span> },
+          { k: '后台服务版本', v: <span className="mono">{status.version}</span> },
           {
             k: '数据目录',
             v: (
@@ -240,18 +237,18 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
             ) : (
               <span>
                 <span className="text-warn">未解锁</span>
-                <span className="text-xs muted">。引用凭据的节点会明确报错，不会匿名运行。</span>
+                <span className="text-xs muted">。使用凭据的阶段会报错；启动后台服务时提供口令即可解锁。</span>
               </span>
             ),
           },
-          { k: 'harness 附加', v: status.harness_attached ? '已附加' : '未附加' },
+          { k: 'harness 连接', v: status.harness_attached ? '已连接' : '未连接' },
           { k: '访问边界', v: accessBoundary },
           {
             k: '调度器',
-            v: schedulerEnabled === null ? '未知' : schedulerEnabled ? '已装配' : '未装配',
+            v: schedulerEnabled === null ? '未知' : schedulerEnabled ? '已启动' : '未启动',
           },
           {
-            k: '调度轮询间隔',
+            k: '调度检查间隔',
             v:
               pollInterval === null ? (
                 <span className="dim">未知</span>
@@ -260,7 +257,7 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
               ),
           },
           {
-            k: '清理器间隔',
+            k: '自动清理间隔',
             v:
               reaperInterval === null ? (
                 <span className="dim">未知</span>
@@ -270,26 +267,26 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
           },
           { k: '产物回收', v: artifactGc === null ? '未知' : artifactGc ? '已启用' : '未启用' },
           { k: '已连接的页面数', v: <CountOrUnknown value={notifierSubscribers} /> },
-          { k: '丢弃的推送数', v: <CountOrUnknown value={notifierDropped} /> },
+          { k: '丢失的实时更新数', v: <CountOrUnknown value={notifierDropped} /> },
         ]}
       />
 
       {schedulerEnabled === false ? (
-        <Banner variant="warn" title="调度循环未装配">
-          任务不会自动推进，排队与就绪阶段会一直停在那里。
+        <Banner variant="warn" title="任务调度没有启动">
+          任务不会自动推进，排队中的阶段会一直停在那里。
         </Banner>
       ) : null}
 
       {notifierDropped !== null && notifierDropped > 0 ? (
-        <Banner variant="warn" title="有客户端跟不上推送">
-          有客户端跟不上推送，重连后靠 REST 拉真实状态。
+        <Banner variant="warn" title="部分实时更新被丢弃">
+          有页面接收更新太慢，部分推送被丢弃。刷新页面即可看到最新状态。
         </Banner>
       ) : null}
 
       <div>
         <div className="section-title">计数</div>
         <div className="row" style={{ gap: 'var(--sp-5)' }}>
-          <Stat label="存活任务" value={numField(nested(counts, 'live_tasks'))} title="counts.live_tasks" />
+          <Stat label="未结束任务" value={numField(nested(counts, 'live_tasks'))} title="counts.live_tasks" />
           <Stat
             label="运行中阶段"
             value={numField(nested(counts, 'running_stages'))}
@@ -310,11 +307,11 @@ function SystemPanel({ status }: { status: SystemStatus }): JSX.Element {
       </div>
 
       <div>
-        <div className="section-title">清理器上次运行</div>
+        <div className="section-title">上次自动清理</div>
         {lastRun === null ? (
           <div className="text-sm dim">尚未运行</div>
         ) : (
-          <KeyValueTable what="reaper.last_run" rows={Object.entries(lastRun)} />
+          <KeyValueTable what="上次自动清理" rows={Object.entries(lastRun)} />
         )}
       </div>
     </div>
@@ -357,7 +354,7 @@ export function StoragePage(): JSX.Element {
   const keepLastValue = keepLastInvalid ? 0 : keepLastNum;
 
   const formError: string | null = conflict
-    ? '二者互斥：task_id 与 older_than 只能填一个'
+    ? '「任务 ID」和「早于此时间」只能填一个'
     : olderThanInvalid
       ? '时间无效，请重新选择'
       : keepLastInvalid
@@ -445,7 +442,7 @@ export function StoragePage(): JSX.Element {
         <div className="page-head__titles">
           <h1>存储与清理</h1>
           <div className="page-head__sub">
-            部署形态、运行提示与数据占用。手动清理只能从这一页发起，默认只做预览。
+            后台服务的运行状态与数据占用。在这里手动清理历史数据，默认只预览、不删除。
           </div>
         </div>
         <div className="page-head__actions">
@@ -469,7 +466,7 @@ export function StoragePage(): JSX.Element {
           <div className="panel__body">
             <Banner
               variant="danger"
-              title={statusState.error.unreachable ? '无法连接内核' : '无法获取系统状态'}
+              title={statusState.error.unreachable ? '无法连接后台服务' : '无法获取系统状态'}
               hint={
                 statusState.data
                   ? '下列内容是最近一次成功读取的结果，可能已经过期。'
@@ -502,7 +499,7 @@ export function StoragePage(): JSX.Element {
           存储占用
           <span className="panel__head-actions">
             {fromPrune ? (
-              <span className="text-xs muted" title="来自最近一次清理响应内附的 storage">
+              <span className="text-xs muted" title="包含最近一次清理后的数据">
                 含最近一次清理结果
               </span>
             ) : (
@@ -521,7 +518,7 @@ export function StoragePage(): JSX.Element {
           <div className="panel__body">
             <Banner
               variant="danger"
-              title={error.unreachable ? '无法连接内核' : '无法获取存储报告'}
+              title={error.unreachable ? '无法连接后台服务' : '无法获取存储报告'}
               hint={data ? '下表是最近一次成功读取的结果，可能已经过期。' : (error.hint ?? undefined)}
               actions={
                 <button type="button" className="btn btn--sm" onClick={refreshAll}>
@@ -537,16 +534,8 @@ export function StoragePage(): JSX.Element {
         {report ? (
           <div className="panel__body">
             <div className="grid grid--2">
-              <StorageSection
-                title="数据库"
-                data={database}
-                hint="键集未在前端契约中固定：这里原样列出内核返回的每一个键，不挑字段、不猜键名。"
-              />
-              <StorageSection
-                title="产物"
-                data={artifacts}
-                hint="同上。字节量按原始字节数换算显示，对象与数组原样展开。"
-              />
+              <StorageSection title="数据库" data={database} />
+              <StorageSection title="产物" data={artifacts} />
             </div>
 
             <div className="divider" />
@@ -558,24 +547,23 @@ export function StoragePage(): JSX.Element {
             </div>
             {unresolved !== null && unresolved > 0 ? (
               <Banner variant="warn" title={`有 ${unresolved.toLocaleString('zh-CN')} 项资源未清理`}>
-                这些是拆除失败、或归属无法确认的资源。它们会一直显示在这里，直到被处理——
-                界面不会把它们藏起来，这个计数也不表示它们已经被回收。
+                这些是删除失败、或归属无法确认的资源，需要人工处理；处理前会一直显示在这里。
               </Banner>
             ) : null}
 
             <div style={{ marginTop: 'var(--sp-3)' }}>
-              <div className="section-title">上次清理（last_run）</div>
+              <div className="section-title">上次清理</div>
               {lastRun === null ? (
                 <div className="text-sm dim">尚未运行</div>
               ) : (
-                <KeyValueTable what="last_run" rows={Object.entries(lastRun)} />
+                <KeyValueTable what="上次清理" rows={Object.entries(lastRun)} />
               )}
             </div>
           </div>
         ) : null}
 
         {!report && loaded && !error ? (
-          <Empty title="内核未返回存储报告" hint="没有数据时这里保持为空，不显示编造的占用数字。" />
+          <Empty title="没有读到存储数据" hint="后台服务没有返回存储数据，请稍后刷新重试。" />
         ) : null}
       </div>
 
@@ -593,15 +581,15 @@ export function StoragePage(): JSX.Element {
                 仅预览（不删除）
               </label>
               <div className="text-xs muted" style={{ marginTop: 2 }}>
-                <span className="mono">dry_run = true</span>：内核只回报「将要删除什么」，不改动任何数据。
+                <span className="mono">dry_run = true</span>：只列出将要删除的内容，不改动任何数据。
               </div>
             </div>
 
             <div className="field-row">
               <Field
                 label="任务 ID（task_id，可选）"
-                hint="按任务清理其事件历史；留空即不按任务限定"
-                error={conflict ? '二者互斥：已填 older_than，请清空其中一项' : undefined}
+                hint="只清理该任务的历史记录；留空则不按任务限定"
+                error={conflict ? '与「早于此时间」只能填一个，请清空其中一项' : undefined}
               >
                 <input
                   className="input input--mono"
@@ -627,9 +615,9 @@ export function StoragePage(): JSX.Element {
 
               <Field
                 label="早于此时间（older_than）"
-                hint="时间界，与 task_id 互斥；按本机时区填写，发送时转成 ISO"
+                hint="只清理早于该时间的记录；与任务 ID 只能填一个"
                 error={
-                  conflict ? '二者互斥：已填 task_id，请清空其中一项' : olderThanInvalid ? '时间无效' : undefined
+                  conflict ? '与「任务 ID」只能填一个，请清空其中一项' : olderThanInvalid ? '时间无效' : undefined
                 }
               >
                 <input
@@ -643,7 +631,7 @@ export function StoragePage(): JSX.Element {
 
             {olderThanIso ? (
               <div className="text-xs dim">
-                将发送 <span className="mono">older_than = {olderThanIso}</span>
+                实际生效的时间界（UTC）：<span className="mono">{olderThanIso}</span>
               </div>
             ) : null}
 
@@ -654,7 +642,7 @@ export function StoragePage(): JSX.Element {
                   checked={includeOrphans}
                   onChange={(e) => setIncludeOrphans(e.target.checked)}
                 />
-                顺带跑一轮孤儿进程／句柄对账
+                同时清理没有归属的进程和资源
               </label>
               <label className="check">
                 <input
@@ -670,10 +658,10 @@ export function StoragePage(): JSX.Element {
                   checked={includeUnreferenced}
                   onChange={(e) => setIncludeUnreferenced(e.target.checked)}
                 />
-                连同未标记删除的零引用产物一并回收
+                同时回收未被任何任务引用的产物（包括未标记删除的）
               </label>
               <div className="text-xs text-warn">
-                更激进——连未标记删除的零引用产物一并回收；仍会拒绝清理被活跃任务引用的数据。
+                范围更大：未被引用的产物即使没标记删除也会回收；仍被任务使用的数据不会被清理。
               </div>
             </div>
 
@@ -693,7 +681,7 @@ export function StoragePage(): JSX.Element {
             <ErrorBanner error={submit.error} />
 
             <div className="text-xs dim">
-              实际删除范围以内核返回的 <span className="mono">actions</span> 为准——下方逐条列出，不由前端推断。
+              实际删除了什么，以下方结果列表为准。
             </div>
           </div>
         </div>
@@ -714,8 +702,8 @@ export function StoragePage(): JSX.Element {
 
           {result.actions.length === 0 ? (
             <Empty
-              title="内核没有返回任何动作"
-              hint="没有需要清理的内容，或内核认为本次参数下没有可清理项。"
+              title="没有可清理的内容"
+              hint="当前条件下没有需要清理的数据。"
             />
           ) : (
             <div className="table-wrap">
@@ -755,7 +743,7 @@ export function StoragePage(): JSX.Element {
           <div className="panel__body">
             <div className="section-title">说明（notes）</div>
             {result.notes.length === 0 ? (
-              <div className="text-sm dim">内核未返回说明。</div>
+              <div className="text-sm dim">没有更多说明。</div>
             ) : (
               <ul className="list-reset text-sm">
                 {result.notes.map((note, index) => (
@@ -766,7 +754,7 @@ export function StoragePage(): JSX.Element {
               </ul>
             )}
             <div className="text-xs dim" style={{ marginTop: 'var(--sp-2)' }}>
-              上方「存储占用」已按本次响应内附的报告刷新，未额外重取。
+              上方「存储占用」已更新为清理后的数据。
             </div>
           </div>
         </div>
@@ -774,7 +762,7 @@ export function StoragePage(): JSX.Element {
 
       {confirming ? (
         <Modal
-          title="确认真实清理（dry_run = false）"
+          title="确认执行清理"
           onClose={() => setConfirming(false)}
           footer={
             <>
@@ -793,18 +781,16 @@ export function StoragePage(): JSX.Element {
           }
         >
           <Banner variant="danger" title="这一步真的会删数据">
-            以下参数将原样发送给内核 <span className="mono">POST /api/storage/prune</span>。删除不可撤销，
-            也不会先进回收站。
+            将按下面的设置永久删除数据，不可撤销。
           </Banner>
           <KV items={confirmItems} />
           <div className="text-xs muted" style={{ marginTop: 'var(--sp-3)' }}>
-            内核对每类数据的处理规则以返回的 <span className="mono">actions</span> 为准；执行后会在本页
-            「已执行的动作」下列出实际删除了什么。
+            执行后会在本页「已执行的动作」中列出实际删除了什么。
           </div>
           {includeUnreferenced ? (
             <div style={{ marginTop: 'var(--sp-3)' }}>
-              <Banner variant="warn" title="已启用最彻底的产物回收">
-                连没有被标记删除的零引用产物也会被回收。仍被活跃任务引用的数据不会被清理。
+              <Banner variant="warn" title="产物回收范围最大">
+                没有被引用的产物即使未标记删除也会被回收；仍被任务使用的数据不受影响。
               </Banner>
             </div>
           ) : null}

@@ -75,7 +75,7 @@ export function SessionConsole({
         await poll();
       } else {
         // 送达失败要说清是为什么，不能只把输入框清空让用户以为发出去了。
-        setSendNote({ ok: false, text: result.reason ?? '内核没有接受这条消息。' });
+        setSendNote({ ok: false, text: result.reason ?? '后台服务没有接受这条消息。' });
       }
     } catch (err) {
       setSendNote({
@@ -124,14 +124,14 @@ export function SessionConsole({
         </div>
 
         {error ? (
-          <Banner variant="danger" title={error.unreachable ? '无法连接内核' : '无法读取会话状态'}>
+          <Banner variant="danger" title={error.unreachable ? '无法连接后台服务' : '无法读取会话状态'}>
             {error.detail}
           </Banner>
         ) : null}
 
         {info && !info.readable ? (
           <Banner variant="warn" title="这个会话已经不在运行">
-            {info.reason ?? '内核没有给出说明。'}
+            {info.reason ?? '服务没有给出具体原因。'}
           </Banner>
         ) : null}
 
@@ -150,7 +150,7 @@ export function SessionConsole({
             ) : null}
           </div>
           <div className="panel__hint">
-            只包含本次内核进程内产出的内容，会话结束后不再保留。已结束的尝试请到任务详情页看事件时间线与产物。
+            这里只显示当前服务运行期间产生的输出，会话结束后不再保留。已结束的执行请到任务详情页查看事件时间线与产物。
           </div>
           <div className="panel__body">
             {!info ? (
@@ -187,7 +187,7 @@ export function SessionConsole({
 
         <Field
           label="发一条消息"
-          hint="只投递首轮之后的消息：首轮输入已在创建会话时交付，重复投递会让同一条指令执行两遍。"
+          hint="发送给正在运行的会话的追加消息。首条指令已在任务启动时发出，请勿重复发送，否则同一条指令会被执行两遍。"
         >
           <textarea
             className="input"

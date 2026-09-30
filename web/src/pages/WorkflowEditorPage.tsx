@@ -208,7 +208,7 @@ export function WorkflowEditorPage(): JSX.Element {
       setBaseSeq(result.revision_seq);
       setSaveNote(
         publish
-          ? `已发布修订 #${result.revision_seq}（有效图版本 ${result.effective_graph_version}）。在途任务不受影响，它们用的是发射时 pinned 的快照。`
+          ? `已发布修订 #${result.revision_seq}。正在运行的任务不受影响，仍按各自启动时的版本执行。`
           : `已保存草稿修订 #${result.revision_seq}，尚未发布。`,
       );
       revisions.reload();
@@ -318,7 +318,7 @@ export function WorkflowEditorPage(): JSX.Element {
                 <>
                   {' · '}
                   {REVISION_SOURCE_LABELS[baseRevision.source]}
-                  {' · 有效图版本 '}
+                  {' · 图版本 '}
                   {baseRevision.effective_graph_version}
                   {baseRevision.is_published ? ' · 已发布版本' : ' · 草稿版本（未发布）'}
                 </>
@@ -408,13 +408,13 @@ export function WorkflowEditorPage(): JSX.Element {
 
         {workflow.data?.status === 'archived' ? (
           <Banner variant="warn" title="该流程已归档">
-            归档流程仍可查看与派生修订；提交新任务前请确认这是你要的版本。
+            归档后仍可查看和继续修改；提交新任务前请确认这是你要用的流程。
           </Banner>
         ) : null}
 
         {baseRevision && !baseRevision.is_published ? (
-          <Banner variant="warn" title="当前基点是一个未发布的草稿修订">
-            提交任务时内核按已发布版本发射。若这里有改动尚未发布，任务看到的是上一个已发布版本。
+          <Banner variant="warn" title="当前修改尚未发布">
+            提交任务时执行的是已发布的版本。如果这里有改动还没发布，新任务用的仍是上一个已发布版本。
           </Banner>
         ) : null}
 
@@ -507,7 +507,7 @@ export function WorkflowEditorPage(): JSX.Element {
               pointerEvents: 'none',
             }}
           >
-            这是定义图：停用节点仍在这里可编辑，但**不参与执行**；执行时真正的依赖由内核按启用集合派生。
+            这是流程的定义图：停用的节点仍在这里可编辑，但**不参与执行**；执行时的实际依赖按各节点的启用状态计算。
           </div>
         </div>
 
@@ -619,7 +619,7 @@ export function WorkflowEditorPage(): JSX.Element {
             {report ? (
               <>
                 <span className="chip">
-                  {report.mode === 'publish' ? '发布校验' : report.mode === 'launch' ? '发射校验' : '草稿校验'}
+                  {report.mode === 'publish' ? '发布校验' : report.mode === 'launch' ? '提交校验' : '草稿校验'}
                 </span>
                 <span className="chip">
                   错误 {report.diagnostics.filter((d) => d.severity === 'error').length}
@@ -659,7 +659,7 @@ export function WorkflowEditorPage(): JSX.Element {
           onApplied={(result) => {
             setLastToggleNote(
               result.awaiting_drain
-                ? `节点「${toggleAsk.name}」已进入排水：在途阶段跑完之前启用状态尚未翻转。`
+                ? `节点「${toggleAsk.name}」将在正在运行的阶段跑完后正式停用。`
                 : result.applied
                   ? `节点「${toggleAsk.name}」的启用状态已变更${result.new_revision_seq !== null ? `，新修订 #${result.new_revision_seq}` : ''}。`
                   : `节点「${toggleAsk.name}」的启停请求已受理，但状态尚未翻转。`,
@@ -831,8 +831,8 @@ function RevisionList({
   return (
     <div className="col" style={{ gap: 6 }}>
       <div className="text-xs dim">
-        修订是不可变的：编辑产生新修订，在途任务仍按发射时 pinned 的快照执行。
-        「载入」把某一版读进画布作为新的编辑起点（不改服务端）。
+        每次保存都会产生一个新版本，旧版本不会被修改；已在运行的任务仍按各自启动时的版本执行。
+        「载入」把某一版读进画布作为新的编辑起点（不会改动服务端）。
       </div>
       {revisions.map((rev) => (
         <div
@@ -854,9 +854,9 @@ function RevisionList({
             <TimeText value={rev.created_at} />
           </div>
           <div className="text-xs dim" style={{ marginTop: 2 }}>
-            {REVISION_SOURCE_LABELS[rev.source]} · 有效图版本 {rev.effective_graph_version} ·{' '}
+            {REVISION_SOURCE_LABELS[rev.source]} · 图版本 {rev.effective_graph_version} ·{' '}
             {rev.graph.nodes.length} 节点 · {rev.graph.edges.length} 边
-            {rev.draft_of !== null ? ` · 派生自 #${rev.draft_of}` : ''}
+            {rev.draft_of !== null ? ` · 基于 #${rev.draft_of}` : ''}
           </div>
           {rev.note ? <div className="text-xs muted" style={{ marginTop: 2 }}>{rev.note}</div> : null}
           <div className="row row--tight" style={{ marginTop: 4 }}>

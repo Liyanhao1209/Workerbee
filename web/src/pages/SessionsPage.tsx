@@ -42,7 +42,7 @@ import { SessionConsole } from '../components/SessionConsole';
  * 或者循环卡住了——两种都值得看一眼。这个阈值是常数，不是凭感觉定的。
  */
 const HEARTBEAT_STALE_MS = 60_000;
-const HEARTBEAT_INTERVAL_NOTE = 'supervisor 每 5 秒刷一次心跳，超过 60 秒未刷新即标记';
+const HEARTBEAT_INTERVAL_NOTE = '后台服务每 5 秒更新一次心跳，超过 60 秒未更新即标记为停滞';
 
 function normalizeSession(raw: unknown): SessionRecord | null {
   if (!isRecord(raw)) return null;
@@ -77,14 +77,14 @@ function SessionStatePill({ state }: { state: string }): JSX.Element {
   const known = SESSION_STATE_LABELS[state];
   if (known) {
     return (
-      <Pill tone={known.tone} title={`台账取值 ${state}`}>
+      <Pill tone={known.tone} title={`原始状态值：${state}`}>
         {known.text}
       </Pill>
     );
   }
   // 未收录的取值：原样显示，不猜。
   return (
-    <Pill tone="idle" title={`台账里的取值 ${state || '（空）'}，本界面未收录，故原样显示`}>
+    <Pill tone="idle" title={`无法识别的状态值 ${state || '（空）'}，按原始内容显示`}>
       {state || '（空）'}
     </Pill>
   );
@@ -92,15 +92,15 @@ function SessionStatePill({ state }: { state: string }): JSX.Element {
 
 function HeartbeatCell({ row }: { row: SessionRecord }): JSX.Element {
   if (!row.last_heartbeat) {
-    return <span className="dim" title="台账里没有心跳时间">无心跳记录</span>;
+    return <span className="dim" title="该会话没有心跳时间记录">无心跳记录</span>;
   }
   const ms = parseExplicitTs(row.last_heartbeat);
   if (ms === null) {
     // 时间戳没带时区：只展示，不判定。
     return (
-      <span title={`该时间戳未带时区，按原样显示：${row.last_heartbeat}`}>
+      <span title={`心跳时间未带时区信息，无法判断是否停滞：${row.last_heartbeat}`}>
         <TimeText value={row.last_heartbeat} />
-        <span className="text-xs dim"> · 未带时区，不判定是否停滞</span>
+        <span className="text-xs dim"> · 时间未带时区，无法判断是否停滞</span>
       </span>
     );
   }
@@ -181,7 +181,7 @@ export function SessionsPage(): JSX.Element {
     setParams(next, { replace: true });
   };
 
-  if (loading && !loaded) return <Loading label="读取会话台账" />;
+  if (loading && !loaded) return <Loading label="读取会话列表" />;
 
   return (
     <div className="page">
@@ -189,9 +189,9 @@ export function SessionsPage(): JSX.Element {
         <div className="page-head__titles">
           <h1>会话</h1>
           <div className="page-head__sub">
-            来自会话台账 <span className="mono">GET /api/sessions</span>
-            （只读）。这里回答排障时最常问的问题：「这次任务还连着哪个 session、它还活着吗」。
-            台账落在库里，因此内核重启后这些记录仍然可查。
+            这里列出各任务正在使用的会话（只读，来自 <span className="mono">GET /api/sessions</span>），
+            用来回答排障时最常问的两个问题：这次任务连着哪个会话、它还在不在。
+            记录保存在数据库中，后台服务重启后仍可查询。
           </div>
         </div>
         <div className="page-head__actions">
@@ -204,7 +204,7 @@ export function SessionsPage(): JSX.Element {
       {error ? (
         <Banner
           variant="danger"
-          title={error.unreachable ? '无法连接内核' : '无法读取会话台账'}
+          title={error.unreachable ? '无法连接后台服务' : '无法读取会话列表'}
           hint={error.hint}
           actions={
             <button type="button" className="btn btn--sm" onClick={reload}>
@@ -215,22 +215,22 @@ export function SessionsPage(): JSX.Element {
           {error.detail}
           {error.kind === 'not_found' ? (
             <div className="text-xs" style={{ marginTop: 4 }}>
-              内核没有返回会话列表。这里报「读不到」，不显示成「没有会话」。
+              后台服务没有返回会话列表，请稍后重试。若持续失败，请检查服务状态。
             </div>
           ) : null}
         </Banner>
       ) : null}
 
       {systemStatus && systemStatus.session_hosting === 'in_process' ? (
-        <Banner variant="warn" title="会话托管：内核内进程（in_process）">
-          harness 会话由内核自己持有，内核重启会打断在途会话，台账里标着「存活」的记录届时会变成失联。
-          需要跨重启保活，请改用独立的 supervisor 进程。
+        <Banner variant="warn" title="当前为单进程运行模式">
+          会话由主服务进程直接运行，主服务重启会中断正在运行的会话。
+          如需服务重启后会话不受影响，请改用独立后台服务模式运行。
         </Banner>
       ) : null}
 
       <div className="panel">
         <div className="panel__head">
-          台账
+          会话列表
           <span className="chip">共 {rows.length}</span>
           <span className="chip chip--accent">存活 {alive}</span>
           {lost > 0 ? <span className="chip chip--danger">已失联 {lost}</span> : null}
@@ -290,10 +290,10 @@ export function SessionsPage(): JSX.Element {
 
         {error ? null : filtered.length === 0 ? (
           <Empty
-            title={rows.length === 0 ? '台账里还没有会话记录' : '当前筛选下没有匹配的会话'}
+            title={rows.length === 0 ? '还没有会话记录' : '当前筛选下没有匹配的会话'}
             hint={
               rows.length === 0
-                ? '任务开始执行、harness 创建会话之后，这里会出现记录。台账为空也可能是任务还在排队。'
+                ? '任务开始执行、harness 创建会话之后，这里会出现记录。也可能是任务还在排队等待执行。'
                 : '换个状态或归属再试。'
             }
           />
@@ -332,7 +332,7 @@ export function SessionsPage(): JSX.Element {
                           <ShortId id={row.owner_task_id} />
                         </a>
                       ) : (
-                        <Chip variant="warn" title="台账里没有归属任务：可能是内核/监督进程启动前的残留，或是任务删除后未回收">
+                        <Chip variant="warn" title="该会话没有关联的任务">
                           无归属任务
                         </Chip>
                       )}
@@ -374,8 +374,8 @@ export function SessionsPage(): JSX.Element {
         )}
 
         <div className="panel__hint">
-          「已失联」表示监督进程确认该会话已经不在，不能再复用；对应阶段会走重试或对账。
-          心跳只说明进程还在，不说明任务在推进，进展请看执行图里的阶段状态与事件时间线。
+          「已失联」表示后台服务确认该会话已不存在，不能再使用；对应阶段会自动重试。
+          心跳正常只说明进程还在，不代表任务在推进；进展请看任务详情页的阶段状态与事件时间线。
         </div>
       </div>
 

@@ -87,25 +87,25 @@ export function ToggleFlow({
       >
         <div className="tristate" style={{ marginBottom: 'var(--sp-3)' }}>
           <div className={`tristate__cell tristate__cell--${result.applied ? 'yes' : 'no'}`}>
-            <div className="tristate__label">启用状态已翻转</div>
-            <div className="tristate__value">{result.applied ? '已应用' : '等待排水'}</div>
+            <div className="tristate__label">启停状态</div>
+            <div className="tristate__value">{result.applied ? '已生效' : '等待生效'}</div>
             {result.new_revision_seq !== null ? (
               <div className="text-xs dim">新修订 #{result.new_revision_seq}</div>
             ) : null}
           </div>
           <div className={`tristate__cell tristate__cell--${result.awaiting_drain ? 'no' : 'yes'}`}>
-            <div className="tristate__label">存量任务处理</div>
+            <div className="tristate__label">进行中的阶段</div>
             <div className="tristate__value">
-              {result.awaiting_drain ? '仍在排水' : mode === 'drain' ? '排水已完成' : '已立即撤回'}
+              {result.awaiting_drain ? '仍在运行，等跑完' : mode === 'drain' ? '已全部跑完' : '已立即取消'}
             </div>
-            <div className="text-xs dim">策略：{result.mode === 'immediate' ? '立即撤回' : '排水'}</div>
+            <div className="text-xs dim">处理方式：{result.mode === 'immediate' ? '立即取消' : '等跑完再停用'}</div>
           </div>
         </div>
 
         {result.awaiting_drain ? (
-          <Banner variant="warn" title="排水进行中">
-            在途阶段跑完之前，该节点的启用状态尚未翻转——这样不会丢弃已经完成的工作。
-            完成后会再产生一次修订。此期间该节点不再领取新阶段。
+          <Banner variant="warn" title="停用等待生效">
+            这个节点上还有正在运行的阶段，等它们跑完后节点才会正式停用，已完成的工作不会丢弃。
+            在此期间该节点不再接手新阶段；停用生效后流程会产生一个新版本。
           </Banner>
         ) : null}
 
@@ -129,10 +129,10 @@ export function ToggleFlow({
           </div>
         ) : null}
 
-        <EdgeDeltaList title="新增的有效依赖边" edges={result.added_edges} tone="accent" />
-        <EdgeDeltaList title="消失的有效依赖边" edges={result.removed_edges} tone="warn" />
-        <IdList title="被排水（跑完为止）的阶段" ids={result.drained_stages} />
-        <IdList title="被立即撤回（走取消链）的阶段" ids={result.withdrawn_stages} tone="danger" />
+        <EdgeDeltaList title="新增的依赖连线" edges={result.added_edges} tone="accent" />
+        <EdgeDeltaList title="消失的依赖连线" edges={result.removed_edges} tone="warn" />
+        <IdList title="等跑完再停的阶段" ids={result.drained_stages} />
+        <IdList title="被立即取消的阶段" ids={result.withdrawn_stages} tone="danger" />
         <IdList title="重新启用后回到队列的阶段" ids={result.revived_stages} tone="accent" />
 
         {result.warnings.length > 0 ? (
@@ -173,19 +173,19 @@ export function ToggleFlow({
             className={enabling ? 'btn btn--primary' : 'btn btn--danger'}
             disabled={submit.busy || preview === null || noEntry}
             onClick={() => void apply()}
-            title={noEntry ? '停用后没有有效入口，内核会拒绝执行' : undefined}
+            title={noEntry ? '停用后流程没有可执行的入口，无法停用' : undefined}
           >
-            {enabling ? '确认启用' : mode === 'immediate' ? '确认停用（立即撤回）' : '确认停用（排水）'}
+            {enabling ? '确认启用' : mode === 'immediate' ? '确认停用（立即取消）' : '确认停用（等跑完再停）'}
           </button>
         </>
       }
     >
-      <Banner variant="info" title="这一步不改变任何状态">
-        下面是内核按当前启用集合派生的有效图差异。确认之后才会真正写入。
+      <Banner variant="info" title="这一步只是预览，不会改动任何内容">
+        下面是这次操作对流程结构和进行中任务的影响，确认之后才会真正生效。
       </Banner>
 
       {previewError ? (
-        <Banner variant="danger" title={previewError.unreachable ? '无法连接内核' : '无法获取预览'}>
+        <Banner variant="danger" title={previewError.unreachable ? '无法连接后台服务' : '无法获取预览'}>
           {previewError.detail}
           <div style={{ marginTop: 6 }}>
             <button type="button" className="btn btn--sm" onClick={() => void loadPreview()}>
@@ -203,7 +203,7 @@ export function ToggleFlow({
 
       {delta ? (
         <>
-          <div className="section-title">拓扑影响</div>
+          <div className="section-title">对流程结构的影响</div>
           <div className="kv">
             <div className="kv__k">受影响的下游节点</div>
             <div className="kv__v">
@@ -217,24 +217,24 @@ export function ToggleFlow({
                 </div>
               )}
             </div>
-            <div className="kv__k">有效入口</div>
+            <div className="kv__k">入口节点</div>
             <div className="kv__v">
               <NodeList ids={delta.entry_nodes_before} /> → <NodeList ids={delta.entry_nodes_after} />
               {entryChanged ? <span className="chip chip--warn">发生变化</span> : null}
             </div>
-            <div className="kv__k">有效出口</div>
+            <div className="kv__k">出口节点</div>
             <div className="kv__v">
               <NodeList ids={delta.exit_nodes_before} /> → <NodeList ids={delta.exit_nodes_after} />
               {entryChanged ? <span className="chip chip--warn">发生变化</span> : null}
             </div>
           </div>
 
-          <EdgeDeltaList title="新增的有效依赖边（绕过停用节点后新出现的路径）" edges={delta.added_edges.map((e) => [e.from_node, e.to_node])} tone="accent" via={delta.added_edges.map((e) => e.via)} />
-          <EdgeDeltaList title="消失的有效依赖边" edges={delta.removed_edges.map((e) => [e.from_node, e.to_node])} tone="warn" via={delta.removed_edges.map((e) => e.via)} />
+          <EdgeDeltaList title="新增的依赖连线（绕过被停用节点后出现的路径）" edges={delta.added_edges.map((e) => [e.from_node, e.to_node])} tone="accent" via={delta.added_edges.map((e) => e.via)} />
+          <EdgeDeltaList title="消失的依赖连线" edges={delta.removed_edges.map((e) => [e.from_node, e.to_node])} tone="warn" via={delta.removed_edges.map((e) => e.via)} />
 
           {noEntry ? (
-            <Banner variant="danger" title="停用后没有有效入口">
-              全部停用或没有可执行节点时，内核会拒绝提交，所以这个操作被阻止。
+            <Banner variant="danger" title="停用后流程没有可执行的入口">
+              流程至少要保留一个可执行的入口节点，所以这次停用不能执行。
             </Banner>
           ) : null}
 
@@ -259,7 +259,7 @@ export function ToggleFlow({
               {!enabling ? (
                 <div className="col" style={{ marginTop: 'var(--sp-3)' }}>
                   <div className="section-title" style={{ margin: 0 }}>
-                    存量任务怎么处理（必须显式选择）
+                    进行中的任务怎么处理（必须选一项）
                   </div>
                   <label className="check" style={{ alignItems: 'flex-start' }}>
                     <input
@@ -270,10 +270,10 @@ export function ToggleFlow({
                       style={{ marginTop: 3 }}
                     />
                     <span>
-                      <strong>排水（默认）</strong>
+                      <strong>等跑完再停用（默认）</strong>
                       <div className="text-xs muted">
-                        在途阶段跑完，排队阶段保留，该节点不再领取新阶段。全部存量结束后才翻转启用状态并产生新修订。
-                        <strong>不丢弃已完成的工作</strong>，代价是生效有延迟。
+                        正在运行的阶段会跑完，排队中的阶段保留；该节点不再接手新阶段。等全部结束后才正式停用。
+                        <strong>不会丢弃已完成的工作</strong>，但停用生效会有延迟。
                       </div>
                     </span>
                   </label>
@@ -286,18 +286,18 @@ export function ToggleFlow({
                       style={{ marginTop: 3 }}
                     />
                     <span>
-                      <strong>立即撤回</strong>
+                      <strong>立即取消</strong>
                       <div className="text-xs muted">
-                        在途阶段走统一取消链（<strong>不保留断点</strong>，重新启用后可能要重跑），
-                        排队阶段标记为已跳过。启用状态立即翻转。这是「撤回已有请求」的强制语义，代价显式。
+                        正在运行的阶段立即取消（<strong>不保留进度</strong>，重新启用后可能要重跑），
+                        排队中的阶段标记为已跳过。停用立即生效。
                       </div>
                     </span>
                   </label>
                 </div>
               ) : (
                 <div className="text-xs dim" style={{ marginTop: 6 }}>
-                  启用操作立即生效：节点恢复参与派生，排水期排队的阶段按新的有效图重新评估
-                  （依赖关系变化时按新依赖执行并记录）。
+                  启用立即生效：该节点重新参与流程，之后启动的任务使用新的流程结构；
+                  已经在运行的任务仍按启动时的结构执行到结束。
                 </div>
               )}
             </>
@@ -308,8 +308,8 @@ export function ToggleFlow({
           {report && report.diagnostics.length > 0 ? (
             <>
               <div className="section-title" style={{ marginTop: 'var(--sp-3)' }}>
-                启停后的可执行性预检（{report.mode}）
-                {blocking > 0 ? <span className="chip chip--danger">{blocking} 条阻断项</span> : null}
+                改动后的可执行性检查
+                {blocking > 0 ? <span className="chip chip--danger">{blocking} 项必须处理的问题</span> : null}
               </div>
               <DiagnosticsGrouped
                 diagnostics={report.diagnostics}

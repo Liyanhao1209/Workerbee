@@ -51,21 +51,21 @@ export function hostingDescription(status: SystemStatus | null): {
   variant: 'ok' | 'warn';
 } {
   if (!status) {
-    return { label: '托管形态未知', detail: '尚未读取到内核状态。', variant: 'warn' };
+    return { label: '托管方式未知', detail: '尚未读取到后台服务状态。', variant: 'warn' };
   }
   if (status.session_hosting === 'supervisor') {
     return {
-      label: '会话托管：supervisor',
+      label: '会话托管：独立进程',
       detail: status.supervisor_connected
-        ? 'harness 子进程由独立的 supervisor 进程持有。内核重启不会打断在途任务。'
-        : 'harness 子进程由 supervisor 持有，但当前 supervisor 未连通——在途会话的实际状态需要核对，不能假定它们还活着。',
+        ? '任务会话由独立进程托管。重启后台服务不会打断正在运行的任务。'
+        : '连不上托管会话的独立进程，无法确认正在运行的会话是否还活着。请检查该进程是否已启动（workerbee-supervisor）。',
       variant: status.supervisor_connected ? 'ok' : 'warn',
     };
   }
   return {
-    label: '会话托管：内核内进程（in_process）',
+    label: '会话托管：后台服务内部',
     detail:
-      'harness 子进程由内核自己持有。内核重启会打断正在执行的任务，在途会话不会存活——重启后需要重新对账，部分工作可能要重跑。需要跨重启保活时请改用独立的 supervisor 进程。',
+      '任务会话由后台服务自己持有。重启后台服务会打断正在运行的任务，重启后需要核对状态，部分工作可能要重跑。如需要重启不丢任务，请改用独立进程托管。',
     variant: 'warn',
   };
 }

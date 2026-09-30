@@ -32,10 +32,10 @@ function ReadError({ error, what, onRetry }: { error: ApiError; what: string; on
   return (
     <Banner
       variant="danger"
-      title={error.unreachable ? '无法连接内核' : `无法读取${what}`}
+      title={error.unreachable ? '无法连接后台服务' : `无法读取${what}`}
       hint={
         error.unreachable
-          ? '读取失败，不代表没有模板，下面不会显示占位内容。'
+          ? '请确认后台服务已启动，然后点重试。连接失败期间这里不会显示任何内容。'
           : error.hint ?? undefined
       }
       actions={
@@ -51,7 +51,7 @@ function ReadError({ error, what, onRetry }: { error: ApiError; what: string; on
 
 function SubmitError({ error, what }: { error: ApiError; what: string }): JSX.Element {
   return (
-    <Banner variant="danger" title={error.unreachable ? '无法连接内核' : what}>
+    <Banner variant="danger" title={error.unreachable ? '无法连接后台服务' : what}>
       <span className="mono text-xs">{error.detail}</span>
     </Banner>
   );
@@ -84,7 +84,7 @@ function slotsTitle(slots: CredentialPlaceholder[]): string {
     const label = slot.original_label ?? '未命名';
     return kind ? `${slot.slot}（原 ${label} · ${kind}）` : `${slot.slot}（原 ${label}）`;
   });
-  return `实例化时必须显式绑定的凭据槽位：${described.join('、')}`;
+  return `使用模板创建流程时，这些凭据需要重新选择：${described.join('、')}`;
 }
 
 // ===========================================================================
@@ -136,7 +136,7 @@ export function TemplatesPage(): JSX.Element {
         <div className="page-head__titles">
           <h1>模板</h1>
           <div className="page-head__sub">
-            模板是可复用、可实例化的图定义。它只带结构，不带凭据，也不带任何运行时内容。
+            模板把一套流程结构保存下来重复使用：包含节点、连线和配置，但不保存凭据，也不保存运行中的内容。
           </div>
         </div>
         <div className="page-head__actions">
@@ -166,8 +166,8 @@ export function TemplatesPage(): JSX.Element {
           <Loading label="加载模板列表" />
         ) : rows.length === 0 ? (
           <Empty
-            title="尚未生成任何模板"
-            hint="从已有流程生成模板会强制剥离凭据为占位引用；实例化时再逐个绑定。"
+            title="还没有任何模板"
+            hint="从已有流程生成模板时，凭据不会存进模板；用模板创建流程时需要重新选择凭据。"
             action={
               <button type="button" className="btn btn--sm btn--primary" onClick={() => setCreateOpen(true)}>
                 生成模板
@@ -187,7 +187,7 @@ export function TemplatesPage(): JSX.Element {
                   <th className="table__num">来源修订</th>
                   <th className="table__num">节点数</th>
                   <th className="table__num">边数</th>
-                  <th>凭据槽位</th>
+                  <th>凭据</th>
                   <th style={{ width: 150 }}>操作</th>
                 </tr>
               </thead>
@@ -232,7 +232,7 @@ export function TemplatesPage(): JSX.Element {
                       </td>
                       <td>
                         {slots === null ? (
-                          <span className="dim" title="内核未返回 payload">
+                          <span className="dim" title="后台服务未返回模板内容">
                             —
                           </span>
                         ) : slots.length === 0 ? (
@@ -241,7 +241,7 @@ export function TemplatesPage(): JSX.Element {
                           <div className="row row--tight">
                             <span className="mono text-xs">{slots.length}</span>
                             <Chip variant="warn" title={slotsTitle(slots)}>
-                              需重绑定
+                              需重新选择
                             </Chip>
                           </div>
                         )}
@@ -254,7 +254,7 @@ export function TemplatesPage(): JSX.Element {
                             disabled={submit.busy}
                             onClick={() => startInstantiate(template)}
                           >
-                            实例化
+                            使用模板
                           </button>
                           <button
                             type="button"
@@ -341,7 +341,7 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
 
   const save = async (): Promise<void> => {
     if (!fromWorkflowId) {
-      setFormError('请选择来源流程——模板的内容来自某一个流程修订。');
+      setFormError('请选择来源流程：模板的内容取自所选流程的某个修订。');
       return;
     }
     if (!name.trim()) {
@@ -385,8 +385,8 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
         </>
       }
     >
-      <Banner variant="warn" title="生成模板会剥离凭据">
-        从流程生成模板会<strong>强制剥离凭据</strong>为占位引用，模板不携带明文凭据，也不含任何运行时内容（队列、活跃 session、审批状态、执行结果）。
+      <Banner variant="warn" title="凭据不会存进模板">
+        从流程生成模板时，<strong>凭据不会被一起保存</strong>，之后用模板创建流程时需要重新选择。模板只保存流程的结构和配置，不保存运行中的内容（进行中的会话、审批、执行结果等）。
       </Banner>
 
       {formError ? (
@@ -492,7 +492,7 @@ function BindModal({
   return (
     <Modal
       wide
-      title={`实例化 · ${template.name}`}
+      title={`使用模板 · ${template.name}`}
       onClose={onClose}
       footer={
         <>
@@ -500,25 +500,25 @@ function BindModal({
             取消
           </button>
           <button type="button" className="btn btn--sm btn--primary" disabled={busy} onClick={confirm}>
-            {busy ? '实例化中…' : '实例化'}
+            {busy ? '创建中…' : '从模板创建'}
           </button>
         </>
       }
     >
-      <Banner variant="warn" title="该模板含凭据槽位，必须先绑定">
-        模板里只有占位引用，没有明文凭据。未绑定的槽位不会被补上默认值，实例化时会报成未绑定。
+      <Banner variant="warn" title="这个模板需要重新选择凭据">
+        凭据不会存进模板，请为下面每一项选择本机凭据。不选的项不会被自动补上，创建结果里会标为未绑定。
       </Banner>
 
-      {error ? <SubmitError error={error} what="实例化失败" /> : null}
+      {error ? <SubmitError error={error} what="使用模板失败" /> : null}
       {credentials.error ? <ReadError error={credentials.error} what="凭据列表" onRetry={credentials.reload} /> : null}
 
       <div className="table-wrap">
         <table className="table table--dense">
           <thead>
             <tr>
-              <th>槽位</th>
-              <th>原引用</th>
-              <th style={{ minWidth: 260 }}>绑定本机凭据</th>
+              <th>位置</th>
+              <th>原凭据</th>
+              <th style={{ minWidth: 260 }}>选择本机凭据</th>
             </tr>
           </thead>
           <tbody>
@@ -540,7 +540,7 @@ function BindModal({
                         value={bindings[slot.slot] ?? ''}
                         onChange={(e) => setBinding(slot.slot, e.target.value)}
                       >
-                        <option value="">不绑定（实例化会报告该槽位未绑定）</option>
+                        <option value="">不选择（创建结果会标记为未绑定）</option>
                         {credentialRows.map((credential) => (
                           <option key={credential.credential_id} value={credential.credential_id}>
                             {credential.label}（{CREDENTIAL_KIND_LABELS[credential.kind]}）
@@ -557,7 +557,7 @@ function BindModal({
       </div>
 
       <div className="text-xs dim" style={{ marginTop: 6 }}>
-        只列出未撤销的凭据。要新建凭据请到「注册表 › 凭据」——这里只做引用，不收密钥。
+        只列出未撤销的凭据。要新建凭据请到「注册表 › 凭据」；这里只选择已有凭据，不输入密钥。
       </div>
     </Modal>
   );
@@ -586,7 +586,7 @@ function NodeTable({ nodes }: { nodes: NodeDefinition[] }): JSX.Element {
             <th>节点名</th>
             <th>角色</th>
             <th>模型候选</th>
-            <th>凭据引用</th>
+            <th>凭据</th>
             <th>必需输入</th>
           </tr>
         </thead>
@@ -615,7 +615,7 @@ function NodeTable({ nodes }: { nodes: NodeDefinition[] }): JSX.Element {
                       ))}
                     </span>
                   ) : (
-                    <span className="text-warn">无凭据引用</span>
+                    <span className="text-warn">未绑定凭据</span>
                   )}
                 </td>
                 <td>
@@ -648,7 +648,7 @@ function InstantiateResultModal({
   return (
     <Modal
       wide
-      title={`实例化结果 · ${template.name}`}
+      title={`创建结果 · ${template.name}`}
       onClose={onClose}
       footer={
         <button type="button" className="btn btn--sm" onClick={onClose}>
@@ -659,11 +659,11 @@ function InstantiateResultModal({
       {missing.length > 0 ? (
         <Banner
           variant="warn"
-          title="存在未绑定的凭据槽位"
-          hint="这次实例化没有补齐凭据，也没有替任何一个槽位编造取值。补齐后请重新实例化。"
+          title="有凭据未绑定"
+          hint="这次创建没有为它们选择凭据，系统也不会替你编造。选好凭据后请重新从模板创建。"
         >
           <div>
-            以下槽位未绑定，实例化结果<strong>不算可用</strong>：
+            以下凭据未绑定，这次创建的流程<strong>还不能用</strong>：
             <ul className="list-reset" style={{ marginTop: 4 }}>
               {missing.map((binding, index) => missingBindingLine(binding, index))}
             </ul>
@@ -674,23 +674,23 @@ function InstantiateResultModal({
       <div className="row row--tight" style={{ marginBottom: 'var(--sp-2)' }}>
         <span className="text-sm muted">是否可用</span>
         <Pill tone={result.usable ? 'success' : 'danger'}>{result.usable ? '可用' : '不可用'}</Pill>
-        <span className="text-xs dim">（模板实例化结果的 usable）</span>
+        <span className="text-xs dim">（本次创建的整体结论）</span>
       </div>
 
       <div className="row row--tight" style={{ marginBottom: 'var(--sp-2)' }}>
-        <span className="text-sm muted">报告结论</span>
+        <span className="text-sm muted">检查报告</span>
         <Pill tone={report.usable ? 'success' : 'danger'}>{report.usable ? '可用' : '不可用'}</Pill>
-        <span className="text-xs dim">（report.usable）</span>
+        <span className="text-xs dim">（报告中的结论）</span>
         {report.usable !== result.usable ? (
-          <span className="text-xs text-warn">两者不一致，以报告为准——报告列出了未绑定槽位。</span>
+          <span className="text-xs text-warn">两个结论不一致时以检查报告为准，报告里列出了未绑定的凭据。</span>
         ) : null}
       </div>
 
       <div className="section-title" style={{ marginTop: 'var(--sp-3)' }}>
-        报告说明（report.notes，原文）
+        后台返回的说明
       </div>
       {report.notes.length === 0 ? (
-        <div className="text-sm dim">内核没有返回说明。</div>
+        <div className="text-sm dim">后台服务没有返回说明。</div>
       ) : (
         <ul className="list-reset">
           {report.notes.map((note, index) => (
@@ -702,16 +702,16 @@ function InstantiateResultModal({
       )}
 
       <div className="section-title" style={{ marginTop: 'var(--sp-3)' }}>
-        实例化出的图（节点 {result.nodes.length} / 边 {result.edges.length}）
+        创建出的流程结构（节点 {result.nodes.length} / 连线 {result.edges.length}）
       </div>
       {result.nodes.length === 0 ? (
-        <div className="text-sm dim">这次实例化没有产出任何节点。</div>
+        <div className="text-sm dim">这次创建没有产出任何节点。</div>
       ) : (
         <NodeTable nodes={result.nodes} />
       )}
 
       <Banner variant="info" title="这还只是草稿">
-        实例化结果为草稿，尚未写入任何流程；请在编辑器中确认后再保存。
+        这次创建只生成了流程草稿，还没有保存成正式流程；请在编辑器中确认后再保存。
       </Banner>
     </Modal>
   );
@@ -751,16 +751,16 @@ function RemoveModal({
         </>
       }
     >
-      <Banner variant="warn" title="删除只作用于模板本身">
-        编辑或删除模板不会静默改写已由该模板创建的流程。
+      <Banner variant="warn" title="删除只影响模板本身">
+        删除模板不会改动已经用它创建的流程。
       </Banner>
       {error ? <SubmitError error={error} what="删除模板失败" /> : null}
       <div className="text-sm muted">
-        已实例化的流程保留它们自己创建时的图与快照，模板后续的任何变化都不会回溯改写它们。
+        已创建的流程保留自己创建时的内容和记录，之后模板的任何改动都不会影响它们。
       </div>
       {slotCount > 0 ? (
         <div className="text-sm muted" style={{ marginTop: 'var(--sp-2)' }}>
-          该模板含 {slotCount} 个凭据槽位；删除模板不会影响已绑定到流程上的凭据引用。
+          该模板有 {slotCount} 处凭据需要使用时重新选择；删除模板不影响已创建的流程里选好的凭据。
         </div>
       ) : null}
     </Modal>
