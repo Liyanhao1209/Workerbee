@@ -1376,13 +1376,15 @@ class ApprovalRepository:
 
 class AssistantRepository:
     """助手线程与消息。返回的是普通字典——它们没有对应的领域实体，
-    字段集就是表结构本身（schema 迁移 7）。
+    字段集就是表结构本身（schema 迁移 7/8）。
 
     对话历史只增不改：``update_message`` 只放行元信息列（backend/用量/degraded），
     不提供改写正文或删除的路径——「整理前文」是追加一条 memory 消息，不是篡改历史。
+    线程元信息同理走 ``update_thread`` 的白名单（title/closed）。
     """
 
     _MESSAGE_UPDATABLE = {"backend", "tokens_in", "tokens_out", "degraded"}
+    _THREAD_UPDATABLE = {"title", "closed"}
 
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -1416,6 +1418,28 @@ class AssistantRepository:
         )
         return [self._to_thread(r) for r in rows]
 
+    async def update_thread(self, thread_id: str, **fields: Any) -> bool:
+        """白名单元信息更新（title/closed）。改名不触碰任何消息。"""
+        sets: list[str] = []
+        params: list[Any] = []
+        for k, v in fields.items():
+            if k not in self._THREAD_UPDATABLE:
+                raise ValueError(f"不可更新的助手线程字段: {k}")
+            sets.append(f"{k}=?")
+            params.append(1 if isinstance(v, bool) else v)
+        if not sets:
+            return True
+        sets.append("updated_at=?")
+        params.append(utcnow().isoformat())
+        params.append(thread_id)
+        return (
+            await self.db.execute_rowcount(
+                f"UPDATE assistant_thread SET {', '.join(sets)} WHERE thread_id=?",
+                params,
+            )
+            > 0
+        )
+
     # ---- message ----
 
     async def append_message(
@@ -1429,14 +1453,19 @@ class AssistantRepository:
         tokens_in: int | None = None,
         tokens_out: int | None = None,
         degraded: bool = False,
+        reasoning: str | None = None,
     ) -> dict[str, Any]:
-        """追加一条消息，并把线程的 updated_at 顶到最新（列表按它排序）。"""
+        """追加一条消息，并把线程的 updated_at 顶到最新（列表按它排序）。
+
+        ``reasoning`` 是助手回复的推理过程（迁移 8 新增列）：与正文分开存，
+        没有推理内容时保持 None（「没有」≠ 空串）。
+        """
         now = utcnow().isoformat()
         async with self.db.transaction():
             await self.db.execute(
                 """INSERT INTO assistant_message(message_id, thread_id, role, content,
-                       backend, tokens_in, tokens_out, degraded, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                       backend, tokens_in, tokens_out, degraded, reasoning, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
                     message_id,
                     thread_id,
@@ -1446,6 +1475,7 @@ class AssistantRepository:
                     tokens_in,
                     tokens_out,
                     1 if degraded else 0,
+                    reasoning,
                     now,
                 ),
             )
@@ -1462,6 +1492,7 @@ class AssistantRepository:
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "degraded": degraded,
+            "reasoning": reasoning,
             "created_at": now,
         }
 
@@ -1518,6 +1549,7 @@ class AssistantRepository:
             "tokens_in": row["tokens_in"],
             "tokens_out": row["tokens_out"],
             "degraded": bool(row["degraded"]),
+            "reasoning": row["reasoning"],
             "created_at": row["created_at"],
         }
 

@@ -690,6 +690,41 @@ async def test_store_storage_report(store):
     assert report["path"].endswith("workerbee.db")
 
 
+# ===========================================================================
+# 基础助手仓储（迁移 7/8）
+# ===========================================================================
+
+
+async def test_assistant_message_reasoning_round_trip(store):
+    """迁移 8 的 reasoning 列：写入原样读回；没有推理内容时是 None 不是空串。"""
+    thread = await store.assistant.create_thread("t1")
+    with_reasoning = await store.assistant.append_message(
+        message_id="m1", thread_id=thread["thread_id"], role="assistant",
+        content="正文", reasoning="推理过程",
+    )
+    without = await store.assistant.append_message(
+        message_id="m2", thread_id=thread["thread_id"], role="user", content="问题",
+    )
+    assert with_reasoning["reasoning"] == "推理过程"
+    assert without["reasoning"] is None
+
+    messages = await store.assistant.list_messages(thread["thread_id"])
+    assert [m["reasoning"] for m in messages] == ["推理过程", None]
+
+
+async def test_assistant_thread_update_is_whitelisted(store):
+    thread = await store.assistant.create_thread("t1", "旧名")
+
+    assert await store.assistant.update_thread(thread["thread_id"], title="新名") is True
+    assert (await store.assistant.get_thread(thread["thread_id"]))["title"] == "新名"
+
+    with pytest.raises(ValueError, match="不可更新"):
+        await store.assistant.update_thread(thread["thread_id"], created_at="x")
+    # 消息正文同样不在白名单里：历史只增不改
+    with pytest.raises(ValueError, match="不可更新"):
+        await store.assistant.update_message("m1", content="改写历史")
+
+
 async def test_graph_spec_used_by_store_is_self_consistent():
     """store 里存的图与内存中的图指纹一致，恢复后能对上钉扎版本。"""
     g = make_graph()

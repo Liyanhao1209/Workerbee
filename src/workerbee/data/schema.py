@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -452,6 +452,15 @@ CREATE TABLE IF NOT EXISTS assistant_message (
 );
 CREATE INDEX IF NOT EXISTS idx_assistant_message_thread
     ON assistant_message(thread_id, created_at);
+""",
+    ),
+    (
+        8,
+        """
+-- 助手回复的推理过程（思维链）单列持久化：流式改造后 reasoning 与正文分开
+-- 累积、分开入库，界面据此渲染可折叠的「思考过程」区。nullable——非思考
+-- 模型没有推理内容，NULL 如实表示「没有」，不是空串。
+ALTER TABLE assistant_message ADD COLUMN reasoning TEXT;
 """,
     ),
 ]
