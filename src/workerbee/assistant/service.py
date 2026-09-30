@@ -5,7 +5,7 @@
 1. 读线程历史（assistant_message 表）→ 滑动窗口截断（不产生额外调用）；
 2. 拼 system prompt = 角色设定 + 使用指引（guidebook）+ 系统快照（snapshot）
    + 钉扎的「整理前文」摘要；
-3. LLMRouter.complete（后端链由配置里的 credential_ref 装配，openai_compat）；
+3. LLMRouter.complete（后端链由配置里的 credential_ref 与 api_protocol 装配）；
 4. 回复过脱敏 → 落库 → 写事件 → notifier 推送。
 
 安全边界（计划 §8）：
@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from ..core.domain.base import DomainModel, new_id, utcnow
 from ..core.runtime.notifier import Notification
@@ -106,6 +106,9 @@ class AssistantConfig(DomainModel):
     enabled: bool = False
     credential_ref: str | None = None
     model_override: str | None = None
+    api_protocol: Literal["openai", "anthropic"] = "openai"
+    """助手请求凭据 Base URL 时用的接口协议：``openai`` 打 ``/chat/completions``，
+    ``anthropic`` 打 ``/v1/messages``。不做 URL 自动推断，由用户显式选择。"""
     window_rounds: int = DEFAULT_WINDOW_ROUNDS
     window_chars: int = DEFAULT_WINDOW_CHARS
     snapshot_budget: int = DEFAULT_SNAPSHOT_BUDGET
@@ -135,21 +138,43 @@ async def save_config(db: Database, config: AssistantConfig) -> None:
 # ---------------------------------------------------------------------------
 
 #: 后端工厂签名：给定配置与凭据引用，产出一个后端实例。测试用它注入假后端；
-#: 生产实现是 ``_default_backend_factory``（openai_compat，经 LLMRouter）。
+#: 生产实现是 ``_default_backend_factory``（按 api_protocol 选后端，经 LLMRouter）。
 BackendFactory = Callable[[AssistantConfig, Any, Any], LLMBackend]
 
 
 def _default_backend_factory(
     config: AssistantConfig, credential_ref: Any, secrets: Any
 ) -> LLMBackend:
-    """生产路径：openai_compat 后端，密钥走 secret_locator（AUTH-02）。"""
+    """生产路径：按 ``api_protocol`` 选 openai_compat 或 anthropic 后端，
+    密钥走 secret_locator（AUTH-02）。协议不做 URL 自动推断，以配置为准。"""
+    kind = "anthropic" if config.api_protocol == "anthropic" else "openai_compat"
     return BackendConfig(
-        kind="openai_compat",
+        kind=kind,
         name="assistant",
         model=config.model_override or credential_ref.default_model or "",
         base_url=credential_ref.base_url,
         secret_locator=credential_ref.secret_locator,
     ).build(secrets=secrets)
+
+
+def _call_failed_hint(exc: LLMError) -> str:
+    """模型调用失败时给用户的引导。404/not_found 最常见的原因是协议选错：
+    拿 Anthropic 兼容端点（如 ``.../anthropic``）走了 OpenAI 兼容路径。"""
+    hint = "模型服务可能暂时不可用；稍后再试，或检查凭据与 Base URL 是否还有效"
+    if _is_not_found(exc):
+        hint += (
+            "；如果 Base URL 是 Anthropic 兼容端点（路径里通常含 /anthropic），"
+            "请在助手设置里把接口协议改成 Anthropic 兼容"
+        )
+    return hint
+
+
+def _is_not_found(exc: LLMError) -> bool:
+    """单后端链失败会被包成 all_failed，not_found 分类藏在尝试链里。"""
+    if exc.kind == "not_found":
+        return True
+    attempts = getattr(exc, "attempts", None) or []
+    return any(str(a).endswith(":not_found") for a in attempts)
 
 
 class AssistantService:
@@ -261,7 +286,7 @@ class AssistantService:
         except LLMError as exc:
             raise AssistantCallFailed(
                 f"助手模型调用失败：{exc}",
-                hint="模型服务可能暂时不可用；稍后再试，或检查凭据与 Base URL 是否还有效",
+                hint=_call_failed_hint(exc),
             ) from exc
 
         safe_reply = self._redact(response.text)
@@ -370,7 +395,9 @@ class AssistantService:
         try:
             response = await router.complete(messages, timeout=self.call_timeout)
         except LLMError as exc:
-            raise AssistantCallFailed(f"整理前文失败：{exc}") from exc
+            raise AssistantCallFailed(
+                f"整理前文失败：{exc}", hint=_call_failed_hint(exc)
+            ) from exc
 
         memory_message = await self.store.assistant.append_message(
             message_id=new_id(),
@@ -475,6 +502,7 @@ class AssistantService:
                 "locator": credential.secret_locator,
                 "base_url": credential.base_url,
                 "model": model,
+                "api_protocol": config.api_protocol,
                 "factory": id(self.backend_factory),
             },
             sort_keys=True,

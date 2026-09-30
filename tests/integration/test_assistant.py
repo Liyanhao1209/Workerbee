@@ -129,6 +129,28 @@ async def test_config_rejects_unknown_credential(client: Any) -> None:
     assert "凭据" in updated.json()["detail"]
 
 
+async def test_config_protocol_roundtrip(client: Any) -> None:
+    """api_protocol 默认 openai，PUT 成 anthropic 后 GET 原样读回。"""
+    got = await client.get("/api/assistant/config")
+    assert got.status_code == 200
+    assert got.json()["api_protocol"] == "openai"
+
+    updated = await client.put("/api/assistant/config", json={"api_protocol": "anthropic"})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["api_protocol"] == "anthropic"
+
+    got = await client.get("/api/assistant/config")
+    assert got.json()["api_protocol"] == "anthropic"
+
+
+async def test_config_rejects_unknown_protocol(client: Any) -> None:
+    """非法协议取值报 400 + 大白话，而不是框架默认的 422 校验报错。"""
+    resp = await client.put("/api/assistant/config", json={"api_protocol": "graphql"})
+    assert resp.status_code == 400
+    assert "openai" in resp.json()["detail"]
+    assert "anthropic" in resp.json()["detail"]
+
+
 # ===========================================================================
 # 问答全路径
 # ===========================================================================

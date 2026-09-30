@@ -1509,6 +1509,15 @@ class AssistantService(_Service):
                     "这条凭据不存在",
                     hint="到 注册表 → 凭据 先建好凭据，再回到这里选择",
                 )
+        if fields.get("api_protocol") is not None and fields["api_protocol"] not in (
+            "openai",
+            "anthropic",
+        ):
+            raise BadRequest(
+                f"接口协议只支持 openai（OpenAI 兼容）和 anthropic（Anthropic 兼容），"
+                f"不认识「{fields['api_protocol']}」",
+                hint="Base URL 路径里含 /anthropic 时选 anthropic，其余情况选 openai",
+            )
         updated = AssistantConfig.model_validate(
             {**current.model_dump(), **fields}
         )

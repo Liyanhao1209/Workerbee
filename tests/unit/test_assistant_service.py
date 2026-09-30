@@ -22,6 +22,9 @@ from workerbee.core.domain.registry import CredentialKind, CredentialRef
 from workerbee.core.runtime.notifier import BroadcastNotifier
 from workerbee.data.event_log import EventType
 from workerbee.data.llm import LLMRouter, LLMTimeoutError
+from workerbee.data.llm.anthropic import AnthropicBackend
+from workerbee.data.llm.backend import LLMConfigError, LLMMessage
+from workerbee.data.llm.openai_compat import OpenAICompatBackend
 
 from tests.fakes import FakeLLMBackend
 
@@ -188,6 +191,7 @@ async def test_timeout_becomes_plain_error(store) -> None:
     with pytest.raises(AssistantCallFailed) as info:
         await service.send_message(thread["thread_id"], "你好")
     assert info.value.hint  # 给出可操作的引导
+    assert "Anthropic" not in info.value.hint  # 超时与协议选择无关，不乱指路
 
 
 async def test_not_enabled(store) -> None:
@@ -236,6 +240,92 @@ async def test_user_message_is_redacted_before_store_and_send(store) -> None:
     history = await service.list_messages(thread["thread_id"])
     assert secret not in str(history)
     assert secret not in result["message"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# 接口协议（api_protocol）：openai 打 /chat/completions，anthropic 打 /v1/messages
+# ---------------------------------------------------------------------------
+
+
+async def test_default_protocol_builds_openai_compat_backend(store) -> None:
+    """不显式选协议时维持原行为：openai_compat 后端。"""
+    service = await make_service(store, FakeLLMBackend("x"), secrets=FakeSecrets())
+    service.backend_factory = None  # 走生产装配路径
+
+    router, config = await service._require_backend()
+    assert config.api_protocol == "openai"
+    backend = router._backends[0]
+    assert isinstance(backend, OpenAICompatBackend)
+    assert backend.base_url == "https://llm.example.com/v1"
+    await service.aclose()
+
+
+async def test_anthropic_protocol_posts_to_messages_endpoint(store) -> None:
+    """api_protocol=anthropic：装配出 Anthropic 后端，实际请求打到 {base_url}/v1/messages。
+
+    这是「凭据 Base URL 是 Anthropic 兼容端点却得到 404」的修复断言——
+    只断言装配出某个类不算数，要断言请求真的去了 /v1/messages。
+    """
+    import httpx
+
+    await store.registry.upsert_credential(
+        CredentialRef(
+            credential_id="cred-ds",
+            label="DeepSeek（Anthropic 兼容）",
+            kind=CredentialKind.BASE_URL_PAIR,
+            secret_locator="secret://cred-ds",
+            base_url="https://api.deepseek.com/anthropic",
+            default_model="deepseek-chat",
+        )
+    )
+    service = await make_service(store, FakeLLMBackend("unused"), secrets=FakeSecrets())
+    service.backend_factory = None
+    await service.save_config(
+        AssistantConfig(
+            enabled=True, credential_ref="cred-ds", api_protocol="anthropic"
+        )
+    )
+
+    router, _ = await service._require_backend()
+    backend = router._backends[0]
+    assert isinstance(backend, AnthropicBackend)
+    assert backend.model == "deepseek-chat"
+
+    seen: list = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "好"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    backend._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    resp = await router.complete([LLMMessage(role="user", content="你好")])
+    assert resp.text == "好"
+    assert len(seen) == 1
+    assert str(seen[0].url) == "https://api.deepseek.com/anthropic/v1/messages"
+    assert seen[0].headers["x-api-key"] == "sk-test"  # 认证头形态也随之切换
+    await service.aclose()
+
+
+async def test_not_found_error_suggests_switching_protocol(store) -> None:
+    """404/not_found 失败时，提示里补一句「也许该把接口协议改成 Anthropic 兼容」。"""
+    backend = FakeLLMBackend(
+        LLMConfigError("HTTP 404", backend="fake-llm", kind="not_found")
+    )
+    service = await make_service(store, backend, secrets=FakeSecrets())
+    thread = await service.create_thread()
+
+    with pytest.raises(AssistantCallFailed) as info:
+        await service.send_message(thread["thread_id"], "你好")
+    hint = info.value.hint
+    assert "/anthropic" in hint
+    assert "Anthropic 兼容" in hint
 
 
 # ---------------------------------------------------------------------------

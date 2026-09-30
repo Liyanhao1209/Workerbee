@@ -950,6 +950,9 @@ class AssistantConfigResponse(ApiResponse):
     enabled: bool = False
     credential_ref: str | None = None
     model_override: str | None = None
+    api_protocol: Literal["openai", "anthropic"] = "openai"
+    """助手请求凭据 Base URL 用的接口协议。``openai`` 打 ``/chat/completions``；
+    ``anthropic`` 打 ``/v1/messages``（Base URL 路径含 /anthropic 时选它）。"""
     window_rounds: int = 12
     window_chars: int = 12000
     snapshot_budget: int = 6000
@@ -959,11 +962,17 @@ class AssistantConfigResponse(ApiResponse):
 
 
 class AssistantConfigUpdateRequest(ApiRequest):
-    """局部更新。只接受引用（credential_ref），不接受任何密钥本体。"""
+    """局部更新。只接受引用（credential_ref），不接受任何密钥本体。
+
+    ``api_protocol`` 故意不用 Literal：取值不合法时由服务层报 400 + 大白话提示，
+    而不是框架默认的 422 校验报错。
+    """
 
     enabled: bool | None = None
     credential_ref: str | None = None
     model_override: str | None = None
+    api_protocol: str | None = None
+    """接口协议：``openai`` / ``anthropic``。其它取值在服务层拒绝。"""
     window_rounds: int | None = Field(default=None, ge=1, le=100)
     window_chars: int | None = Field(default=None, ge=500, le=200000)
     snapshot_budget: int | None = Field(default=None, ge=500, le=100000)
