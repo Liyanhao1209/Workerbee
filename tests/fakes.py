@@ -65,6 +65,7 @@ class FakeHarness:
         reasoning_effort: str | None, system_prompt: str | None,
         initial_input: str | None = None,
         permission_mode: str | None = None,
+        credential_ref: str | None = None,
         cwd: str | None = None, extra: dict | None = None,
     ) -> SessionHandle:
         self.created.append(
@@ -75,6 +76,7 @@ class FakeHarness:
                 "system_prompt": system_prompt,
                 "initial_input": initial_input,
                 "permission_mode": permission_mode,
+                "credential_ref": credential_ref,
                 "stage_id": stage.stage_id,
                 "node_id": stage.node_id,
             }

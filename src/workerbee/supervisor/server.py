@@ -576,6 +576,9 @@ class Supervisor:
             system_prompt=params.get("system_prompt"),
             initial_input=params.get("initial_input"),
             permission_mode=params.get("permission_mode"),
+            # core 已解析好的凭据材料（supervisor 没有凭据库口令，自己解不开）。
+            # 只从这里流向 HarnessConfig.credential，不落日志。
+            credential=params.get("credential"),
             cwd=params.get("cwd"),
             extra=params.get("extra"),
         )

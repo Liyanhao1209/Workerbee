@@ -1098,6 +1098,77 @@ async def test_credential_revoke_is_a_post_action(client: Any, engine: Engine) -
     assert restored.json()["revoked"] is True, "缺省即撤销；传 revoked=false 才恢复"
 
 
+async def test_credential_created_with_secret_material(client: Any, engine: Engine) -> None:
+    """随请求提交密钥本体：内核写入凭据库、自动建 locator、立即登记脱敏。"""
+    # 凭据库未解锁（内核没带口令启动）：明确拒绝，不悄悄只存引用
+    rejected = await client.post(
+        "/api/credentials",
+        json={"label": "k1", "kind": "api_key", "secret": {"api_key": SECRET}},
+    )
+    assert rejected.status_code == 400
+    assert "凭据库未解锁" in rejected.json()["detail"]
+    assert SECRET not in rejected.text
+
+    # harness_login 没有密钥本体，带 secret 是配置错误
+    wrong = await client.post(
+        "/api/credentials",
+        json={"label": "k2", "kind": "harness_login", "secret": {"api_key": SECRET}},
+    )
+    assert wrong.status_code == 400
+    assert SECRET not in wrong.text
+
+    # 解锁后：正常写入
+    vault = engine.config.data_dir / "secrets.vault"
+    await SecretStore.create(PASSPHRASE, vault)
+    await engine.unlock_secrets(PASSPHRASE)
+
+    created = await client.post(
+        "/api/credentials",
+        json={"label": "k1", "kind": "api_key", "secret": {"api_key": SECRET}},
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["secret_locator"], "带密钥创建时必须自动生成 locator"
+    assert SECRET not in created.text
+
+    # 密钥真的进了凭据库，且能被解析路径读到
+    stored = await engine.secret_store.get(body["secret_locator"])
+    assert stored == {"api_key": SECRET}
+
+    # 新写入的密值立即纳入脱敏：不需要重启内核才生效
+    await engine.store.events.append(
+        scope=EventScope.SYSTEM,
+        type=EventType.SYSTEM_START,
+        payload={"note": f"key={SECRET}"},
+    )
+    events = (await client.get("/api/system/events?limit=50")).json()["events"]
+    assert SECRET not in json.dumps(events, ensure_ascii=False)
+
+
+async def test_credential_secret_can_pair_with_base_url(client: Any, engine: Engine) -> None:
+    """base_url_pair：url 与 key 一起进凭据库，url 同时留在引用上供展示。"""
+    vault = engine.config.data_dir / "secrets.vault"
+    await SecretStore.create(PASSPHRASE, vault)
+    await engine.unlock_secrets(PASSPHRASE)
+
+    created = await client.post(
+        "/api/credentials",
+        json={
+            "label": "self-hosted",
+            "kind": "base_url_pair",
+            "base_url": "https://llm.example.com/v1",
+            "secret": {"api_key": SECRET, "base_url": "https://llm.example.com/v1"},
+        },
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["base_url"] == "https://llm.example.com/v1"
+    stored = await engine.secret_store.get(body["secret_locator"])
+    assert stored["api_key"] == SECRET
+    assert stored["base_url"] == "https://llm.example.com/v1"
+    assert SECRET not in created.text
+
+
 # ===========================================================================
 # 注册表与模板的增删
 # ===========================================================================

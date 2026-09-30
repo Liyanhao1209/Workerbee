@@ -410,6 +410,7 @@ class Scheduler:
                 "reasoning_effort": profile.reasoning_effort,
                 "compact_threshold": profile.compact_threshold,
                 "credential_ref": profile.credential_ref,
+                "permission_mode": profile.permission_mode,
                 "candidate_index": fresh_stage.profile_cursor,
             },
             resume_from_checkpoint=fresh_stage.checkpoint_ref,
@@ -462,6 +463,9 @@ class Scheduler:
                     # 权限模式由用户在候选上显式指定；无钩子的 harness 靠它保证
                     # 不会中途停下来等人（HUM-03）。未指定时由适配器如实拒绝。
                     permission_mode=profile.permission_mode,
+                    # 节点候选上的凭据引用，优先于 harness 登记时的 auth_binding。
+                    # 不传的话候选上的选择会被静默忽略——用户以为换了身份，实际没有。
+                    credential_ref=profile.credential_ref,
                     cwd=self.node_cwd,
                 ),
                 timeout=self.config.dispatch_timeout,

@@ -695,15 +695,23 @@ class ProbeResponse(ApiResponse):
 
 
 class CredentialCreateRequest(ApiRequest):
-    """登记一份凭据**引用**。密钥本体只进 Secret Store，本接口不接收、不返回。"""
+    """登记一份凭据**引用**，或同时把密钥本体交给内核写入凭据库。
+
+    ``secret`` 提供时：内核把它写进 Secret Store（加密落盘）并自动建立引用，
+    响应里**不含**密钥本体。不提供时本接口只登记引用，指向凭据库里已有的条目。
+    """
 
     credential_id: str | None = None
     label: str
     kind: CredentialKind
     secret_locator: str | None = None
     """指向 Secret Store 的条目名（如 ``secret://openai``）。
-    ``harness_login`` 类型留空——凭据由 harness 自身登录态提供。"""
+    ``harness_login`` 类型留空——凭据由 harness 自身登录态提供。
+    提供 ``secret`` 时可省略，内核会按 credential_id 自动生成。"""
     base_url: str | None = None
+    secret: dict[str, str] | None = None
+    """密钥本体（如 ``{"api_key": "sk-..."}``，base_url_pair 再加 ``"base_url"``）。
+    只在请求体里出现一次，写库后即弃；不落日志、不进事件、不在响应里回显。"""
 
 
 class RevokeRequest(ApiRequest):

@@ -13,6 +13,8 @@
 
 **凭据不出网关**：本层从不读取 Secret Store 的值，也不把 ``CredentialRef`` 之外的
 任何凭据材料塞进响应。响应模型在 ``schemas`` 里，形状本来就是「只有引用」。
+创建凭据时随请求提交上来的密钥本体只做一次转手（请求 → ``Engine.store_secret``），
+不进事件、不落日志、不在响应里回显。
 """
 
 from __future__ import annotations
@@ -923,17 +925,34 @@ class RegistryService(_Service):
         return await self.store.registry.list_credentials()
 
     async def create_credential(self, req: S.CredentialCreateRequest) -> CredentialRef:
-        if req.kind.value != "harness_login" and not req.secret_locator:
+        if req.kind.value != "harness_login" and not req.secret_locator and not req.secret:
             raise BadRequest(
-                "该凭据类型需要在 Secret Store 中有对应条目",
-                hint="提供 secret_locator（如 secret://openai）；"
-                "若使用 harness 自身的登录态，请选 kind=harness_login",
+                "该凭据类型需要密钥：直接提交密钥内容，或提供 secret_locator 指向凭据库中已有条目",
+                hint="若使用 harness 自身的登录态，请选 kind=harness_login",
             )
+        if req.kind.value == "harness_login" and req.secret:
+            raise BadRequest(
+                "harness_login 没有密钥本体可存（凭据由 harness 自身的登录态提供）"
+            )
+
+        cred_id = req.credential_id or new_id()
+        locator = req.secret_locator
+        if req.secret:
+            if self.engine.secret_store is None:
+                raise BadRequest(
+                    "凭据库未解锁，无法保存密钥",
+                    hint="内核启动时提供 --passphrase（或 WORKERBEE_PASSPHRASE）后重试；"
+                    "也可以只登记指向凭据库已有条目的 secret_locator",
+                )
+            locator = locator or f"secret://cred-{cred_id}"
+            # 写库与登记脱敏必须成对（store_secret 内部保证）；密钥本体不进事件载荷。
+            await self.engine.store_secret(locator, dict(req.secret), label=req.label)
+
         cred = CredentialRef(
-            credential_id=req.credential_id or new_id(),
+            credential_id=cred_id,
             label=req.label,
             kind=req.kind,
-            secret_locator=req.secret_locator,
+            secret_locator=locator,
             base_url=req.base_url,
         )
         await self.store.registry.upsert_credential(cred)

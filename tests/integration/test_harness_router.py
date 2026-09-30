@@ -615,7 +615,7 @@ async def test_missing_credential_reference_is_an_explicit_failure(mock_router):
     with pytest.raises(AdapterError) as excinfo:
         await open_session(router, reg)
     assert excinfo.value.code == ErrorCode.HARNESS_UNAVAILABLE
-    assert "不存在的凭据引用" in excinfo.value.message
+    assert "不存在的凭据" in excinfo.value.message
 
 
 async def test_missing_secret_store_is_reported_not_ignored(mock_router):
@@ -631,7 +631,7 @@ async def test_missing_secret_store_is_reported_not_ignored(mock_router):
     await router.store.registry.upsert_credential(credential)
     with pytest.raises(AdapterError) as excinfo:
         await open_session(router, reg)
-    assert "未配置 SecretStore" in excinfo.value.message
+    assert "凭据库未解锁" in excinfo.value.message
 
 
 async def test_native_login_harness_needs_no_credential(mock_router):
@@ -641,6 +641,85 @@ async def test_native_login_harness_needs_no_credential(mock_router):
     proc = router._procs[reg.harness_id]  # noqa: SLF001
     stat = await proc.call(METHODS.SESSION_STAT, {"session_ref": handle.session_ref})
     assert stat["diagnostics"]["credential_keys"] == []
+
+
+# ----------------------------------------------------------------------
+# 6.1 节点候选级凭据（ExecutionProfile.credential_ref）
+# ----------------------------------------------------------------------
+
+
+async def test_profile_credential_ref_reaches_adapter(mock_router, tmp_path):
+    """harness 没有 auth_binding 时，候选上的 credential_ref 单独生效。"""
+    vault = await SecretStore.create("测试口令", tmp_path / "vault.json")
+    await vault.put("secret://per-node", {"auth_token": SECRET_VALUE})
+    credential = CredentialRef(
+        credential_id="cred-node",
+        label="节点级凭据",
+        kind=CredentialKind.API_KEY,
+        secret_locator="secret://per-node",
+    )
+    router, rec, reg = await mock_router({"steps": [{"do": "turn_end"}]}, secret_store=vault)
+    await router.store.registry.upsert_credential(credential)
+
+    handle = await open_session(router, reg, credential_ref="cred-node")
+    proc = router._procs[reg.harness_id]  # noqa: SLF001
+    stat = await proc.call(METHODS.SESSION_STAT, {"session_ref": handle.session_ref})
+    assert stat["diagnostics"]["credential_keys"] == ["auth_token"]
+    assert SECRET_VALUE not in rec.dump()
+
+
+async def test_profile_credential_ref_overrides_auth_binding(mock_router, tmp_path):
+    """候选上的 credential_ref 优先于 harness 的 auth_binding（候选是更具体的意图）。"""
+    vault = await SecretStore.create("测试口令", tmp_path / "vault.json")
+    await vault.put("secret://binding", {"api_key": "sk-binding-000000000000"})
+    await vault.put("secret://override", {"auth_token": SECRET_VALUE})
+    binding = CredentialRef(
+        credential_id="cred-binding",
+        label="harness 绑定",
+        kind=CredentialKind.API_KEY,
+        secret_locator="secret://binding",
+    )
+    override = CredentialRef(
+        credential_id="cred-override",
+        label="候选覆盖",
+        kind=CredentialKind.API_KEY,
+        secret_locator="secret://override",
+    )
+    router, _, reg = await mock_router(
+        {"steps": [{"do": "turn_end"}]},
+        secret_store=vault,
+        auth_binding=binding.credential_id,
+        auth_mode=AuthMode.API_KEY,
+    )
+    await router.store.registry.upsert_credential(binding)
+    await router.store.registry.upsert_credential(override)
+
+    handle = await open_session(router, reg, credential_ref="cred-override")
+    proc = router._procs[reg.harness_id]  # noqa: SLF001
+    stat = await proc.call(METHODS.SESSION_STAT, {"session_ref": handle.session_ref})
+    assert stat["diagnostics"]["credential_keys"] == ["auth_token"], (
+        "候选上的 credential_ref 必须压过 harness 的 auth_binding"
+    )
+
+
+async def test_revoked_profile_credential_is_an_explicit_failure(mock_router, tmp_path):
+    """候选引用了已撤销的凭据：明确失败，不静默退回本机登录态。"""
+    vault = await SecretStore.create("测试口令", tmp_path / "vault.json")
+    await vault.put("secret://gone", {"api_key": SECRET_VALUE})
+    credential = CredentialRef(
+        credential_id="cred-gone",
+        label="已撤销",
+        kind=CredentialKind.API_KEY,
+        secret_locator="secret://gone",
+        revoked=True,
+    )
+    router, _, reg = await mock_router({"steps": []}, secret_store=vault)
+    await router.store.registry.upsert_credential(credential)
+
+    with pytest.raises(AdapterError) as excinfo:
+        await open_session(router, reg, credential_ref="cred-gone")
+    assert "已被撤销" in excinfo.value.message
+    assert SECRET_VALUE not in excinfo.value.message
 
 
 async def test_secretish_env_template_is_warned_about(mock_router):

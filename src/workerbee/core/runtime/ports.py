@@ -116,6 +116,7 @@ class HarnessPort(Protocol):
         system_prompt: str | None,
         initial_input: str | None = None,
         permission_mode: str | None = None,
+        credential_ref: str | None = None,
         cwd: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> SessionHandle: ...
@@ -126,6 +127,9 @@ class HarnessPort(Protocol):
     「一次性执行一条 prompt 然后退出」（如 ``claude -p``），它们没有「先建空会话
     再注入」这种形态。若适配器确实支持运行中注入（``interact=True``），
     内核在首轮之后还会继续用 ``send_input`` 投递 BTW 等消息。
+
+    ``credential_ref`` 是节点候选上指定的凭据引用（ExecutionProfile.credential_ref），
+    优先级高于 harness 登记时的 ``auth_binding``。为 None 时回退到 ``auth_binding``。
     """
 
     async def resume_session(

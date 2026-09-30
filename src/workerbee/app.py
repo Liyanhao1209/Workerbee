@@ -236,6 +236,7 @@ class Engine:
             on_session_died=self._on_session_died,
             on_log=self._log_adapter,
             registration_provider=self._harness_registration,
+            credential_resolver=self._resolve_session_credential,
         )
         try:
             await client.ensure_connected(attempts=3, delay=0.5)
@@ -252,6 +253,43 @@ class Engine:
 
     async def _harness_registration(self, harness_id: str) -> Any:
         return await self.store.registry.get_harness(harness_id)
+
+    async def _resolve_session_credential(
+        self, harness_id: str, credential_ref: str | None
+    ) -> Any:
+        """supervisor 形态下的凭据解析点（SupervisorClient 的 credential_resolver）。
+
+        解析只能发生在 core：凭据注册表与凭据库口令都在这里，supervisor 刻意
+        两者都没有。节点候选的 ``credential_ref`` 优先于 harness 的
+        ``auth_binding``；两者皆无返回 None（本机登录态）。解析出的材料随
+        session.create 参数经本机 socket 发给 supervisor，不落日志、不进事件。
+        """
+        from .adapters.host.router import resolve_credential_material
+
+        ref_id = credential_ref
+        if not ref_id:
+            reg = await self.store.registry.get_harness(harness_id)
+            ref_id = reg.auth_binding if reg else None
+        if not ref_id:
+            return None
+        return await resolve_credential_material(
+            self.store, self._secret_store, harness_id=harness_id, ref_id=ref_id
+        )
+
+    async def store_secret(
+        self, locator: str, values: dict[str, str], *, label: str | None = None
+    ) -> None:
+        """写入凭据本体，并**立即**把值登记进脱敏器。
+
+        脱敏器的已知值清单是在解锁时一次性登记的（unlock_secrets）；解锁之后
+        新增的密值若不在此处补登记，会以明文形态通过事件日志与历史的脱敏检查——
+        一个「看着在脱敏」的静默失效点。
+        """
+        if self._secret_store is None:
+            raise RuntimeError("凭据库未解锁，无法写入")
+        await self._secret_store.put(locator, values, label=label)
+        if self._redactor is not None:
+            self._redactor.bind_many(values.values())
 
     async def _deliver_approval(
         self, approval: Any, status: Any, modified_action: str | None

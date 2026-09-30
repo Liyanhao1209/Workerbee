@@ -265,3 +265,115 @@ class _FakeStage:
     task_id = "t1"
     node_id = "A"
     node_name = "A"
+
+
+# ===========================================================================
+# 凭据材料的传递（AUTH-02：core 解析、supervisor 透传，全程不落日志）
+# ===========================================================================
+
+
+async def test_create_session_forwards_resolved_credential():
+    """SupervisorClient 把解析好的凭据材料放进 session.create 参数。"""
+    from workerbee.adapters.host.remote import SupervisorClient
+
+    sent: list[dict] = []
+
+    async def resolver(harness_id: str, credential_ref: str | None):
+        assert credential_ref == "cred-1"
+        return {"api_key": "sk-test-forward"}
+
+    client = SupervisorClient("/nonexistent.sock", credential_resolver=resolver)
+
+    async def fake_call(method, params=None, *, timeout=None):
+        sent.append({"method": method, "params": params})
+        return {"session_ref": "s1", "harness_id": "h1"}
+
+    client.call = fake_call  # type: ignore[assignment]
+    handle = await client.create_session(
+        harness_id="h1",
+        attempt=_FakeAttempt(),
+        stage=_FakeStage(),
+        model_name="m1",
+        reasoning_effort=None,
+        system_prompt=None,
+        credential_ref="cred-1",
+    )
+    assert handle.session_ref == "s1"
+    assert sent[0]["params"]["credential"] == {"api_key": "sk-test-forward"}
+
+
+async def test_create_session_without_credential_omits_the_key():
+    """没有凭据时参数里**不出现** credential 键——「没有」与「空」要分清。"""
+    from workerbee.adapters.host.remote import SupervisorClient
+
+    sent: list[dict] = []
+
+    async def resolver(harness_id: str, credential_ref: str | None):
+        return None
+
+    client = SupervisorClient("/nonexistent.sock", credential_resolver=resolver)
+
+    async def fake_call(method, params=None, *, timeout=None):
+        sent.append(params)
+        return {"session_ref": "s1", "harness_id": "h1"}
+
+    client.call = fake_call  # type: ignore[assignment]
+    await client.create_session(
+        harness_id="h1",
+        attempt=_FakeAttempt(),
+        stage=_FakeStage(),
+        model_name="m1",
+        reasoning_effort=None,
+        system_prompt=None,
+    )
+    assert "credential" not in sent[0]
+
+
+async def test_credential_ref_without_resolver_is_an_explicit_failure():
+    """候选指定了凭据但客户端没配解析器：明确失败，不静默退回本机登录态。"""
+    from workerbee.adapters.host.remote import SupervisorClient
+    from workerbee.adapters.sdk.protocol import AdapterError
+
+    client = SupervisorClient("/nonexistent.sock")
+    with pytest.raises(AdapterError) as excinfo:
+        await client.create_session(
+            harness_id="h1",
+            attempt=_FakeAttempt(),
+            stage=_FakeStage(),
+            model_name="m1",
+            reasoning_effort=None,
+            system_prompt=None,
+            credential_ref="cred-1",
+        )
+    assert "凭据解析器" in excinfo.value.message
+
+
+async def test_supervisor_forwards_credential_to_router(supervisor):
+    """supervisor 把 core 解析好的材料原样交给它持有的 router。"""
+    from workerbee.core.runtime.ports import SessionHandle
+
+    captured: dict = {}
+
+    class _RecordingHarness:
+        async def create_session(self, **kwargs):
+            captured.update(kwargs)
+            return SessionHandle(session_ref="s-rec", harness_id=kwargs["harness_id"])
+
+    original = supervisor.harness
+    supervisor.harness = _RecordingHarness()
+    try:
+        result = await supervisor._m_session_create(
+            {
+                "harness_id": "h1",
+                "attempt_id": "at1",
+                "stage_id": "s1",
+                "task_id": "t1",
+                "node_id": "A",
+                "model_name": "m1",
+                "credential": {"api_key": "sk-test-forward"},
+            }
+        )
+        assert result["session_ref"] == "s-rec"
+        assert captured["credential"] == {"api_key": "sk-test-forward"}
+    finally:
+        supervisor.harness = original

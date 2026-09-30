@@ -112,6 +112,7 @@ __all__ = [
     "BUILTIN_ADAPTERS",
     "ADAPTER_ALIASES",
     "child_env",
+    "resolve_credential_material",
     "EventCallback",
     "PermissionCallback",
     "ExitCallback",
@@ -220,6 +221,66 @@ def _with_initial_input(
     merged = dict(extra or {})
     merged.setdefault("prompt", initial_input)
     return merged
+
+
+async def resolve_credential_material(
+    store: Any,
+    secret_store: Any,
+    *,
+    harness_id: str,
+    ref_id: str | None,
+) -> dict[str, str] | None:
+    """把凭据引用解析成注入材料（模块级，供 router 与组合根共用一份逻辑）。
+
+    两个调用点：``HarnessRouter._resolve_credential``（in_process 形态）与
+    ``app.py`` 给 ``SupervisorClient`` 注入的解析器（supervisor 形态——core 持有
+    注册表与凭据库口令，supervisor 两者都没有，所以只能由 core 解析后随
+    session.create 参数带过去）。两处若各写一份，判撤与判空的口径迟早漂移。
+
+    返回值**只**允许流向 ``HarnessConfig.credential`` / session.create 参数。
+    任何日志与异常里最多出现 locator，绝不出现值（AUTH-02）。
+    """
+    if not ref_id:
+        return None  # 依赖本机登录态
+    ref = await store.registry.get_credential(ref_id)
+    if ref is None:
+        raise AdapterError(
+            ErrorCode.HARNESS_UNAVAILABLE,
+            f"harness {harness_id} 引用了不存在的凭据：{ref_id}",
+            {"harness_id": harness_id, "credential_id": ref_id},
+        )
+    if not ref.is_usable():
+        raise AdapterError(
+            ErrorCode.HARNESS_UNAVAILABLE,
+            f"harness {harness_id} 引用的凭据已被撤销：{ref.credential_id}",
+            {"harness_id": harness_id, "credential_id": ref.credential_id},
+        )
+    locator = ref.secret_locator
+    if not locator:
+        # harness_login：凭据由 harness 自己的登录态提供，框架无从也无权读取。
+        return None
+    if secret_store is None:
+        raise AdapterError(
+            ErrorCode.HARNESS_UNAVAILABLE,
+            f"harness {harness_id} 引用了凭据（locator={locator}），"
+            f"但凭据库未解锁（内核启动时未提供口令），无法解析",
+            {"harness_id": harness_id, "locator": locator},
+        )
+    try:
+        credential = await secret_store.get(locator)
+    except Exception as exc:  # noqa: BLE001 - 消息里只含 locator，不含值
+        raise AdapterError(
+            ErrorCode.HARNESS_UNAVAILABLE,
+            f"读取凭据失败（locator={locator}）：{type(exc).__name__}: {exc}",
+            {"harness_id": harness_id, "locator": locator},
+        ) from exc
+    if not credential:
+        raise AdapterError(
+            ErrorCode.HARNESS_UNAVAILABLE,
+            f"凭据为空或不存在（locator={locator}）",
+            {"harness_id": harness_id, "locator": locator},
+        )
+    return dict(credential)
 
 
 @dataclass
@@ -533,10 +594,18 @@ class HarnessRouter:
         system_prompt: str | None,
         initial_input: str | None = None,
         permission_mode: str | None = None,
+        credential_ref: str | None = None,
+        credential: dict[str, str] | None = None,
         cwd: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> SessionHandle:
         reg = await self._registration(harness_id)
+
+        # credential 是调用方已解析好的材料（supervisor 形态下由 core 解析后经
+        # socket 带来——supervisor 没有凭据库口令，自己解不开）。未给定时才在本地
+        # 按 credential_ref → auth_binding 的顺序解析。
+        if credential is None:
+            credential = await self._resolve_credential(reg, credential_ref)
 
         checkpoint_ref = getattr(attempt, "resume_from_checkpoint", None)
         if checkpoint_ref:
@@ -552,12 +621,12 @@ class HarnessRouter:
                 system_prompt=system_prompt,
                 initial_input=initial_input,
                 permission_mode=permission_mode,
+                credential=credential,
                 cwd=cwd,
                 extra=extra,
             )
 
         proc = await self._ensure_process(harness_id)
-        credential = await self._resolve_credential(reg)
         request = self._build_request(
             reg,
             attempt=attempt,
@@ -592,6 +661,7 @@ class HarnessRouter:
             model_name=str(snapshot.get("model_name") or ""),
             reasoning_effort=snapshot.get("reasoning_effort"),
             system_prompt=None,
+            credential_ref=snapshot.get("credential_ref"),
         )
 
     async def _resume(
@@ -606,11 +676,14 @@ class HarnessRouter:
         system_prompt: str | None = None,
         initial_input: str | None = None,
         permission_mode: str | None = None,
+        credential_ref: str | None = None,
+        credential: dict[str, str] | None = None,
         cwd: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> SessionHandle:
         proc = await self._ensure_process(reg.harness_id)
-        credential = await self._resolve_credential(reg)
+        if credential is None:
+            credential = await self._resolve_credential(reg, credential_ref)
         request = self._build_request(
             reg,
             attempt=attempt,
@@ -1222,62 +1295,35 @@ class HarnessRouter:
             params.setdefault(key, value)
         return params
 
-    async def _resolve_credential(self, reg: HarnessRegistration) -> dict[str, str] | None:
-        """按 ``auth_binding`` 从 Secret Store 取凭据明文。
+    async def _resolve_credential(
+        self, reg: HarnessRegistration, credential_ref: str | None = None
+    ) -> dict[str, str] | None:
+        """解析本次会话要用的凭据。
 
-        返回值**只**允许流向 ``HarnessConfig.credential``。任何日志与异常里
-        最多出现 locator（AUTH-02）。
+        节点候选上的 ``credential_ref`` 优先于 harness 登记时的 ``auth_binding``
+        （候选是更具体的意图）。返回值**只**允许流向 ``HarnessConfig.credential``。
+        任何日志与异常里最多出现 locator（AUTH-02）。
         """
-        if not reg.auth_binding:
+        ref_id = credential_ref or reg.auth_binding
+        if not ref_id:
             return None  # 依赖本机登录态
         if self.store is None:
             # standalone（supervisor）没有 core 的凭据注册表。明确失败，不要拿
             # 「本机登录态」顶上——那等于换了一份身份（AUTH-02）。
+            # supervisor 形态下正常路径不走到这里：core 解析好材料后随
+            # session.create 参数直接带过来（见 create_session 的 credential 参数）。
             raise AdapterError(
                 ErrorCode.HARNESS_UNAVAILABLE,
-                f"harness {reg.harness_id} 绑定了凭据引用 {reg.auth_binding}，"
+                f"harness {reg.harness_id} 绑定了凭据引用 {ref_id}，"
                 f"但当前是 standalone 模式（没有 core 的凭据注册表），无法解析",
-                {"harness_id": reg.harness_id, "credential_id": reg.auth_binding},
+                {"harness_id": reg.harness_id, "credential_id": ref_id},
             )
-        ref = await self.store.registry.get_credential(reg.auth_binding)
-        if ref is None:
-            raise AdapterError(
-                ErrorCode.HARNESS_UNAVAILABLE,
-                f"harness {reg.harness_id} 绑定了不存在的凭据引用：{reg.auth_binding}",
-                {"harness_id": reg.harness_id, "credential_id": reg.auth_binding},
-            )
-        if not ref.is_usable():
-            raise AdapterError(
-                ErrorCode.HARNESS_UNAVAILABLE,
-                f"harness {reg.harness_id} 绑定的凭据已被撤销：{ref.credential_id}",
-                {"harness_id": reg.harness_id, "credential_id": ref.credential_id},
-            )
-        locator = ref.secret_locator
-        if not locator:
-            # harness_login：凭据由 harness 自己的登录态提供，框架无从也无权读取。
-            return None
-        if self.secret_store is None:
-            raise AdapterError(
-                ErrorCode.HARNESS_UNAVAILABLE,
-                f"harness {reg.harness_id} 绑定了凭据（locator={locator}），"
-                f"但路由器未配置 SecretStore，无法解析",
-                {"harness_id": reg.harness_id, "locator": locator},
-            )
-        try:
-            credential = await self.secret_store.get(locator)
-        except Exception as exc:  # noqa: BLE001 - 消息里只含 locator，不含值
-            raise AdapterError(
-                ErrorCode.HARNESS_UNAVAILABLE,
-                f"读取凭据失败（locator={locator}）：{type(exc).__name__}: {exc}",
-                {"harness_id": reg.harness_id, "locator": locator},
-            ) from exc
-        if not credential:
-            raise AdapterError(
-                ErrorCode.HARNESS_UNAVAILABLE,
-                f"凭据为空或不存在（locator={locator}）",
-                {"harness_id": reg.harness_id, "locator": locator},
-            )
-        return dict(credential)
+        return await resolve_credential_material(
+            self.store,
+            self.secret_store,
+            harness_id=reg.harness_id,
+            ref_id=ref_id,
+        )
 
     async def _call(
         self, proc: AdapterProcess, method: str, params: dict[str, Any]

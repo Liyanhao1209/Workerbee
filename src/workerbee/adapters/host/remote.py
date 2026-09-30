@@ -34,6 +34,12 @@ __all__ = ["SupervisorClient"]
 
 EventCallback = Callable[[AdapterEvent], Awaitable[None]]
 DiedCallback = Callable[[str, str], Awaitable[None]]
+CredentialResolver = Callable[[str, str | None], Awaitable[dict[str, str] | None]]
+"""（harness_id, 节点候选的 credential_ref）→ 注入材料或 None（本机登录态）。
+
+由组合根注入。core 持有凭据注册表与凭据库口令，supervisor 两者都没有——
+所以解析只能发生在 core，材料随 session.create 参数经本机 socket 带过去。
+"""
 
 
 class SupervisorClient:
@@ -47,6 +53,7 @@ class SupervisorClient:
         on_session_died: DiedCallback | None = None,
         on_log: Callable[[str], None] | None = None,
         registration_provider: Any | None = None,
+        credential_resolver: CredentialResolver | None = None,
         call_timeout: float = 60.0,
     ) -> None:
         self.socket_path = Path(socket_path)
@@ -57,6 +64,9 @@ class SupervisorClient:
         #: supervisor 刻意不读 core 的数据库，所以「怎么启动这个 harness」
         #: 必须由 core 显式告诉它。
         self.registration_provider = registration_provider
+        #: 由组合根注入：凭据引用 → 注入材料。为 None 时又收到 credential_ref，
+        #: 必须明确失败——静默退回本机登录态等于悄悄换了一份身份（AUTH-02）。
+        self.credential_resolver = credential_resolver
         self.call_timeout = call_timeout
 
         self._reader: asyncio.StreamReader | None = None
@@ -304,28 +314,45 @@ class SupervisorClient:
         reasoning_effort: str | None, system_prompt: str | None,
         initial_input: str | None = None,
         permission_mode: str | None = None,
+        credential_ref: str | None = None,
         cwd: str | None = None, extra: dict | None = None,
     ) -> SessionHandle:
         await self._ensure_harness_ready(harness_id)
+        credential: dict[str, str] | None = None
+        if self.credential_resolver is not None:
+            # 节点候选的 credential_ref 缺省时，解析器内部回退到 harness 的
+            # auth_binding——这个回退需要读注册表，只能由 core 侧做。
+            credential = await self.credential_resolver(harness_id, credential_ref)
+        elif credential_ref:
+            raise AdapterError(
+                ErrorCode.HARNESS_UNAVAILABLE,
+                f"节点候选指定了凭据 {credential_ref}，但当前客户端未配置凭据解析器；"
+                f"不能静默退回本机登录态",
+                {"harness_id": harness_id, "credential_id": credential_ref},
+            )
+        params: dict[str, Any] = {
+            "harness_id": harness_id,
+            "attempt_id": attempt.attempt_id,
+            "stage_id": stage.stage_id,
+            "task_id": stage.task_id,
+            "node_id": stage.node_id,
+            "node_name": stage.node_name,
+            "attempt_seq": attempt.attempt_seq,
+            "profile_id": attempt.profile_id,
+            "model_name": model_name,
+            "reasoning_effort": reasoning_effort,
+            "system_prompt": system_prompt,
+            "initial_input": initial_input,
+            "permission_mode": permission_mode,
+            "cwd": cwd,
+            "extra": extra,
+        }
+        if credential is not None:
+            # 密钥材料只出现在这里（本机 socket 的调用参数）。不进日志、不进事件。
+            params["credential"] = credential
         result = await self.call(
             METHODS.SESSION_CREATE,
-            {
-                "harness_id": harness_id,
-                "attempt_id": attempt.attempt_id,
-                "stage_id": stage.stage_id,
-                "task_id": stage.task_id,
-                "node_id": stage.node_id,
-                "node_name": stage.node_name,
-                "attempt_seq": attempt.attempt_seq,
-                "profile_id": attempt.profile_id,
-                "model_name": model_name,
-                "reasoning_effort": reasoning_effort,
-                "system_prompt": system_prompt,
-                "initial_input": initial_input,
-                "permission_mode": permission_mode,
-                "cwd": cwd,
-                "extra": extra,
-            },
+            params,
             timeout=180.0,
         )
         return SessionHandle(
