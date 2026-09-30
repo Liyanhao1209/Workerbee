@@ -378,10 +378,51 @@ export interface Task {
   updated_at?: string;
 }
 
+/** 一次工具调用的展示视图。is_error 为 null 表示结果还没回来（仍在执行）。 */
+export interface ToolCallView {
+  tool_use_id: string | null;
+  name: string | null;
+  target: string | null;
+  input_preview: string;
+  input_truncated: boolean;
+  is_error: boolean | null;
+  result_preview: string | null;
+  result_truncated: boolean;
+}
+
+/** 一次执行尝试的工作细节（GET /api/tasks/{id}/attempts/{aid}/work）。 */
+export interface AttemptWork {
+  task_id: string;
+  attempt_id: string;
+  stage_id: string | null;
+  node_id: string | null;
+  input: {
+    system_prompt?: string;
+    system_prompt_truncated?: boolean;
+    user_input?: string;
+    user_input_truncated?: boolean;
+  } | null;
+  reasoning: string | null;
+  reasoning_truncated: boolean;
+  tool_calls: ToolCallView[];
+  files_written: string[];
+  files_read: string[];
+  commands: string[];
+  artifact_ids: string[];
+}
+
+/** 产物正文（GET /api/tasks/{id}/artifacts/{aid}/content）。有界截断，已过脱敏。 */
+export interface ArtifactContent {
+  artifact_id: string;
+  text: string;
+  truncated: boolean;
+  size_bytes: number | null;
+  media_type: string | null;
+}
+
 // ===========================================================================
 // 审批（L5，HUM-03/04）
 // ===========================================================================
-
 export interface ApprovalBinding {
   task_id: string;
   stage_id: string;

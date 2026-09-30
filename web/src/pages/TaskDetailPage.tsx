@@ -22,6 +22,7 @@ import { tasks as taskApi } from '../api/endpoints';
 import { useAsync, useSubmit } from '../hooks/useAsync';
 import { asArray, asString, isRecord } from '../api/guards';
 import { AttemptCard } from './ExecutionGraphPage';
+import { ArtifactText } from '../components/AttemptWork';
 import { TaskControls, OriginOfControlText, ErrorBanner } from '../components/TaskControls';
 import { ApprovalCard } from '../components/Approval';
 import { NodeQueue } from '../components/NodeQueue';
@@ -62,6 +63,18 @@ export function TaskDetailPage(): JSX.Element {
 
   const stages = useMemo(() => data?.stages ?? [], [data]);
   const attempts = useMemo(() => data?.attempts ?? [], [data]);
+
+  /** node_id → 节点名：产物与尝试记录里只有 id，名字从阶段快照与图快照补。 */
+  const nodeNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const s of stages) {
+      if (s.node_name) map.set(s.node_id, s.node_name);
+    }
+    for (const n of task?.graph_snapshot.graph.nodes ?? []) {
+      if (!map.has(n.node_id)) map.set(n.node_id, n.name);
+    }
+    return map;
+  }, [stages, task]);
 
   /** 仍在运行的分支：任务的 failure_summary 与阶段事实取并集，避免任一侧缺失导致漏报。 */
   const runningBranches = useMemo(() => {
@@ -187,7 +200,7 @@ export function TaskDetailPage(): JSX.Element {
           ) : (
             <div className="col" style={{ gap: 6 }}>
               {artifacts.map((artifact) => (
-                <ArtifactRow key={artifact.artifact_id} artifact={artifact} />
+                <ArtifactRow key={artifact.artifact_id} artifact={artifact} nodeNames={nodeNames} />
               ))}
             </div>
           )}
@@ -582,7 +595,13 @@ function StageRow({
 // 产物
 // ---------------------------------------------------------------------------
 
-function ArtifactRow({ artifact }: { artifact: ArtifactRecord }): JSX.Element {
+function ArtifactRow({
+  artifact,
+  nodeNames,
+}: {
+  artifact: ArtifactRecord;
+  nodeNames: Map<string, string>;
+}): JSX.Element {
   const bad = !artifact.summary_ok;
   // 任务详情端点只投影部分字段（没有 digest / lineage / ref_count 等）：
   // 取不到的显示 artifact_id 或「未知」，**不补 0**。
@@ -635,8 +654,13 @@ function ArtifactRow({ artifact }: { artifact: ArtifactRecord }): JSX.Element {
       <div className="text-xs dim" style={{ marginTop: 3 }}>
         {artifact.producer ? (
           <>
-            产出者：节点 {artifact.producer.node_id?.slice(0, 8) ?? '未知'} · 阶段{' '}
-            {artifact.producer.stage_id.slice(0, 8)} · 第 {artifact.producer.attempt_seq} 次尝试
+            产出者：
+            {artifact.producer.node_id
+              ? (nodeNames.get(artifact.producer.node_id) ??
+                `节点 ${artifact.producer.node_id.slice(0, 8)}`)
+              : '未知（该产物早于生产者记录功能）'}
+            {' · 第 '}
+            {artifact.producer.attempt_seq} 次尝试
           </>
         ) : (
           '产出者：未记录'
@@ -654,6 +678,12 @@ function ArtifactRow({ artifact }: { artifact: ArtifactRecord }): JSX.Element {
       {lineage.length > 0 ? (
         <div className="text-xs dim" style={{ marginTop: 2 }}>
           来源链：{lineage.map((l) => l.slice(0, 8)).join(' → ')}
+        </div>
+      ) : null}
+
+      {artifact.producer ? (
+        <div style={{ marginTop: 4 }}>
+          <ArtifactText taskId={artifact.producer.task_id} artifactId={artifact.artifact_id} />
         </div>
       ) : null}
     </div>

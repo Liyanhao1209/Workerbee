@@ -16,6 +16,7 @@ import { useAsync } from '../hooks/useAsync';
 import { asArray } from '../api/guards';
 import { STAGE_STATES, STAGE_TRANSITIONING_STATES } from '../api/types';
 import { ExecutionCanvas } from '../graph/ExecutionCanvas';
+import { AttemptWorkPanel } from '../components/AttemptWork';
 import { TaskControls, OriginOfControlText, ErrorBanner } from '../components/TaskControls';
 import { ApprovalCard } from '../components/Approval';
 import {
@@ -716,6 +717,7 @@ function StagePanel({
 }
 
 export function AttemptCard({ attempt }: { attempt: Attempt }): JSX.Element {
+  const [showWork, setShowWork] = useState(false);
   const duration = durationBetween(attempt.started_at, attempt.ended_at);
   const outcome = attempt.outcome;
   const snapshot = attempt.profile_snapshot;
@@ -809,8 +811,7 @@ export function AttemptCard({ attempt }: { attempt: Attempt }): JSX.Element {
 
       <div className="section-title" style={{ marginTop: 6 }}>
         上下文整理记录 · {attempt.compact_events.length}
-      </div>
-      {attempt.compact_events.length === 0 ? (
+      </div>      {attempt.compact_events.length === 0 ? (
         <div className="text-xs dim">
           这次尝试没有发生上下文整理（若配置了阈值却从未触发，检查 harness 是否支持该能力）。
         </div>
@@ -826,6 +827,13 @@ export function AttemptCard({ attempt }: { attempt: Attempt }): JSX.Element {
           ))}
         </ul>
       )}
+
+      <div style={{ marginTop: 6 }}>
+        <button type="button" className="btn btn--xs" onClick={() => setShowWork((v) => !v)}>
+          {showWork ? '收起工作细节' : '工作细节（输入 / 推理 / 工具 / 文件）'}
+        </button>
+        {showWork ? <AttemptWorkPanel taskId={attempt.task_id} attemptId={attempt.attempt_id} /> : null}
+      </div>
     </div>
   );
 }

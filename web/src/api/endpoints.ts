@@ -25,6 +25,8 @@ import type {
   ProbeResult,
   PruneResult,
   ReorderResult,
+  ArtifactContent,
+  AttemptWork,
   ResumeResponse,
   RevisionSaveResult,
   RevisionSource,
@@ -178,6 +180,17 @@ export const tasks = {
 
   get: (taskId: string) => request<TaskDetail>(`/api/tasks/${encodeURIComponent(taskId)}`),
 
+  /** 单次执行尝试的工作细节：输入、推理、工具调用、涉及的文件。 */
+  attemptWork: (taskId: string, attemptId: string) =>
+    request<AttemptWork>(
+      `/api/tasks/${encodeURIComponent(taskId)}/attempts/${encodeURIComponent(attemptId)}/work`,
+    ),
+
+  /** 产物正文（有界截断，已脱敏）。 */
+  artifactContent: (taskId: string, artifactId: string) =>
+    request<ArtifactContent>(
+      `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
+    ),
   pause: (taskId: string, body: { from_node_id?: string | null; reason?: string | null } = {}) =>
     request<PauseResponse>(`/api/tasks/${encodeURIComponent(taskId)}/pause`, { method: 'POST', body }),
 
