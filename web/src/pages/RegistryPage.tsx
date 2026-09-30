@@ -854,7 +854,7 @@ function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
           </div>
         </div>
         <div className="panel__hint">
-          这里只登记引用。密钥本体存放在 Secret Store，界面不读取也不显示。
+          密钥加密保存在本机凭据库，界面只显示引用信息，不显示密钥本身。
         </div>
 
         {submit.error && !revoking ? (
@@ -871,8 +871,8 @@ function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
           <Loading label="加载凭据列表" />
         ) : rows.length === 0 ? (
           <Empty
-            title="尚未登记任何凭据引用"
-            hint="凭据引用只记录「去哪里取」。密钥本身请先写入 Secret Store，这里只登记条目名。"
+            title="还没有任何凭据"
+            hint="新建一份凭据后，配置节点时就可以选择用它调用模型服务；不选则默认使用 harness 本机的登录状态。"
             action={
               <button type="button" className="btn btn--sm btn--primary" onClick={() => setCreateOpen(true)}>
                 新建凭据
@@ -884,11 +884,11 @@ function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
             <table className="table">
               <thead>
                 <tr>
-                  <th>label</th>
-                  <th>credential_id</th>
+                  <th>名称</th>
+                  <th>ID</th>
                   <th>类型</th>
-                  <th>secret_locator</th>
-                  <th>base_url</th>
+                  <th>凭据库条目</th>
+                  <th>服务地址</th>
                   <th>状态</th>
                   <th style={{ width: 90 }}>操作</th>
                 </tr>
@@ -1001,27 +1001,42 @@ function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
 function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }): JSX.Element {
   const [label, setLabel] = useState('');
   const [kind, setKind] = useState<CredentialKind>('api_key');
+  const [mode, setMode] = useState<'secret' | 'locator'>('secret');
+  const [apiKey, setApiKey] = useState('');
   const [locator, setLocator] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const submit = useSubmit();
 
+  const isLogin = kind === 'harness_login';
+
   const save = async (): Promise<void> => {
     if (!label.trim()) {
-      setFormError('label 必填。');
+      setFormError('名称必填。');
       return;
     }
-    if (kind !== 'harness_login' && !locator.trim()) {
-      setFormError('该类型必须填写指向 Secret Store 的条目名（只有 harness_login 可以留空）。');
+    if (!isLogin && mode === 'secret' && !apiKey.trim()) {
+      setFormError('请填写 API Key。');
+      return;
+    }
+    if (!isLogin && mode === 'locator' && !locator.trim()) {
+      setFormError('请填写凭据库中已有条目的名称。');
       return;
     }
     setFormError(null);
+    const secret: Record<string, string> | null =
+      !isLogin && mode === 'secret'
+        ? kind === 'base_url_pair'
+          ? { api_key: apiKey.trim(), base_url: baseUrl.trim() }
+          : { api_key: apiKey.trim() }
+        : null;
     const saved = await submit.run(() =>
       registryApi.createCredential({
         label: label.trim(),
         kind,
-        secret_locator: kind === 'harness_login' ? null : locator.trim(),
+        secret_locator: isLogin || mode === 'secret' ? null : locator.trim(),
         base_url: baseUrl.trim() || null,
+        secret,
       }),
     );
     if (saved) onSaved();
@@ -1042,10 +1057,6 @@ function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSa
         </>
       }
     >
-      <Banner variant="info" title="这里只登记引用">
-        本接口只登记<strong>引用</strong>；密钥本体只进 Secret Store，前端不收、不显示、不回显。
-      </Banner>
-
       {formError ? (
         <Banner variant="danger" title="无法提交">
           {formError}
@@ -1054,10 +1065,10 @@ function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSa
       {submit.error ? <SubmitError error={submit.error} what="新建凭据失败" /> : null}
 
       <div className="field-row">
-        <Field label="label">
-          <input className="input" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="OpenAI 生产 Key" />
+        <Field label="名称" required hint="给自己看的名字">
+          <input className="input" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="如：公司 Claude 账号" />
         </Field>
-        <Field label="类型">
+        <Field label="类型" required>
           <select
             className="select"
             value={kind}
@@ -1076,31 +1087,58 @@ function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSa
         </Field>
       </div>
 
-      <div style={{ marginTop: 'var(--sp-3)' }}>
-        <Field
-          label="指向 Secret Store 的条目名（如 secret://openai）"
-          hint="harness_login 类型请留空。"
-        >
-          <input
-            className="input input--mono"
-            value={locator}
-            disabled={kind === 'harness_login'}
-            onChange={(e) => setLocator(e.target.value)}
-            placeholder="secret://openai"
-          />
-        </Field>
-      </div>
+      {isLogin ? (
+        <div style={{ marginTop: 'var(--sp-3)' }} className="text-sm dim">
+          这种类型不需要填写任何密钥：执行时直接使用该 harness 在这台机器上的登录状态。
+        </div>
+      ) : (
+        <>
+          <div style={{ marginTop: 'var(--sp-3)' }}>
+            <Field label="密钥来源" required>
+              <select className="select" value={mode} onChange={(e) => setMode(e.target.value as 'secret' | 'locator')}>
+                <option value="secret">直接填写密钥</option>
+                <option value="locator">引用凭据库中已有的条目</option>
+              </select>
+            </Field>
+          </div>
 
-      <div style={{ marginTop: 'var(--sp-3)' }}>
-        <Field label="base_url" hint="Base URL + Key 类型才需要；其它类型可留空。">
-          <input
-            className="input input--mono"
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
-            placeholder="https://api.openai.com/v1"
-          />
-        </Field>
-      </div>
+          {mode === 'secret' ? (
+            <div style={{ marginTop: 'var(--sp-3)' }}>
+              <Field label="API Key" required hint="加密后保存；保存后这里、日志和历史记录都不会再显示它。">
+                <input
+                  className="input input--mono"
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="sk-..."
+                />
+              </Field>
+            </div>
+          ) : (
+            <div style={{ marginTop: 'var(--sp-3)' }}>
+              <Field label="条目名" required hint="凭据库中已有条目的名字，通常只有手工管理凭据库时才用这种方式。">
+                <input
+                  className="input input--mono"
+                  value={locator}
+                  onChange={(e) => setLocator(e.target.value)}
+                  placeholder="secret://openai"
+                />
+              </Field>
+            </div>
+          )}
+
+          <div style={{ marginTop: 'var(--sp-3)' }}>
+            <Field label="服务地址" hint="只有「Base URL + Key」类型需要；其它类型留空。">
+              <input
+                className="input input--mono"
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                placeholder="https://api.example.com/v1"
+              />
+            </Field>
+          </div>
+        </>
+      )}
     </Modal>
   );
 }
