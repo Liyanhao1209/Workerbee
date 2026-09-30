@@ -1,9 +1,13 @@
 /**
- * 模板（/templates）：从流程生成模板，再按模板实例化出新流程。
+ * 模板（/templates）：流程模板、节点模板、凭据模板三类可复用配置。
  *
  * 两条硬约束贯穿整页：
- *   1. 模板**不携带凭据**——生成时把凭据剥离成占位引用，实例化时必须显式绑定；
+ *   1. 模板**不携带密钥**——密钥本体永远进不了模板；本机凭据的引用（只是个
+ *      id）默认保留，同机实例化自动绑定，跨机使用时才要求重新选择；
  *   2. 绑定不全时**不编造凭据**——如实把 missing_bindings 摆出来，绝不谎报「实例化成功」。
+ *
+ * 凭据模板不是独立实体：它就是注册表里保存的凭据，在这里露出是为了让
+ * 「保存一次、建节点时引用」这条路径和流程/节点模板出现在同一个地方。
  */
 
 import { useState } from 'react';
@@ -21,6 +25,7 @@ import type {
   TemplatePayload,
 } from '../api/types';
 import { Banner, Chip, Empty, Field, Loading, Modal, Pill, ShortId } from '../components/common';
+import { CredentialsTab } from '../components/Credentials';
 import { useAsync, useSubmit } from '../hooks/useAsync';
 import { CREDENTIAL_KIND_LABELS, TEMPLATE_KIND_LABELS } from '../labels';
 
@@ -84,22 +89,32 @@ function slotsTitle(slots: CredentialPlaceholder[]): string {
     const label = slot.original_label ?? '未命名';
     return kind ? `${slot.slot}（原 ${label} · ${kind}）` : `${slot.slot}（原 ${label}）`;
   });
-  return `使用模板创建流程时，这些凭据需要重新选择：${described.join('、')}`;
+  return `这个模板记录了 ${slots.length} 处凭据引用：同机使用自动绑定，来自他机的引用需要重新选择。${described.join('、')}`;
 }
 
 // ===========================================================================
 // 页面
 // ===========================================================================
 
+type TabKey = 'workflow' | 'node' | 'credential';
+
+const TABS: { key: TabKey; label: string }[] = [
+  { key: 'workflow', label: '流程模板' },
+  { key: 'node', label: '节点模板' },
+  { key: 'credential', label: '凭据模板' },
+];
+
 export function TemplatesPage(): JSX.Element {
   const templates = useAsync(templatesApi.list, []);
+  const [tab, setTab] = useState<TabKey>('workflow');
   const [createOpen, setCreateOpen] = useState(false);
   const [bindTarget, setBindTarget] = useState<Template | null>(null);
   const [outcome, setOutcome] = useState<{ template: Template; result: TemplateInstantiateResult } | null>(null);
   const [removing, setRemoving] = useState<Template | null>(null);
   const submit = useSubmit();
 
-  const rows: Template[] = templates.data?.templates ?? [];
+  const allRows: Template[] = templates.data?.templates ?? [];
+  const rows = allRows.filter((t) => t.kind === tab);
 
   const runInstantiate = async (template: Template, bindings: Record<string, string>): Promise<void> => {
     const result = await submit.run(() => templatesApi.instantiate(template.template_id, { bindings }));
@@ -136,20 +151,39 @@ export function TemplatesPage(): JSX.Element {
         <div className="page-head__titles">
           <h1>模板</h1>
           <div className="page-head__sub">
-            模板把一套流程结构保存下来重复使用：包含节点、连线和配置，但不保存凭据，也不保存运行中的内容。
+            把可复用的配置保存下来：流程模板存结构和节点配置，节点模板存单个节点，凭据模板存接入模型服务所需的配置。密钥永远不会被保存。
           </div>
         </div>
         <div className="page-head__actions">
           <button type="button" className="btn btn--sm" onClick={templates.reload}>
             刷新
           </button>
-          <button type="button" className="btn btn--sm btn--primary" onClick={() => setCreateOpen(true)}>
-            生成模板
-          </button>
+          {tab !== 'credential' ? (
+            <button type="button" className="btn btn--sm btn--primary" onClick={() => setCreateOpen(true)}>
+              生成模板
+            </button>
+          ) : null}
         </div>
       </div>
 
-      <div className="panel">
+      <div className="row row--tight" style={{ marginBottom: 'var(--sp-3)' }}>
+        {TABS.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            className={tab === item.key ? 'btn btn--sm btn--primary' : 'btn btn--sm'}
+            onClick={() => setTab(item.key)}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ display: tab === 'credential' ? 'block' : 'none' }}>
+        <CredentialsTab enabled={tab === 'credential'} />
+      </div>
+
+      <div className="panel" style={{ display: tab === 'credential' ? 'none' : 'block' }}>
         <div className="panel__head">模板列表</div>
 
         {submit.error && !bindTarget && !removing ? (
@@ -166,8 +200,8 @@ export function TemplatesPage(): JSX.Element {
           <Loading label="加载模板列表" />
         ) : rows.length === 0 ? (
           <Empty
-            title="还没有任何模板"
-            hint="从已有流程生成模板时，凭据不会存进模板；用模板创建流程时需要重新选择凭据。"
+            title={tab === 'node' ? '还没有任何节点模板' : '还没有任何流程模板'}
+            hint="模板保存节点的结构、提示词和模型配置；密钥不会被保存，凭据引用默认保留、同机使用时自动绑定。"
             action={
               <button type="button" className="btn btn--sm btn--primary" onClick={() => setCreateOpen(true)}>
                 生成模板
@@ -240,8 +274,8 @@ export function TemplatesPage(): JSX.Element {
                         ) : (
                           <div className="row row--tight">
                             <span className="mono text-xs">{slots.length}</span>
-                            <Chip variant="warn" title={slotsTitle(slots)}>
-                              需重新选择
+                            <Chip variant="accent" title={slotsTitle(slots)}>
+                              含凭据引用
                             </Chip>
                           </div>
                         )}
