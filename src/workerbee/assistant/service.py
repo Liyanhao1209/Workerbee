@@ -5,8 +5,11 @@
 1. 读线程历史（assistant_message 表）→ 滑动窗口截断（不产生额外调用）；
 2. 拼 system prompt = 角色设定 + 使用指引（guidebook）+ 系统快照（snapshot）
    + 钉扎的「整理前文」摘要；
-3. LLMRouter.complete（后端链由配置里的 credential_ref 与 api_protocol 装配）；
-4. 回复过脱敏 → 落库 → 写事件 → notifier 推送。
+3. LLMRouter.stream（后端链由配置里的 credential_ref 与 api_protocol 装配）：
+   每个增量 chunk 经 notifier 推 ``assistant_chunk``（正文与推理过程分开），
+   推送失败不阻断主流程；
+4. 完整回复与推理过程过脱敏 → 落库 → 写事件 → 推最终 ``assistant_message``
+   （前端以此触发 REST 重拉对账——推送只是加速器，不是事实源）。
 
 安全边界（计划 §8）：
 - **只读**：本服务只调数据源的只读方法与仓储的助手表写入，没有任何系统写入口。
@@ -25,7 +28,7 @@ from ..core.domain.base import DomainModel, new_id, utcnow
 from ..core.runtime.notifier import Notification
 from ..data.db import Database
 from ..data.event_log import EventActor, EventScope, EventType
-from ..data.llm.backend import LLMBackend, LLMError, LLMMessage
+from ..data.llm.backend import LLMBackend, LLMChunk, LLMError, LLMMessage
 from ..data.llm.router import BackendConfig, LLMRouter
 from ..data.store import Store
 from .guidebook import DEFAULT_GUIDEBOOK_BUDGET, load_guidebook
@@ -54,6 +57,12 @@ CONFIG_KEY = "assistant_config"
 
 #: 发给模型的单次调用超时（秒）。同步等待的问答不能无限挂住。
 CALL_TIMEOUT_S = 120.0
+
+#: 对话名长度上限（重命名与自动标题共用同一口径）。
+THREAD_TITLE_MAX_CHARS = 100
+
+#: 自动标题取首条用户消息的前 N 个字符。
+AUTO_TITLE_CHARS = 20
 
 _ROLE_PROMPT = """你是 Workerbee（本机多智能体工作流编排工具）的内置助手。
 
@@ -221,6 +230,19 @@ class AssistantService:
     async def list_threads(self) -> list[dict[str, Any]]:
         return await self.store.assistant.list_threads()
 
+    async def rename_thread(self, thread_id: str, title: str) -> dict[str, Any]:
+        """改线程名。标题非空、最长 100 字符（路由层已校验，这里兜底）。"""
+        await self._require_thread(thread_id)
+        title = title.strip()
+        if not title:
+            raise AssistantError("对话名不能为空")
+        if len(title) > THREAD_TITLE_MAX_CHARS:
+            raise AssistantError(f"对话名最长 {THREAD_TITLE_MAX_CHARS} 个字符")
+        await self.store.assistant.update_thread(thread_id, title=title)
+        thread = await self.store.assistant.get_thread(thread_id)
+        assert thread is not None  # _require_thread 刚查过
+        return thread
+
     async def list_messages(self, thread_id: str) -> list[dict[str, Any]]:
         await self._require_thread(thread_id)
         return await self.store.assistant.list_messages(thread_id)
@@ -242,8 +264,13 @@ class AssistantService:
     # ------------------------------------------------------------------
 
     async def send_message(self, thread_id: str, text: str) -> dict[str, Any]:
-        """同步问答：落用户消息 → 调模型 → 落助手回复 → 留痕 → 推送。"""
-        await self._require_thread(thread_id)
+        """流式问答：落用户消息前先把模型回复流式收齐（chunk 经推送通道实时下发），
+        再落库 → 留痕 → 推最终「assistant_message」供前端对账。
+
+        HTTP 响应仍在完整回复就绪后才返回（一问一答的契约不变）；「流式」体现在
+        生成期间每个增量都会推 ``assistant_chunk`` 通知，前端据此实时渲染。
+        """
+        thread = await self._require_thread(thread_id)
         router, config = await self._require_backend()
 
         # 用户消息先脱敏再入库、再发给模型：用户可能粘贴含密钥的报错（AUTH-02）。
@@ -281,43 +308,79 @@ class AssistantService:
                 "系统快照因预算裁掉了分区：" + "、".join(snapshot.trimmed)
             )
 
+        # 回复的 message_id 预先生成：chunk 推送靠它与前端的「正在生成」气泡关联。
+        reply_id = new_id()
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        final: LLMChunk | None = None
         try:
-            response = await router.complete(messages, timeout=self.call_timeout)
+            async for chunk in router.stream(messages, timeout=self.call_timeout):
+                if chunk.final:
+                    final = chunk
+                if not chunk.text:
+                    continue
+                if chunk.kind == "reasoning":
+                    reasoning_parts.append(chunk.text)
+                else:
+                    text_parts.append(chunk.text)
+                self._publish_chunk(thread_id, reply_id, chunk.kind, chunk.text)
         except LLMError as exc:
             raise AssistantCallFailed(
                 f"助手模型调用失败：{exc}",
                 hint=_call_failed_hint(exc),
             ) from exc
 
-        safe_reply = self._redact(response.text)
-        degraded = response.degraded() or bool(degraded_notes)
-        usage = response.usage
+        if final is None:
+            # 后端违反协议（流结束了却没有终帧）：如实判失败，不拿半截内容凑数。
+            raise AssistantCallFailed(
+                "助手模型的流式响应没有正常结束（缺少收尾帧）",
+                hint="稍后再试；反复出现时检查模型服务与协议选择",
+            )
+
+        safe_reply = self._redact("".join(text_parts))
+        raw_reasoning = "".join(reasoning_parts)
+        # 推理过程入库前同样过脱敏：它可能复述快照或用户消息里的敏感片段。
+        safe_reasoning = self._redact(raw_reasoning) if raw_reasoning else None
+
+        if not final.streamed:
+            degraded_notes.append("该后端不支持流式输出，本次回复是一次性完整返回的")
+        fell_back = final.fallback_from is not None
+        degraded = fell_back or bool(degraded_notes)
+        usage = final.usage
+        backend_name = final.backend or "unknown"
 
         user_message = await self.store.assistant.append_message(
             message_id=new_id(), thread_id=thread_id, role="user", content=safe_text
         )
         reply = await self.store.assistant.append_message(
-            message_id=new_id(),
+            message_id=reply_id,
             thread_id=thread_id,
             role="assistant",
             content=safe_reply,
-            backend=response.backend,
+            backend=backend_name,
             tokens_in=usage.input_tokens if usage else None,
             tokens_out=usage.output_tokens if usage else None,
             degraded=degraded,
+            reasoning=safe_reasoning,
         )
 
+        # 自动标题：线程还没有名字时，取本次（首条）用户消息的前 20 字落库。
+        if not thread.get("title"):
+            await self.store.assistant.update_thread(
+                thread_id, title=safe_text[:AUTO_TITLE_CHARS]
+            )
+
         # 留痕：后端、用量、降级、截断条数都记；对话正文不进事件日志。
-        if response.degraded():
+        if fell_back:
             await self.store.events.append(
                 scope=EventScope.ASSISTANT,
                 type=EventType.ASSISTANT_BACKEND_DEGRADED,
                 actor=EventActor.AI,
                 scope_id=thread_id,
                 payload={
-                    "fallback_from": response.fallback_from,
-                    "used": response.backend,
-                    "reasons": list(response.degraded_reasons),
+                    "fallback_from": final.fallback_from,
+                    "used": backend_name,
+                    "reasons": list(final.degraded_reasons),
                 },
             )
         await self.store.events.append(
@@ -327,11 +390,13 @@ class AssistantService:
             scope_id=thread_id,
             payload={
                 "message_id": reply["message_id"],
-                "backend": response.backend,
-                "model": response.model,
+                "backend": backend_name,
+                "model": final.model,
                 "tokens_in": usage.input_tokens if usage else None,
                 "tokens_out": usage.output_tokens if usage else None,
                 "degraded": degraded,
+                "has_reasoning": safe_reasoning is not None,
+                "streamed": final.streamed,
                 "window_dropped": window.dropped,
                 "guidebook_missing": guidebook.missing,
                 "guidebook_truncated": guidebook.truncated,
@@ -352,8 +417,30 @@ class AssistantService:
             "message": reply,
             "dropped": window.dropped,
             "degraded": degraded,
-            "degraded_reasons": degraded_notes + list(response.degraded_reasons),
+            "degraded_reasons": degraded_notes + list(final.degraded_reasons),
         }
+
+    def _publish_chunk(
+        self, thread_id: str, message_id: str, kind: str, text: str
+    ) -> None:
+        """把一条流式增量推给前端。推送是加速器不是事实源：失败不阻断主流程，
+        前端最终以 ``assistant_message`` 推送触发的 REST 重拉为准。"""
+        if self.notifier is None:
+            return
+        try:
+            self.notifier.publish(
+                Notification(
+                    kind="assistant_chunk",
+                    payload={
+                        "thread_id": thread_id,
+                        "message_id": message_id,
+                        "kind": kind,
+                        "text": self._redact(text),
+                    },
+                )
+            )
+        except Exception:  # noqa: BLE001 - 推送通道的故障不该打断一次问答
+            pass
 
     # ------------------------------------------------------------------
     # 手动整理前文（唯一会产生额外调用的记忆操作，用户显式触发）

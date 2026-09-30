@@ -14,6 +14,7 @@ import pytest
 from workerbee.assistant import (
     AssistantCallFailed,
     AssistantConfig,
+    AssistantError,
     AssistantLocked,
     AssistantNotConfigured,
     AssistantService,
@@ -136,10 +137,19 @@ async def test_full_flow_and_prompt_contents(store) -> None:
     assert message_events[0]["payload"]["backend"] == "fake-llm"
     assert "这是回答" not in str(message_events)
 
-    # 推送
-    notification = queue.get_nowait()
-    assert notification.kind == "assistant_message"
-    assert notification.payload["thread_id"] == thread["thread_id"]
+    # 推送：先是逐 chunk 增量（加速器），最后是 assistant_message 对账通知（事实源）
+    notifications = []
+    while not queue.empty():
+        notifications.append(queue.get_nowait())
+    assert {n.kind for n in notifications} == {"assistant_chunk", "assistant_message"}
+    assert notifications[-1].kind == "assistant_message"
+    assert notifications[-1].payload["thread_id"] == thread["thread_id"]
+    # 正文 chunk 按序拼起来就是完整回复
+    assembled = "".join(
+        n.payload["text"] for n in notifications
+        if n.kind == "assistant_chunk" and n.payload["kind"] == "text"
+    )
+    assert assembled == "这是回答。"
 
 
 async def test_history_is_sent_back_to_model(store) -> None:
@@ -326,6 +336,128 @@ async def test_not_found_error_suggests_switching_protocol(store) -> None:
     hint = info.value.hint
     assert "/anthropic" in hint
     assert "Anthropic 兼容" in hint
+
+
+# ---------------------------------------------------------------------------
+# 流式：chunk 推送的顺序与内容、reasoning 落库
+# ---------------------------------------------------------------------------
+
+
+async def test_chunks_are_pushed_in_order_and_reasoning_is_persisted(store) -> None:
+    """逐 chunk 推送的内容与顺序必须可见；reasoning 与正文分开累积、分开落库。"""
+    backend = FakeLLMBackend("这是回答。", reasonings=("先想清楚再答",))
+    notifier = BroadcastNotifier()
+    queue = notifier.subscribe()
+    service = await make_service(store, backend, secrets=FakeSecrets(), notifier=notifier)
+    thread = await service.create_thread(title="流式")
+
+    result = await service.send_message(thread["thread_id"], "你好")
+
+    # 推送序列：reasoning chunk → 两个 text chunk（假后端把正文拆两半）→ 最终对账
+    kinds: list[tuple[str, str, str]] = []
+    while not queue.empty():
+        n = queue.get_nowait()
+        if n.kind == "assistant_chunk":
+            kinds.append((n.payload["kind"], n.payload["text"], n.payload["message_id"]))
+        else:
+            kinds.append((n.kind, "", n.payload.get("message_id", "")))
+    assert [k[:2] for k in kinds] == [
+        ("reasoning", "先想清楚再答"),
+        ("text", "这是"),
+        ("text", "回答。"),
+        ("assistant_message", ""),
+    ]
+    # 所有 chunk 与最终对账都关联到同一个 message_id，且就是最终落库的那条
+    assert {k[2] for k in kinds} == {result["message"]["message_id"]}
+
+    # reasoning 落库且读得回来
+    assert result["message"]["reasoning"] == "先想清楚再答"
+    history = await service.list_messages(thread["thread_id"])
+    assert history[1]["reasoning"] == "先想清楚再答"
+    assert history[0]["reasoning"] is None  # 用户消息没有推理内容
+
+    # 事件里如实记录「有推理过程」，正文仍不进事件
+    events = await store.events.by_scope(*_assistant_scope(thread["thread_id"]))
+    message_events = [e for e in events if e["type"] == EventType.ASSISTANT_MESSAGE.value]
+    assert message_events[0]["payload"]["has_reasoning"] is True
+    assert "先想清楚再答" not in str(message_events)
+
+
+async def test_reasoning_is_redacted_before_store(store) -> None:
+    """推理过程可能复述敏感片段：入库前与正文同口径过脱敏。"""
+    from workerbee.security.secret_store import SecretRedactor
+
+    secret = "sk-live-redactme0123456789"
+    redactor = SecretRedactor([secret])
+    backend = FakeLLMBackend("回答", reasonings=(f"用户在问 {secret} 的事",))
+    service = await make_service(store, backend, secrets=FakeSecrets())
+    service.redactor = redactor
+    thread = await service.create_thread()
+
+    result = await service.send_message(thread["thread_id"], "你好")
+
+    assert result["message"]["reasoning"] is not None
+    assert secret not in result["message"]["reasoning"]
+    history = await service.list_messages(thread["thread_id"])
+    assert secret not in str(history)
+
+
+async def test_send_failure_persists_nothing(store) -> None:
+    """流式调用失败：不落用户消息、不落半截回复——失败的问答不留半成品。"""
+    backend = FakeLLMBackend(LLMTimeoutError("超时", backend="fake-llm"))
+    service = await make_service(store, backend, secrets=FakeSecrets())
+    thread = await service.create_thread()
+
+    with pytest.raises(AssistantCallFailed):
+        await service.send_message(thread["thread_id"], "你好")
+    assert await service.list_messages(thread["thread_id"]) == []
+
+
+# ---------------------------------------------------------------------------
+# 对话重命名与自动标题
+# ---------------------------------------------------------------------------
+
+
+async def test_first_message_sets_the_thread_title(store) -> None:
+    """没有标题的线程：首条消息发出后取前 20 字作为标题，之后不再覆盖。"""
+    backend = FakeLLMBackend("答")
+    service = await make_service(store, backend, secrets=FakeSecrets())
+    thread = await service.create_thread()  # 无标题
+
+    question = "帮我看看现在的系统状态怎么样，有没有需要处理的事情"
+    await service.send_message(thread["thread_id"], question)
+
+    renamed = await service.store.assistant.get_thread(thread["thread_id"])
+    assert renamed["title"] == question[:20]
+
+    # 第二条消息不再改标题
+    await service.send_message(thread["thread_id"], "再换个问题")
+    again = await service.store.assistant.get_thread(thread["thread_id"])
+    assert again["title"] == question[:20]
+
+
+async def test_explicit_title_is_not_overwritten(store) -> None:
+    backend = FakeLLMBackend("答")
+    service = await make_service(store, backend, secrets=FakeSecrets())
+    thread = await service.create_thread(title="我起的名字")
+    await service.send_message(thread["thread_id"], "你好")
+    kept = await service.store.assistant.get_thread(thread["thread_id"])
+    assert kept["title"] == "我起的名字"
+
+
+async def test_rename_thread(store) -> None:
+    service = await make_service(store, FakeLLMBackend("答"), secrets=FakeSecrets())
+    thread = await service.create_thread(title="旧名字")
+
+    renamed = await service.rename_thread(thread["thread_id"], "  新名字  ")
+    assert renamed["title"] == "新名字"
+
+    with pytest.raises(AssistantError, match="不能为空"):
+        await service.rename_thread(thread["thread_id"], "   ")
+    with pytest.raises(AssistantError, match="最长"):
+        await service.rename_thread(thread["thread_id"], "长" * 101)
+    with pytest.raises(KeyError):
+        await service.rename_thread("不存在的线程", "名字")
 
 
 # ---------------------------------------------------------------------------

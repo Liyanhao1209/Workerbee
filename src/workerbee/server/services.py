@@ -1446,6 +1446,22 @@ class AssistantService(_Service):
         thread = await self._core().create_thread(title=(req.title or "").strip())
         return S.AssistantThreadResponse.model_validate(thread)
 
+    async def rename_thread(
+        self, thread_id: str, req: S.AssistantThreadRenameRequest
+    ) -> S.AssistantThreadResponse:
+        title = req.title.strip()
+        if not title:
+            raise BadRequest("对话名不能为空。")
+        if len(title) > 100:
+            raise BadRequest("对话名太长了，最多 100 个字符。")
+        try:
+            thread = await self._core().rename_thread(thread_id, title)
+        except KeyError:
+            raise NotFound(f"对话不存在: {thread_id}") from None
+        except AssistantError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.AssistantThreadResponse.model_validate(thread)
+
     async def list_messages(self, thread_id: str) -> S.AssistantMessageListResponse:
         try:
             messages = await self._core().list_messages(thread_id)

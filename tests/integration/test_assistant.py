@@ -217,6 +217,60 @@ async def test_missing_thread_is_404(client: Any) -> None:
     assert resp.status_code == 404
 
 
+# ===========================================================================
+# 重命名与自动标题
+# ===========================================================================
+
+
+async def test_rename_thread_via_api(client: Any) -> None:
+    thread = (await client.post("/api/assistant/threads", json={"title": "旧"})).json()
+    tid = thread["thread_id"]
+
+    renamed = await client.patch(f"/api/assistant/threads/{tid}", json={"title": "新名字"})
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["title"] == "新名字"
+
+    listing = (await client.get("/api/assistant/threads")).json()
+    assert {t["thread_id"]: t["title"] for t in listing["threads"]}[tid] == "新名字"
+
+
+async def test_rename_thread_rejects_bad_titles(client: Any) -> None:
+    thread = (await client.post("/api/assistant/threads", json={})).json()
+    tid = thread["thread_id"]
+
+    empty = await client.patch(f"/api/assistant/threads/{tid}", json={"title": "   "})
+    assert empty.status_code == 400
+    assert "空" in empty.json()["detail"]
+
+    too_long = await client.patch(f"/api/assistant/threads/{tid}", json={"title": "长" * 101})
+    assert too_long.status_code == 400
+    assert "100" in too_long.json()["detail"]
+
+    missing = await client.patch("/api/assistant/threads/不存在", json={"title": "x"})
+    assert missing.status_code == 404
+
+
+async def test_first_message_sets_title_via_api(
+    client: Any, engine: Engine, backend: FakeLLMBackend
+) -> None:
+    await _setup_credential_and_config(engine, client)
+    thread = (await client.post("/api/assistant/threads", json={})).json()
+    tid = thread["thread_id"]
+
+    question = " Workerbee 的审批在哪里处理，能不能给我指一下路径？"
+    sent = await client.post(
+        f"/api/assistant/threads/{tid}/messages", json={"content": question}
+    )
+    assert sent.status_code == 200, sent.text
+
+    listing = (await client.get("/api/assistant/threads")).json()
+    title = {t["thread_id"]: t["title"] for t in listing["threads"]}[tid]
+    assert title == question.strip()[:20]
+
+    # 消息响应里带 reasoning 字段（假后端没有推理内容：是 None，不是空串）
+    assert sent.json()["message"]["reasoning"] is None
+
+
 async def test_empty_message_rejected(client: Any, engine: Engine) -> None:
     thread = (await client.post("/api/assistant/threads", json={})).json()
     resp = await client.post(

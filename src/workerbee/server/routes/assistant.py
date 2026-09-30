@@ -34,6 +34,17 @@ async def list_threads(services: ServicesDep) -> S.AssistantThreadListResponse:
     return await services.assistant.list_threads()
 
 
+@router.patch(
+    "/api/assistant/threads/{thread_id}",
+    response_model=S.AssistantThreadResponse,
+    summary="重命名助手对话",
+)
+async def rename_thread(
+    thread_id: str, req: S.AssistantThreadRenameRequest, services: ServicesDep
+) -> S.AssistantThreadResponse:
+    return await services.assistant.rename_thread(thread_id, req)
+
+
 @router.get(
     "/api/assistant/threads/{thread_id}/messages",
     response_model=S.AssistantMessageListResponse,
@@ -53,7 +64,7 @@ async def list_messages(
 async def send_message(
     thread_id: str, req: S.AssistantSendRequest, services: ServicesDep
 ) -> S.AssistantSendResponse:
-    """一问一答同步返回。生成期间前端显示「正在生成」。"""
+    """一问一答同步返回完整回复；生成期间的增量经 WS 推 ``assistant_chunk``。"""
     return await services.assistant.send_message(thread_id, req)
 
 

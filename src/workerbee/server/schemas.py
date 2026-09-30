@@ -105,6 +105,7 @@ __all__ = [
     "ApprovalDecideRequest",
     "DeliveryResponse",
     "AssistantThreadCreateRequest",
+    "AssistantThreadRenameRequest",
     "AssistantThreadResponse",
     "AssistantThreadListResponse",
     "AssistantMessageResponse",
@@ -897,6 +898,13 @@ class AssistantThreadListResponse(ApiResponse):
     returned: int = 0
 
 
+class AssistantThreadRenameRequest(ApiRequest):
+    """改对话名。故意不用长度/非空的字段校验：非法取值由服务层报
+    400 + 大白话提示，而不是框架默认的 422 校验报错。"""
+
+    title: str
+
+
 class AssistantMessageResponse(ApiResponse):
     """一条对话消息。``tokens_*`` 为 None 表示后端没给用量（未知，不是 0）。"""
 
@@ -910,6 +918,8 @@ class AssistantMessageResponse(ApiResponse):
     tokens_out: int | None = None
     degraded: bool = False
     """True 表示这条回复发生过降级（备用后端、快照裁剪、指引缺失等）。"""
+    reasoning: str | None = None
+    """助手的推理过程（思维链）。None 表示这次回答没有推理内容（未知 ≠ 空串）。"""
     created_at: str
 
 
