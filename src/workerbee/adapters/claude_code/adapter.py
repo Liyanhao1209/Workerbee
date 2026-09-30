@@ -58,6 +58,7 @@ import asyncio
 import contextlib
 import json
 import os
+import tempfile
 import time
 import uuid
 from typing import Any
@@ -176,6 +177,9 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
         self._interrupted: dict[str, float] = {}
         """session_ref → 最近一次由我们发出打断的时刻，用于如实解释 result 的报错。"""
         self._watchdogs: dict[str, asyncio.Task] = {}
+        #: session_ref → 本会话专属的 MCP 配置临时文件（由 extra["mcp_tools"] 渲染），
+        #: 会话结束时尽力清理。
+        self._session_tmpfiles: dict[str, str] = {}
         self.manifest = _build_manifest(self.input_channel, idle_end_seconds=self.idle_end_seconds)
 
     # ------------------------------------------------------------------
@@ -350,15 +354,86 @@ class ClaudeCodeAdapter(CliHarnessAdapter):
             ("--allowedTools", "allowed_tools"),
             ("--disallowedTools", "disallowed_tools"),
             ("--settings", "settings"),
-            ("--mcp-config", "mcp_config"),
             ("--agent", "agent"),
         ):
             value = opts.get(key)
             if value:
                 argv += [flag, str(value)]
+        # MCP 工具：opts 里显式给的 mcp_config（JSON 文件路径或内联 JSON）优先；
+        # 否则把节点引用经 extra["mcp_tools"] 到达的工具渲染成本会话专属的
+        # 配置文件。claude 拿到 --mcp-config 会自己拉起 stdio MCP 服务器。
+        mcp_config = opts.get("mcp_config")
+        if not mcp_config:
+            mcp_config = self._materialize_mcp_config(request)
+        if mcp_config:
+            argv += ["--mcp-config", str(mcp_config)]
         if opts.get("dangerously_skip_permissions"):
             argv += ["--dangerously-skip-permissions"]
         return argv
+
+    def _materialize_mcp_config(self, request: CreateSessionRequest) -> str | None:
+        """把 extra["mcp_tools"] 渲染成 claude 的 MCP 配置 JSON 临时文件。
+
+        格式：``{"mcpServers": {name: {...}}}``；stdio 条目给 command/args/env/cwd，
+        http/sse 条目给 ``type`` + url。缺 command（stdio）或缺 url（http/sse）
+        的条目无法连接，跳过——它们的说明已随上下文进入 prompt，这里不假装配上。
+        每个会话一个独立文件（键为 session_ref），会话结束时尽力清理。
+        """
+        tools = request.extra.get("mcp_tools")
+        if not isinstance(tools, list) or not tools:
+            return None
+        servers: dict[str, Any] = {}
+        for item in tools:
+            if not isinstance(item, dict):
+                continue
+            raw_name = str(item.get("name") or "").strip()
+            if not raw_name:
+                continue
+            transport = str(item.get("transport") or "stdio")
+            entry: dict[str, Any] = {}
+            if transport == "stdio":
+                command = item.get("command")
+                if not command:
+                    continue
+                entry["command"] = str(command)
+                if item.get("args"):
+                    entry["args"] = [str(a) for a in item["args"]]
+                if item.get("env"):
+                    entry["env"] = {str(k): str(v) for k, v in item["env"].items()}
+                if item.get("cwd"):
+                    entry["cwd"] = str(item["cwd"])
+            else:
+                url = item.get("url")
+                if not url:
+                    continue
+                entry["type"] = transport
+                entry["url"] = str(url)
+            name = raw_name
+            suffix = 2
+            while name in servers:
+                name = f"{raw_name}-{suffix}"
+                suffix += 1
+            servers[name] = entry
+        if not servers:
+            return None
+        fd, path = tempfile.mkstemp(prefix="workerbee-mcp-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2))
+        key = str(request.session_ref_hint or "")
+        if key:
+            self._session_tmpfiles[key] = path
+        return path
+
+    async def on_stream_closed(self, session: CliSession, returncode: int | None) -> None:
+        try:
+            await super().on_stream_closed(session, returncode)
+        finally:
+            # harness 进程已退出，MCP 配置文件不再被读取；尽力清理，
+            # 失败不掩盖结束事件。
+            tmpfile = self._session_tmpfiles.pop(session.session_ref, None)
+            if tmpfile:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmpfile)
 
     # ------------------------------------------------------------------
     # host 控制通道（HUM-03）
@@ -886,6 +961,9 @@ def _build_manifest(input_channel: bool, *, idle_end_seconds: float | None = Non
             "后关闭输入通道让 harness 退出；session_ended 始终以进程真的退出为准。",
             "无 SDK 宿主时默认 --permission-prompts none：需要审批的动作会被拒绝，"
             "而不是让整轮挂在一个没人能回答的询问上。",
+            "extra.mcp_tools 会渲染成本会话专属的 --mcp-config 临时文件（mcpServers 格式），"
+            "stdio 服务器由 claude 自己拉起；会话结束后临时文件被清理。"
+            "opts 里显式给的 mcp_config 优先于该渲染结果。",
         ],
     )
 

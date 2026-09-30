@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import os
 import sys
 import time
 from typing import Any, Callable
@@ -771,6 +773,109 @@ def test_kimi_prefixes_system_prompt_instead_of_dropping_it():
     )
     assert "你是审阅者" in argv[2]
     assert "看一下这个补丁" in argv[2]
+
+
+# ----------------------------------------------------------------------
+# 节点引用（Skill / MCP 工具）→ extra → argv
+# ----------------------------------------------------------------------
+
+
+async def test_kimi_extra_skills_become_session_skills_dir(tmp_path):
+    """extra["skills"] 必须真的落成 kimi 认的目录形态，并出现在 argv 里。"""
+    adapter = KimiCodeAdapter()
+    req = _request(session_ref_hint="s1")
+    req.extra["skills"] = [
+        {"name": "代码审查", "content": "先跑测试再下结论", "version": 2},
+        {"name": "写文档", "content": "用平实的中文", "version": 1},
+    ]
+    argv = adapter.build_argv(request=req, prompt="hi", resume_locator=None, checkpoint=None)
+
+    assert "--skills-dir" in argv
+    skills_dir = argv[argv.index("--skills-dir") + 1]
+    assert os.path.isdir(skills_dir)
+    for name, body in (("代码审查", "先跑测试再下结论"), ("写文档", "用平实的中文")):
+        text = open(os.path.join(skills_dir, name, "SKILL.md"), encoding="utf-8").read()
+        assert body in text
+        assert f"name: {name}" in text
+
+    # 会话结束（进程退出）后临时目录被尽力清理
+    adapter._out = io.StringIO()  # 协议通道替身：不拉起进程也能走结束钩子
+    session = CliSession(
+        session_ref="s1", harness_id="h1", persist_locator=None, proc=None, label="fake"
+    )
+    await adapter.on_stream_closed(session, 0)
+    assert not os.path.exists(skills_dir)
+    assert "s1" not in adapter._session_tmpdirs
+
+
+def test_kimi_explicit_skills_dir_wins_over_extra_skills(tmp_path):
+    """opts / extra 里显式给的 skills_dir 优先，且不会再落临时目录。"""
+    adapter = KimiCodeAdapter()
+    req = _request(session_ref_hint="s1")
+    req.extra["skills"] = [{"name": "s", "content": "c", "version": 1}]
+    req.extra["skills_dir"] = str(tmp_path)
+    argv = adapter.build_argv(request=req, prompt="hi", resume_locator=None, checkpoint=None)
+    assert argv[argv.index("--skills-dir") + 1] == str(tmp_path)
+    assert adapter._session_tmpdirs == {}
+
+
+def test_kimi_ignores_mcp_tools():
+    """kimi 没有 MCP 支持（已核实 --help）：extra["mcp_tools"] 被忽略，不报错。"""
+    adapter = KimiCodeAdapter()
+    req = _request(session_ref_hint="s1")
+    req.extra["mcp_tools"] = [{"name": "pgsql", "transport": "stdio", "command": "mcp-pgsql"}]
+    argv = adapter.build_argv(request=req, prompt="hi", resume_locator=None, checkpoint=None)
+    assert "--mcp-config" not in argv
+
+
+async def test_claude_extra_mcp_tools_render_to_mcp_config(tmp_path):
+    """extra["mcp_tools"] 必须渲染成 claude 的 mcpServers JSON 并出现在 argv 里。"""
+    adapter = ClaudeCodeAdapter()
+    req = _request(session_ref_hint="s1")
+    req.extra["mcp_tools"] = [
+        {
+            "name": "pgsql", "transport": "stdio", "command": "mcp-pgsql",
+            "args": ["--ro"], "env": {"PGHOST": "db"}, "cwd": "/srv", "url": None,
+        },
+        {
+            "name": "remote", "transport": "http", "command": None,
+            "args": [], "env": {}, "cwd": None, "url": "https://mcp.example.com/sse",
+        },
+        {"name": "broken", "transport": "stdio", "command": None},  # 无法拉起，跳过
+    ]
+    argv = adapter.build_argv(request=req, prompt="hi", resume_locator=None, checkpoint=None)
+
+    assert "--mcp-config" in argv
+    config_path = argv[argv.index("--mcp-config") + 1]
+    with open(config_path, encoding="utf-8") as fh:
+        config = json.load(fh)
+    servers = config["mcpServers"]
+    assert servers["pgsql"] == {
+        "command": "mcp-pgsql", "args": ["--ro"], "env": {"PGHOST": "db"}, "cwd": "/srv",
+    }
+    assert servers["remote"] == {"type": "http", "url": "https://mcp.example.com/sse"}
+    assert "broken" not in servers
+
+    # 会话结束后临时文件被尽力清理
+    adapter._out = io.StringIO()
+    session = CliSession(
+        session_ref="s1", harness_id="h1", persist_locator=None, proc=None, label="fake"
+    )
+    await adapter.on_stream_closed(session, 0)
+    assert not os.path.exists(config_path)
+
+
+def test_claude_explicit_mcp_config_wins_over_extra_mcp_tools(tmp_path):
+    """opts 里显式给的 mcp_config 优先于 extra 渲染结果，且不产生临时文件。"""
+    adapter = ClaudeCodeAdapter()
+    req = _request(session_ref_hint="s1")
+    req.extra["options"] = {"mcp_config": str(tmp_path / "mine.json")}
+    req.extra["mcp_tools"] = [{"name": "pgsql", "transport": "stdio", "command": "mcp-pgsql"}]
+    argv = adapter.build_argv(request=req, prompt="hi", resume_locator=None, checkpoint=None)
+    assert argv.count("--mcp-config") == 1
+    assert argv[argv.index("--mcp-config") + 1] == str(tmp_path / "mine.json")
+    assert adapter._session_tmpfiles == {}
+
 
 
 def _fake_cli_session(adapter: Any, ref: str = "s1") -> None:

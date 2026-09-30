@@ -39,6 +39,9 @@ ACP 协议，本适配器未实现，也不据此声明能力）。
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 from typing import Any
 
 from ..sdk.cli import (
@@ -100,6 +103,9 @@ class KimiCodeAdapter(CliHarnessAdapter):
         super().__init__()
         self.input_channel = False
         self.manifest = _build_manifest()
+        #: session_ref → 本会话专属的 skills 临时目录（由 extra["skills"] 落成），
+        #: 会话结束时尽力清理。
+        self._session_tmpdirs: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 探测 / 兼容性
@@ -245,10 +251,57 @@ class KimiCodeAdapter(CliHarnessAdapter):
             argv += ["--agent-file", str(agent_file)]
         for d in opts.get("add_dirs") or request.extra.get("add_dirs") or []:
             argv += ["--add-dir", str(d)]
-        skills_dir = opts.get("skills_dir")
+        skills_dir = opts.get("skills_dir") or request.extra.get("skills_dir")
+        if not skills_dir:
+            # 节点引用到的 Skill 随 extra["skills"] 到达：落成 kimi 认的
+            # 「目录下每个 skill 一个子目录、内含 SKILL.md」形态。
+            # 注意 --skills-dir 会**替换** kimi 自动发现的技能目录（已核实），
+            # 这一点写在 manifest.notes 与节点配置界面上。
+            skills_dir = self._materialize_skills(request)
         if skills_dir:
             argv += ["--skills-dir", str(skills_dir)]
         return argv
+
+    def _materialize_skills(self, request: CreateSessionRequest) -> str | None:
+        """把 extra["skills"] 落成本会话专属的临时 skills 目录，返回目录路径。
+
+        每个会话一个独立目录（并发会话不共享），键为 session_ref；会话结束
+        （``on_stream_closed``）时尽力清理。没有引用任何 Skill 时返回 None。
+        """
+        skills = request.extra.get("skills")
+        if not isinstance(skills, list) or not skills:
+            return None
+        tmpdir = tempfile.mkdtemp(prefix="workerbee-kimi-skills-")
+        used: set[str] = set()
+        for item in skills:
+            if not isinstance(item, dict):
+                continue
+            name = _safe_dirname(str(item.get("name") or "skill"))
+            base = name
+            suffix = 2
+            while name in used:
+                name = f"{base}-{suffix}"
+                suffix += 1
+            used.add(name)
+            body = str(item.get("content") or "")
+            text = f"---\nname: {name}\n---\n\n# {item.get('name') or name}\n\n{body}\n"
+            skill_dir = os.path.join(tmpdir, name)
+            os.makedirs(skill_dir, exist_ok=True)
+            with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        key = str(request.session_ref_hint or "")
+        if key:
+            self._session_tmpdirs[key] = tmpdir
+        return tmpdir
+
+    async def on_stream_closed(self, session: CliSession, returncode: int | None) -> None:
+        try:
+            await super().on_stream_closed(session, returncode)
+        finally:
+            # harness 进程已退出，skills 目录不再被读取；尽力清理，失败不掩盖结束事件。
+            tmpdir = self._session_tmpdirs.pop(session.session_ref, None)
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
     def credential_env_map(self) -> dict[str, str]:
         """kimi 以本机登录态为主（``kimi login``）；未验证其环境变量凭据形式，
@@ -408,8 +461,19 @@ def _build_manifest() -> AdapterManifest:
             "若会话在首轮结束前被杀，将无法 resume。",
             "stream-json 行格式属未公开契约，本适配器按实测格式解析，"
             "遇到不认识的 role/type 会如实上报而不是静默丢弃。",
+            "extra.skills 会落成会话级临时目录并以 --skills-dir 传给 kimi；"
+            "--skills-dir 会**替换** kimi 自动发现的用户/项目技能目录（已核实），"
+            "会话结束后临时目录被清理。",
+            "kimi 没有 MCP 支持（已核实 --help）：extra.mcp_tools 被忽略，"
+            "节点引用的工具只经上下文组装进入 prompt 说明，不会被真正拉起。",
         ],
     )
+
+
+def _safe_dirname(name: str) -> str:
+    """Skill 名落盘为目录名：剔除路径分隔与特殊字符，避免越出临时目录。"""
+    cleaned = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name).strip("._")
+    return cleaned or "skill"
 
 
 def _parse_version(output: str) -> str | None:
