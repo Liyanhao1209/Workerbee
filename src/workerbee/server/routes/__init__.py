@@ -6,9 +6,12 @@
 
 from __future__ import annotations
 
-from . import approvals, nodes, registry, system, tasks, templates, workflows
+from . import approvals, assistant, nodes, registry, system, tasks, templates, workflows
 
-__all__ = ["ROUTERS", "approvals", "nodes", "registry", "system", "tasks", "templates", "workflows"]
+__all__ = [
+    "ROUTERS", "approvals", "assistant", "nodes", "registry", "system",
+    "tasks", "templates", "workflows",
+]
 
 #: 注册顺序即匹配顺序：更具体的路径在前。
 ROUTERS = [
@@ -19,4 +22,5 @@ ROUTERS = [
     registry.router,
     templates.router,
     approvals.router,
+    assistant.router,
 ]

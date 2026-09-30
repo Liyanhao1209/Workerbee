@@ -104,6 +104,16 @@ __all__ = [
     "ApprovalListResponse",
     "ApprovalDecideRequest",
     "DeliveryResponse",
+    "AssistantThreadCreateRequest",
+    "AssistantThreadResponse",
+    "AssistantThreadListResponse",
+    "AssistantMessageResponse",
+    "AssistantMessageListResponse",
+    "AssistantSendRequest",
+    "AssistantSendResponse",
+    "AssistantCompactResponse",
+    "AssistantConfigResponse",
+    "AssistantConfigUpdateRequest",
     # 领域模型的再导出：前端契约与领域字段集保持一致
     "Approval",
     "Attempt",
@@ -862,6 +872,101 @@ class DeliveryResponse(ApiResponse):
     delivered: bool = False
     status: str
     detail: str | None = None
+
+
+# ===========================================================================
+# 基础助手（AI-01）
+# ===========================================================================
+
+
+class AssistantThreadCreateRequest(ApiRequest):
+    title: str | None = None
+    """留空时用小窗默认标题。"""
+
+
+class AssistantThreadResponse(ApiResponse):
+    thread_id: str
+    title: str = ""
+    closed: bool = False
+    created_at: str
+    updated_at: str
+
+
+class AssistantThreadListResponse(ApiResponse):
+    threads: list[AssistantThreadResponse] = Field(default_factory=list)
+    returned: int = 0
+
+
+class AssistantMessageResponse(ApiResponse):
+    """一条对话消息。``tokens_*`` 为 None 表示后端没给用量（未知，不是 0）。"""
+
+    message_id: str
+    thread_id: str
+    role: str
+    """user / assistant / memory（「整理前文」产出的摘要）。"""
+    content: str
+    backend: str | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    degraded: bool = False
+    """True 表示这条回复发生过降级（备用后端、快照裁剪、指引缺失等）。"""
+    created_at: str
+
+
+class AssistantMessageListResponse(ApiResponse):
+    messages: list[AssistantMessageResponse] = Field(default_factory=list)
+    returned: int = 0
+
+
+class AssistantSendRequest(ApiRequest):
+    content: str
+    """用户的问题。空白内容会被拒绝。"""
+
+
+class AssistantSendResponse(ApiResponse):
+    """一次问答的结果：助手回复 + 本次发送的窗口/降级事实。"""
+
+    message: AssistantMessageResponse
+    user_message: AssistantMessageResponse
+    dropped: int = 0
+    """因窗口限制未随本次发送的更早消息条数（滑动窗口截断，不产生额外调用）。"""
+    degraded: bool = False
+    degraded_reasons: list[str] = Field(default_factory=list)
+
+
+class AssistantCompactResponse(ApiResponse):
+    """「整理前文」的结果。这是唯一会额外调用一次模型的记忆操作。"""
+
+    compacted: bool
+    summarized: int = 0
+    """被整理进摘要的旧消息条数。"""
+    memory_message_id: str | None = None
+    note: str | None = None
+
+
+class AssistantConfigResponse(ApiResponse):
+    """助手配置。**只含引用与参数，密钥本体永远不会出现在这里**（只进不出）。"""
+
+    enabled: bool = False
+    credential_ref: str | None = None
+    model_override: str | None = None
+    window_rounds: int = 12
+    window_chars: int = 12000
+    snapshot_budget: int = 6000
+    secrets_unlocked: bool = False
+    """凭据库此刻是否已解锁。未解锁时即使配置齐了也读不到密钥——
+    前端据此显示引导文案，而不是等发问时才报错。"""
+
+
+class AssistantConfigUpdateRequest(ApiRequest):
+    """局部更新。只接受引用（credential_ref），不接受任何密钥本体。"""
+
+    enabled: bool | None = None
+    credential_ref: str | None = None
+    model_override: str | None = None
+    window_rounds: int | None = Field(default=None, ge=1, le=100)
+    window_chars: int | None = Field(default=None, ge=500, le=200000)
+    snapshot_budget: int | None = Field(default=None, ge=500, le=100000)
 
 
 StorageReportResponse.model_rebuild()

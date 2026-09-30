@@ -23,7 +23,7 @@ from .. import __version__
 from . import schemas as S
 from .auth import TokenAuth, is_loopback_client
 from .routes import ROUTERS
-from .services import ServiceError, Services
+from .services import AssistantSnapshotSource, ServiceError, Services
 from .ws import router as ws_router
 
 __all__ = ["create_app", "static_dir", "explanation_page"]
@@ -47,6 +47,12 @@ def create_app(engine: Any, *, token: str, allow_remote: bool = False) -> FastAP
     """
     auth = TokenAuth(token)
     services = Services(engine)
+
+    # 助手的快照数据源在这里注入：assistant/ 不 import server 层，
+    # 由本侧把 Services 的只读方法适配给它（引擎单独使用时快照为空并如实降级）。
+    core_assistant = getattr(engine, "assistant", None)
+    if core_assistant is not None:
+        core_assistant.snapshot_source = AssistantSnapshotSource(services)
 
     app = FastAPI(
         title="Workerbee API",

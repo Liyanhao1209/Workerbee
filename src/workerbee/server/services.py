@@ -42,6 +42,7 @@ from ..core.domain import (
 from ..core.domain.task import StageState
 from ..core.domain.template import MissingBinding, Template, TemplateKind
 from ..core.graph.validate import ValidationReport, validate
+from ..assistant import AssistantConfig, AssistantError
 from ..data.db import ConflictError
 from ..data.event_log import EventActor, EventScope, EventType
 from . import schemas as S
@@ -1340,6 +1341,182 @@ class ApprovalService(_Service):
 
 
 # ===========================================================================
+# 基础助手（AI-01）
+# ===========================================================================
+
+#: 快照「最近错误事件」分区收录的事件类型。
+_ERROR_EVENT_TYPES = frozenset(
+    {
+        EventType.HANDOFF_FAILED.value,
+        EventType.VALIDATION_FAILED.value,
+        EventType.SESSION_LOST.value,
+        EventType.RESOURCE_TEARDOWN_FAILED.value,
+        EventType.RESOURCE_ORPHANED.value,
+        EventType.APPROVAL_UNDELIVERABLE.value,
+    }
+)
+
+
+class AssistantSnapshotSource:
+    """把 Services 的只读方法适配给 ``assistant.snapshot.SnapshotSource`` 协议。
+
+    分层纪律：``assistant/`` 不 import server 层，所以由本侧做适配。
+    全部方法只读；取到的数据已经过各服务的既有脱敏口径。
+    """
+
+    def __init__(self, services: "Services") -> None:
+        self._services = services
+
+    async def system_status(self) -> dict[str, Any]:
+        status = await self._services.system.status(allow_remote=False)
+        data = status.model_dump(mode="json")
+        return {
+            "secrets_unlocked": data.get("secrets_unlocked"),
+            "counts": data.get("counts"),
+            "startup_notes": data.get("startup_notes"),
+        }
+
+    async def attention_items(self) -> dict[str, Any]:
+        attention = await self._services.system.attention()
+        return attention.model_dump(mode="json")
+
+    async def recent_tasks(self, limit: int) -> list[dict[str, Any]]:
+        tasks = await self._services.engine.store.tasks.list_tasks(limit=limit)
+        return [
+            {
+                "task_id": t.task_id,
+                "workflow_id": t.workflow_id,
+                "workflow_name": t.workflow_name,
+                "observed_state": t.observed_state.value,
+                "failure_summary": t.failure_summary,
+                "blocked_reason": t.blocked_reason,
+            }
+            for t in tasks
+        ]
+
+    async def registry_overview(self) -> dict[str, Any]:
+        registry = self._services.engine.store.registry
+        harnesses = await registry.list_harnesses()
+        return {
+            "harnesses": [
+                {
+                    "harness_id": h.harness_id,
+                    "name": h.name,
+                    "enabled": h.enabled,
+                    "last_probe_ok": h.last_probe_ok,
+                }
+                for h in harnesses
+            ],
+            "credential_count": len(await registry.list_credentials()),
+            "skill_count": len(await registry.list_skills()),
+            "tool_count": len(await registry.list_tools()),
+        }
+
+    async def recent_error_events(self, limit: int) -> list[dict[str, Any]]:
+        rows = await self._services.engine.store.events.tail(limit=500)
+        errors = [r for r in rows if r["type"] in _ERROR_EVENT_TYPES]
+        return [
+            {"ts": r["ts"], "type": r["type"], "note": r["payload"].get("note")}
+            for r in errors[-limit:]
+        ]
+
+
+class AssistantService(_Service):
+    """基础助手的网关门面。核心编排在 ``engine.assistant``（assistant/service.py），
+    本层只做参数校验与错误翻译——判断分支不下沉到路由，也不上移到内核。"""
+
+    def _core(self) -> Any:
+        svc = getattr(self.engine, "assistant", None)
+        if svc is None:
+            raise BadRequest("助手服务未装配，本轮内核不支持助手功能")
+        return svc
+
+    # ---- 线程与消息 ----
+
+    async def list_threads(self) -> S.AssistantThreadListResponse:
+        threads = await self._core().list_threads()
+        return S.AssistantThreadListResponse(
+            threads=[S.AssistantThreadResponse.model_validate(t) for t in threads],
+            returned=len(threads),
+        )
+
+    async def create_thread(
+        self, req: S.AssistantThreadCreateRequest
+    ) -> S.AssistantThreadResponse:
+        thread = await self._core().create_thread(title=(req.title or "").strip())
+        return S.AssistantThreadResponse.model_validate(thread)
+
+    async def list_messages(self, thread_id: str) -> S.AssistantMessageListResponse:
+        try:
+            messages = await self._core().list_messages(thread_id)
+        except KeyError:
+            raise NotFound(f"对话不存在: {thread_id}") from None
+        return S.AssistantMessageListResponse(
+            messages=[S.AssistantMessageResponse.model_validate(m) for m in messages],
+            returned=len(messages),
+        )
+
+    async def send_message(
+        self, thread_id: str, req: S.AssistantSendRequest
+    ) -> S.AssistantSendResponse:
+        text = req.content.strip()
+        if not text:
+            raise BadRequest("消息内容不能为空。")
+        try:
+            result = await self._core().send_message(thread_id, text)
+        except KeyError:
+            raise NotFound(f"对话不存在: {thread_id}") from None
+        except AssistantError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.AssistantSendResponse(
+            message=S.AssistantMessageResponse.model_validate(result["message"]),
+            user_message=S.AssistantMessageResponse.model_validate(result["user_message"]),
+            dropped=result["dropped"],
+            degraded=result["degraded"],
+            degraded_reasons=result["degraded_reasons"],
+        )
+
+    async def compact(self, thread_id: str) -> S.AssistantCompactResponse:
+        """手动「整理前文」。这是唯一会额外调用一次模型的记忆操作（用户显式触发）。"""
+        try:
+            result = await self._core().compact_thread(thread_id)
+        except KeyError:
+            raise NotFound(f"对话不存在: {thread_id}") from None
+        except AssistantError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.AssistantCompactResponse.model_validate(result)
+
+    # ---- 配置（secret 只进不出：只接受引用） ----
+
+    async def get_config(self) -> S.AssistantConfigResponse:
+        config = await self._core().get_config()
+        return S.AssistantConfigResponse(
+            **config.model_dump(),
+            secrets_unlocked=self.engine.secret_store is not None,
+        )
+
+    async def update_config(
+        self, req: S.AssistantConfigUpdateRequest
+    ) -> S.AssistantConfigResponse:
+        current = await self._core().get_config()
+        fields = req.model_dump(exclude_unset=True)
+        if not fields:
+            raise BadRequest("没有需要更新的字段")
+        if fields.get("credential_ref"):
+            cred = await self.store.registry.get_credential(fields["credential_ref"])
+            if cred is None:
+                raise BadRequest(
+                    "这条凭据不存在",
+                    hint="到 注册表 → 凭据 先建好凭据，再回到这里选择",
+                )
+        updated = AssistantConfig.model_validate(
+            {**current.model_dump(), **fields}
+        )
+        await self._core().save_config(updated)
+        return await self.get_config()
+
+
+# ===========================================================================
 # 容器
 # ===========================================================================
 
@@ -1356,6 +1533,7 @@ class Services:
         self.registry = RegistryService(engine)
         self.templates = TemplateService(engine)
         self.approvals = ApprovalService(engine)
+        self.assistant = AssistantService(engine)
 
 
 # ===========================================================================
