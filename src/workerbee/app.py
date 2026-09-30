@@ -154,6 +154,7 @@ class Engine:
         self.scheduler: Scheduler | None = None
         self.reaper: Reaper | None = None
         self.harness: Any | None = None
+        self.assistant: Any | None = None
 
         self._secret_store: Any = None
         self._redactor: Any = None
@@ -589,6 +590,18 @@ class Engine:
             ),
         )
 
+        # 基础助手（AI-01）。快照数据源由 server 层在 create_app 时注入
+        # （assistant/ 不 import server）；未注入时快照为空并如实标注降级。
+        # secret_resolver 给的是回调而不是凭据库本身：解锁发生在引擎生命周期中段。
+        from .assistant import AssistantService
+
+        self.assistant = AssistantService(
+            store=self.store,
+            notifier=self.notifier,
+            secret_resolver=lambda: self._secret_store,
+            redactor=self._redactor,
+        )
+
     async def _build_llm(self) -> Any | None:
         from .data.llm import LLMRouter
 
@@ -802,6 +815,9 @@ class Engine:
         if self.harness is not None and hasattr(self.harness, "stop"):
             with contextlib.suppress(Exception):
                 await self.harness.stop()
+        if self.assistant is not None:
+            with contextlib.suppress(Exception):
+                await self.assistant.aclose()
         with contextlib.suppress(Exception):
             await self.store.events.append(
                 scope=_scope("system"),

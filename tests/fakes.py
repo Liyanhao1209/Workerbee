@@ -12,8 +12,15 @@ from typing import Any, Callable
 
 from workerbee.core.domain.artifact import ArtifactKind, ArtifactProducer
 from workerbee.core.runtime.ports import AssembledContext, SessionCaps, SessionHandle
+from workerbee.data.llm import LLMMessage, LLMResponse
 
-__all__ = ["FakeHarness", "FakeContextBuilder", "FakeSummarizer", "ScriptedFailure"]
+__all__ = [
+    "FakeHarness",
+    "FakeContextBuilder",
+    "FakeSummarizer",
+    "FakeLLMBackend",
+    "ScriptedFailure",
+]
 
 
 class ScriptedFailure(Exception):
@@ -258,3 +265,49 @@ class FakeSummarizer:
             ok=overall_ok,
             reason=None if overall_ok else "摘要未覆盖全部契约字段",
         )
+
+
+class FakeLLMBackend:
+    """按脚本返回预置响应的假 LLM 后端（助手测试用）。
+
+    ``responses`` 按调用次序取用，可以是字符串（正常回复）或异常（按要求失败）；
+    用完后重复最后一个。``calls`` 记录每次实际收到的 messages——
+    断言「模型真的收到了 guidebook / 快照 / 历史」全靠它，只断言状态码不算数。
+    """
+
+    def __init__(
+        self,
+        *responses: Any,
+        name: str = "fake-llm",
+        model: str = "fake-model",
+    ) -> None:
+        self._responses = list(responses) or ["（空回复）"]
+        self.name = name
+        self.model = model
+        self.calls: list[list[LLMMessage]] = []
+        self.closed = False
+
+    async def complete(
+        self,
+        messages: Any,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        self.calls.append(list(messages))
+        payload = self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
+        if isinstance(payload, Exception):
+            raise payload
+        return LLMResponse(
+            text=str(payload),
+            model=self.model,
+            backend=self.name,
+            usage=None,
+        )
+
+    async def health(self) -> tuple[bool, None]:
+        return True, None
+
+    async def aclose(self) -> None:
+        self.closed = True
