@@ -9,6 +9,7 @@ import { ExecutionGraphPage } from './pages/ExecutionGraphPage';
 import { RegistryPage } from './pages/RegistryPage';
 import { SessionsPage } from './pages/SessionsPage';
 import { TemplatesPage } from './pages/TemplatesPage';
+import { TemplateGraphEditorPage } from './pages/TemplateGraphEditorPage';
 import { StoragePage } from './pages/StoragePage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
@@ -29,6 +30,7 @@ export function App(): JSX.Element {
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/registry" element={<RegistryPage />} />
           <Route path="/templates" element={<TemplatesPage />} />
+          <Route path="/templates/new" element={<TemplateGraphEditorPage />} />
           <Route path="/storage" element={<StoragePage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Route>

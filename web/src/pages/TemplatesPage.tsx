@@ -11,6 +11,7 @@
  */
 
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { ApiError } from '../api/client';
 import { registry as registryApi, templates as templatesApi, workflows as workflowApi } from '../api/endpoints';
 import { defaultRetryPolicy, newLocalId } from '../api/guards';
@@ -106,6 +107,7 @@ const TABS: { key: TabKey; label: string }[] = [
 ];
 
 export function TemplatesPage(): JSX.Element {
+  const navigate = useNavigate();
   const templates = useAsync(templatesApi.list, []);
   const [tab, setTab] = useState<TabKey>('workflow');
   const [createOpen, setCreateOpen] = useState(false);
@@ -165,7 +167,12 @@ export function TemplatesPage(): JSX.Element {
               <button type="button" className="btn btn--sm btn--primary" onClick={() => setCreateOpen(true)}>
                 从流程生成
               </button>
-              <button type="button" className="btn btn--sm" onClick={() => setManualOpen(true)}>
+              <button
+                type="button"
+                className="btn btn--sm"
+                onClick={() => (tab === 'node' ? setManualOpen(true) : navigate('/templates/new'))}
+                title={tab === 'node' ? '填写单个节点的配置' : '用和新建流程同一个画布画拓扑'}
+              >
                 手动创建
               </button>
             </>
@@ -327,24 +334,14 @@ export function TemplatesPage(): JSX.Element {
         />
       ) : null}
 
-      {manualOpen && tab !== 'credential' ? (
-        tab === 'node' ? (
-          <ManualNodeModal
-            onClose={() => setManualOpen(false)}
-            onSaved={() => {
-              setManualOpen(false);
-              templates.reload();
-            }}
-          />
-        ) : (
-          <ManualWorkflowModal
-            onClose={() => setManualOpen(false)}
-            onSaved={() => {
-              setManualOpen(false);
-              templates.reload();
-            }}
-          />
-        )
+      {manualOpen && tab === 'node' ? (
+        <ManualNodeModal
+          onClose={() => setManualOpen(false)}
+          onSaved={() => {
+            setManualOpen(false);
+            templates.reload();
+          }}
+        />
       ) : null}
 
       {bindTarget ? (
@@ -1113,237 +1110,6 @@ function ManualNodeModal({ onClose, onSaved }: { onClose: () => void; onSaved: (
             onChange={(next) => setCandidates((prev) => prev.map((c) => (c.key === draft.key ? next : c)))}
             onRemove={candidates.length > 1 ? () => setCandidates((prev) => prev.filter((_, i) => i !== idx)) : undefined}
           />
-        ))}
-      </div>
-    </Modal>
-  );
-}
-
-interface NodeDraft {
-  key: string;
-  name: string;
-  system_prompt: string;
-  candidate: CandidateDraft;
-  /** 上游节点的 key 列表；只能选排在自己前面的节点，从结构上杜绝环。 */
-  upstreams: string[];
-}
-
-function emptyNodeDraft(): NodeDraft {
-  return { key: newLocalId(), name: '', system_prompt: '', candidate: emptyCandidate(), upstreams: [] };
-}
-
-function ManualWorkflowModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }): JSX.Element {
-  const harnesses = useAsync(registryApi.harnesses, []);
-  const credentials = useAsync(registryApi.credentials, []);
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [nodes, setNodes] = useState<NodeDraft[]>([emptyNodeDraft()]);
-  const [formError, setFormError] = useState<string | null>(null);
-  const submit = useSubmit();
-
-  const save = async (): Promise<void> => {
-    if (!name.trim()) {
-      setFormError('名称必填。');
-      return;
-    }
-    if (nodes.length === 0) {
-      setFormError('至少需要一个节点。');
-      return;
-    }
-    const names = nodes.map((n) => n.name.trim());
-    if (names.some((n) => !n)) {
-      setFormError('每个节点都要填名称。');
-      return;
-    }
-    if (new Set(names).size !== names.length) {
-      setFormError('节点名称不能重复。');
-      return;
-    }
-    if (nodes.some((n) => !n.candidate.harness_ref)) {
-      setFormError('每个节点都要选择一个 harness。');
-      return;
-    }
-    setFormError(null);
-
-    const edges = nodes.flatMap((node) =>
-      node.upstreams.map((upKey) => {
-        const upstream = nodes.find((n) => n.key === upKey);
-        return {
-          from_node: upstream?.name.trim() ?? '',
-          to_node: node.name.trim(),
-          output_contract: null,
-          desc: null,
-        };
-      }),
-    );
-    const slots = nodes.flatMap((node) => slotsFor(node.name.trim(), [node.candidate]));
-
-    const saved = await submit.run(() =>
-      templatesApi.create({
-        name: name.trim(),
-        description: description.trim() || null,
-        kind: 'workflow',
-        payload: {
-          nodes: nodes.map((node) => ({
-            name: node.name.trim(),
-            role: null,
-            description: null,
-            system_prompt: node.system_prompt || null,
-            profiles: [candidateToProfile(node.candidate)],
-            skill_refs: [],
-            tool_refs: [],
-            required_inputs: [],
-          })),
-          edges,
-          sensitive_slots: slots,
-        },
-      }),
-    );
-    if (saved) onSaved();
-  };
-
-  return (
-    <Modal
-      wide
-      title="手动创建流程模板"
-      onClose={onClose}
-      footer={
-        <>
-          <button type="button" className="btn btn--sm" onClick={onClose}>
-            取消
-          </button>
-          <button type="button" className="btn btn--sm btn--primary" disabled={submit.busy} onClick={() => void save()}>
-            {submit.busy ? '保存中…' : '保存'}
-          </button>
-        </>
-      }
-    >
-      <Banner variant="info" title="每个节点一组候选">
-        这里每个节点只配一组执行候选（harness + 模型 + 凭据）；需要多个候选的话，先用模板创建流程，再在流程编辑器里补。
-      </Banner>
-
-      {formError ? (
-        <Banner variant="danger" title="无法提交">
-          {formError}
-        </Banner>
-      ) : null}
-      {submit.error ? <SubmitError error={submit.error} what="创建流程模板失败" /> : null}
-
-      <div className="field-row">
-        <Field label="名称" required>
-          <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="标准三节点流水线" />
-        </Field>
-        <Field label="描述">
-          <input
-            className="input"
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder="这个模板适用于什么场景"
-          />
-        </Field>
-      </div>
-
-      <div className="divider" />
-      <div className="row row--between">
-        <div className="section-title" style={{ margin: 0 }}>
-          节点（按执行顺序列出；上游只能选排在前面的节点）
-        </div>
-        <button type="button" className="btn btn--sm" onClick={() => setNodes((prev) => [...prev, emptyNodeDraft()])}>
-          + 添加节点
-        </button>
-      </div>
-
-      <div className="col" style={{ gap: 'var(--sp-3)', marginTop: 'var(--sp-2)' }}>
-        {nodes.map((node, idx) => (
-          <div
-            key={node.key}
-            style={{
-              border: '1px solid var(--line)',
-              borderRadius: 'var(--radius)',
-              background: 'var(--bg-2)',
-              padding: 'var(--sp-2)',
-            }}
-          >
-            <div className="row row--tight">
-              <span className="chip chip--accent">#{idx + 1}</span>
-              <input
-                className="input"
-                style={{ width: 180 }}
-                value={node.name}
-                onChange={(e) =>
-                  setNodes((prev) => prev.map((n) => (n.key === node.key ? { ...n, name: e.target.value } : n)))
-                }
-                placeholder="节点名称"
-              />
-              <span className="dim text-sm">上游依赖：</span>
-              {idx === 0 ? (
-                <span className="dim text-sm">入口节点，无上游</span>
-              ) : (
-                nodes.slice(0, idx).map((upstream) => (
-                  <label key={upstream.key} className="check">
-                    <input
-                      type="checkbox"
-                      checked={node.upstreams.includes(upstream.key)}
-                      onChange={(e) =>
-                        setNodes((prev) =>
-                          prev.map((n) =>
-                            n.key === node.key
-                              ? {
-                                  ...n,
-                                  upstreams: e.target.checked
-                                    ? [...n.upstreams, upstream.key]
-                                    : n.upstreams.filter((k) => k !== upstream.key),
-                                }
-                              : n,
-                          ),
-                        )
-                      }
-                    />
-                    {upstream.name.trim() || `节点 ${nodes.indexOf(upstream) + 1}`}
-                  </label>
-                ))
-              )}
-              <span style={{ flex: '1 1 auto' }} />
-              <button
-                type="button"
-                className="btn btn--xs btn--danger"
-                disabled={nodes.length <= 1}
-                onClick={() =>
-                  setNodes((prev) =>
-                    prev
-                      .filter((n) => n.key !== node.key)
-                      .map((n) => ({ ...n, upstreams: n.upstreams.filter((k) => k !== node.key) })),
-                  )
-                }
-                title="删除该节点"
-              >
-                ×
-              </button>
-            </div>
-            <div style={{ marginTop: 'var(--sp-2)' }}>
-              <textarea
-                className="input"
-                rows={2}
-                value={node.system_prompt}
-                onChange={(e) =>
-                  setNodes((prev) =>
-                    prev.map((n) => (n.key === node.key ? { ...n, system_prompt: e.target.value } : n)),
-                  )
-                }
-                placeholder="系统提示词：这个节点要做什么"
-              />
-            </div>
-            <div style={{ marginTop: 'var(--sp-2)' }}>
-              <CandidateFields
-                draft={node.candidate}
-                harnesses={harnesses.data ?? []}
-                credentials={credentials.data ?? []}
-                onChange={(next) =>
-                  setNodes((prev) => prev.map((n) => (n.key === node.key ? { ...n, candidate: next } : n)))
-                }
-              />
-            </div>
-          </div>
         ))}
       </div>
     </Modal>
