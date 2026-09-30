@@ -31,6 +31,7 @@ class EventScope(StrEnum):
     RESOURCE = "resource"
     APPROVAL = "approval"
     SYSTEM = "system"
+    ASSISTANT = "assistant"
 
 
 class EventActor(StrEnum):
@@ -110,6 +111,12 @@ class EventType(StrEnum):
     SYSTEM_START = "system.start"
     SYSTEM_STOP = "system.stop"
     STORAGE_PRUNED = "storage.pruned"
+
+    # 基础助手（AI-01）。payload 只放后端名、用量、截断条数等元信息，
+    # 对话正文不落事件日志（正文在 assistant_message 表里，已脱敏）。
+    ASSISTANT_MESSAGE = "assistant.message"
+    ASSISTANT_BACKEND_DEGRADED = "assistant.backend_degraded"
+    ASSISTANT_COMPACTED = "assistant.compacted"
 
 
 RedactorFn = Callable[[Any], Any]

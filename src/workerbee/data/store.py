@@ -14,8 +14,7 @@ import sqlite3
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
-from ..core.domain import (
-    Approval,
+from ..core.domain import (    Approval,
     ApprovalBinding,
     ApprovalDecision,
     ApprovalStatus,
@@ -42,6 +41,7 @@ from ..core.domain import (
     WorkflowDefinition,
     WorkflowRevision,
     WorkflowStatus,
+    utcnow,
 )
 from ..core.domain.registry import ApprovalPolicy, AuthMode, RiskLevel
 from ..core.domain.template import Template, TemplateKind, TemplatePayload
@@ -56,6 +56,7 @@ __all__ = [
     "TaskRepository",
     "ResourceRepository",
     "ApprovalRepository",
+    "AssistantRepository",
 ]
 
 
@@ -1369,6 +1370,159 @@ class ApprovalRepository:
 
 
 # ===========================================================================
+# 基础助手（AI-01）
+# ===========================================================================
+
+
+class AssistantRepository:
+    """助手线程与消息。返回的是普通字典——它们没有对应的领域实体，
+    字段集就是表结构本身（schema 迁移 7）。
+
+    对话历史只增不改：``update_message`` 只放行元信息列（backend/用量/degraded），
+    不提供改写正文或删除的路径——「整理前文」是追加一条 memory 消息，不是篡改历史。
+    """
+
+    _MESSAGE_UPDATABLE = {"backend", "tokens_in", "tokens_out", "degraded"}
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    # ---- thread ----
+
+    async def create_thread(self, thread_id: str, title: str = "") -> dict[str, Any]:
+        now = utcnow().isoformat()
+        await self.db.execute(
+            """INSERT INTO assistant_thread(thread_id, title, closed, created_at, updated_at)
+               VALUES (?,?,0,?,?)""",
+            (thread_id, title, now, now),
+        )
+        return {
+            "thread_id": thread_id,
+            "title": title,
+            "closed": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    async def get_thread(self, thread_id: str) -> dict[str, Any] | None:
+        row = await self.db.fetch_one(
+            "SELECT * FROM assistant_thread WHERE thread_id=?", (thread_id,)
+        )
+        return self._to_thread(row) if row else None
+
+    async def list_threads(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        rows = await self.db.fetch_all(
+            "SELECT * FROM assistant_thread ORDER BY updated_at DESC LIMIT ?", (limit,)
+        )
+        return [self._to_thread(r) for r in rows]
+
+    # ---- message ----
+
+    async def append_message(
+        self,
+        *,
+        message_id: str,
+        thread_id: str,
+        role: str,
+        content: str,
+        backend: str | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        degraded: bool = False,
+    ) -> dict[str, Any]:
+        """追加一条消息，并把线程的 updated_at 顶到最新（列表按它排序）。"""
+        now = utcnow().isoformat()
+        async with self.db.transaction():
+            await self.db.execute(
+                """INSERT INTO assistant_message(message_id, thread_id, role, content,
+                       backend, tokens_in, tokens_out, degraded, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    message_id,
+                    thread_id,
+                    role,
+                    content,
+                    backend,
+                    tokens_in,
+                    tokens_out,
+                    1 if degraded else 0,
+                    now,
+                ),
+            )
+            await self.db.execute(
+                "UPDATE assistant_thread SET updated_at=? WHERE thread_id=?",
+                (now, thread_id),
+            )
+        return {
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "role": role,
+            "content": content,
+            "backend": backend,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "degraded": degraded,
+            "created_at": now,
+        }
+
+    async def list_messages(
+        self, thread_id: str, *, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        """按时间正序取回。同刻消息以 rowid 定序（插入顺序即对话顺序）。"""
+        rows = await self.db.fetch_all(
+            """SELECT * FROM assistant_message WHERE thread_id=?
+               ORDER BY created_at, rowid LIMIT ?""",
+            (thread_id, limit),
+        )
+        return [self._to_message(r) for r in rows]
+
+    async def update_message(self, message_id: str, **fields: Any) -> bool:
+        sets: list[str] = []
+        params: list[Any] = []
+        for k, v in fields.items():
+            if k not in self._MESSAGE_UPDATABLE:
+                raise ValueError(f"不可更新的助手消息字段: {k}")
+            sets.append(f"{k}=?")
+            params.append(1 if isinstance(v, bool) else v)
+        if not sets:
+            return True
+        params.append(message_id)
+        return (
+            await self.db.execute_rowcount(
+                f"UPDATE assistant_message SET {', '.join(sets)} WHERE message_id=?",
+                params,
+            )
+            > 0
+        )
+
+    # ---- mappers ----
+
+    @staticmethod
+    def _to_thread(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "thread_id": row["thread_id"],
+            "title": row["title"],
+            "closed": bool(row["closed"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _to_message(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "message_id": row["message_id"],
+            "thread_id": row["thread_id"],
+            "role": row["role"],
+            "content": row["content"],
+            "backend": row["backend"],
+            "tokens_in": row["tokens_in"],
+            "tokens_out": row["tokens_out"],
+            "degraded": bool(row["degraded"]),
+            "created_at": row["created_at"],
+        }
+
+
+# ===========================================================================
 # 可更新字段白名单与编码
 # ===========================================================================
 
@@ -1461,6 +1615,7 @@ class Store:
         self.tasks = TaskRepository(db)
         self.resources = ResourceRepository(db)
         self.approvals = ApprovalRepository(db)
+        self.assistant = AssistantRepository(db)
         self.events = EventLog(db)
         self.artifacts = ArtifactStore(db)
         self.messages = MessageBus(db)

@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -419,6 +419,39 @@ ALTER TABLE artifact ADD COLUMN producer_attempt_id TEXT;
 -- 节点候选的 model_name 留空时回退到它。只存模型名（非敏感），密钥本体仍只在
 -- Secret Store。
 ALTER TABLE credential_ref ADD COLUMN default_model TEXT;
+""",
+    ),
+    (
+        7,
+        """
+-- 基础助手（AI-01）的对话持久化：重启后历史原样读回（清单 §3.12）。
+-- 对话历史只增不改（整理前文是追加一条 memory 消息，不改写旧消息）；
+-- content 入库前已过脱敏（用户可能粘贴含密钥的报错，AUTH-02）。
+CREATE TABLE IF NOT EXISTS assistant_thread (
+    thread_id  TEXT PRIMARY KEY,
+    title      TEXT NOT NULL DEFAULT '',
+    closed     INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- role：user / assistant / memory（「整理前文」产出的摘要消息）。
+-- backend / tokens_in / tokens_out / degraded 让每次调用的来源与用量可见
+-- （OBS-04：取不到时为 NULL——未知，不是 0）。
+CREATE TABLE IF NOT EXISTS assistant_message (
+    message_id TEXT PRIMARY KEY,
+    thread_id  TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    backend    TEXT,
+    tokens_in  INTEGER,
+    tokens_out INTEGER,
+    degraded   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (thread_id) REFERENCES assistant_thread(thread_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_message_thread
+    ON assistant_message(thread_id, created_at);
 """,
     ),
 ]
