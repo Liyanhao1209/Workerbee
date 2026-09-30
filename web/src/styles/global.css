@@ -884,6 +884,31 @@ kbd,
   resize: none;
 }
 
+/* 助手入口：右下角圆形悬浮按钮。z-index 低于 .sidepanel（40）——
+   面板打开时按钮本身不渲染，不存在叠放冲突。 */
+.assistant-fab {
+  position: fixed;
+  right: var(--sp-4);
+  bottom: var(--sp-4);
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 1px solid var(--accent-dim);
+  background: var(--accent-bg);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: var(--shadow-pop);
+  z-index: 30;
+  padding: 0;
+}
+.assistant-fab:hover {
+  background: var(--bg-sel);
+  color: var(--fg-0);
+}
+
 /* ==========================================================================
    徽标计数
    ========================================================================== */

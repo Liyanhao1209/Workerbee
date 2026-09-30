@@ -121,14 +121,6 @@ export function AppShell(): JSX.Element {
             需处理
             {count > 0 ? <span className="badge">{count > 99 ? '99+' : count}</span> : null}
           </button>
-          <button
-            type="button"
-            className="btn btn--sm"
-            onClick={() => setAssistantOpen((v) => !v)}
-            title="向内置助手提问：怎么用、现在什么状态、报错是什么意思"
-          >
-            助手
-          </button>
         </div>
       </header>
 
@@ -195,6 +187,33 @@ export function AppShell(): JSX.Element {
 
       {drawerOpen ? <AttentionDrawer onClose={() => setDrawerOpen(false)} /> : null}
       {assistantOpen ? <AssistantPanel onClose={() => setAssistantOpen(false)} /> : null}
+      {/* 助手入口：右下角圆形悬浮按钮。面板打开时隐藏——面板头部自带「收起」。 */}
+      {assistantOpen ? null : (
+        <button
+          type="button"
+          className="assistant-fab"
+          onClick={() => setAssistantOpen(true)}
+          title="向内置助手提问：怎么用、现在什么状态、报错是什么意思"
+          aria-label="打开助手"
+        >
+          <svg
+            width="22"
+            height="22"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M4 13a8 8 0 0 1 16 0" />
+            <rect x="3" y="13" width="4" height="6" rx="1.5" />
+            <rect x="17" y="13" width="4" height="6" rx="1.5" />
+            <path d="M21 19a2 2 0 0 1-2 2h-4" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }

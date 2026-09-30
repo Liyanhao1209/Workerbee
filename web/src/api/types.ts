@@ -1036,6 +1036,8 @@ export interface AssistantConfig {
   enabled: boolean;
   credential_ref: string | null;
   model_override: string | null;
+  /** 接口协议：openai 打 /chat/completions；anthropic 打 /v1/messages（Base URL 含 /anthropic 时选它）。 */
+  api_protocol: 'openai' | 'anthropic';
   window_rounds: number;
   window_chars: number;
   snapshot_budget: number;
@@ -1048,6 +1050,7 @@ export interface AssistantConfigUpdate {
   enabled?: boolean;
   credential_ref?: string | null;
   model_override?: string | null;
+  api_protocol?: 'openai' | 'anthropic';
   window_rounds?: number;
   window_chars?: number;
   snapshot_budget?: number;

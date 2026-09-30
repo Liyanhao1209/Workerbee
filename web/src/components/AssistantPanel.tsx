@@ -322,6 +322,16 @@ function AssistantSettings(): JSX.Element {
         />
         <span>启用助手</span>
       </label>
+      <Field label="接口协议" hint="Base URL 路径里含 /anthropic 时选 Anthropic 兼容。">
+        <select
+          className="select"
+          value={config.api_protocol}
+          onChange={(e) => void save({ api_protocol: e.target.value as 'openai' | 'anthropic' })}
+        >
+          <option value="openai">OpenAI 兼容（大多数服务）</option>
+          <option value="anthropic">Anthropic 兼容（Claude 及兼容端点）</option>
+        </select>
+      </Field>
       <Field label="模型凭据" hint="助手用这条凭据的 Base URL 和 Key 调用模型。">
         <select
           className="select"
