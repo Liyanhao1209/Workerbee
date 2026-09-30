@@ -325,6 +325,8 @@ export const registry = {
     kind: CredentialKind;
     secret_locator?: string | null;
     base_url?: string | null;
+    /** 节点候选留空模型时回退到的模型名。 */
+    default_model?: string | null;
     /** 密钥本体（如 { api_key: 'sk-...' }）。只在请求体出现一次，响应不回显。 */
     secret?: Record<string, string> | null;
   }) => request<CredentialRef>('/api/credentials', { method: 'POST', body }),
@@ -373,7 +375,9 @@ export const templates = {
     kind?: 'workflow' | 'node';
     from_workflow_id?: string | null;
     from_revision_seq?: number | null;
-    /** 直接给载荷时，凭据必须已剥离为 sensitive_slots 占位。 */
+    /** 从流程生成时是否保留本机凭据引用（默认保留；分享给他机时置 false）。 */
+    keep_credential_refs?: boolean;
+    /** 直接给载荷时，凭据只能是引用（credential_id），密钥本体装不进来。 */
     payload?: {
       nodes: unknown[];
       edges: unknown[];

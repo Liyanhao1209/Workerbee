@@ -889,6 +889,7 @@ function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
                   <th>类型</th>
                   <th>凭据库条目</th>
                   <th>服务地址</th>
+                  <th>默认模型</th>
                   <th>状态</th>
                   <th style={{ width: 90 }}>操作</th>
                 </tr>
@@ -916,6 +917,15 @@ function CredentialsTab({ enabled }: { enabled: boolean }): JSX.Element {
                       {credential.base_url ? (
                         <span className="mono text-xs" title={credential.base_url}>
                           {credential.base_url}
+                        </span>
+                      ) : (
+                        <span className="dim">—</span>
+                      )}
+                    </td>
+                    <td>
+                      {credential.default_model ? (
+                        <span className="mono text-xs" title={credential.default_model}>
+                          {credential.default_model}
                         </span>
                       ) : (
                         <span className="dim">—</span>
@@ -1005,6 +1015,7 @@ function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSa
   const [apiKey, setApiKey] = useState('');
   const [locator, setLocator] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
+  const [defaultModel, setDefaultModel] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const submit = useSubmit();
 
@@ -1036,6 +1047,7 @@ function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSa
         kind,
         secret_locator: isLogin || mode === 'secret' ? null : locator.trim(),
         base_url: baseUrl.trim() || null,
+        default_model: defaultModel.trim() || null,
         secret,
       }),
     );
@@ -1139,6 +1151,19 @@ function CreateCredentialModal({ onClose, onSaved }: { onClose: () => void; onSa
           </div>
         </>
       )}
+
+      {!isLogin ? (
+        <div style={{ marginTop: 'var(--sp-3)' }}>
+          <Field label="默认模型" hint="可留空。节点没填模型名时会用这个值，这样一份凭据就是完整的接入配置。">
+            <input
+              className="input input--mono"
+              value={defaultModel}
+              onChange={(e) => setDefaultModel(e.target.value)}
+              placeholder="如 claude-sonnet-4-6 / kimi-k2"
+            />
+          </Field>
+        </div>
+      ) : null}
     </Modal>
   );
 }

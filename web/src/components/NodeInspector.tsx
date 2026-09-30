@@ -310,7 +310,7 @@ function ProfileEditor({
             </select>
           </Field>
 
-          <Field label="模型名" hint="留空表示用 harness 当前登录态的默认模型">
+          <Field label="模型名" hint="留空时用所选凭据的默认模型；凭据也没填就用 harness 登录态的默认模型。">
             <input
               className="input input--mono"
               value={profile.model_name}
@@ -319,7 +319,7 @@ function ProfileEditor({
             />
           </Field>
 
-          <Field label="凭据" hint="用哪份凭据调用模型服务。默认使用 harness 本机的登录状态。">
+          <Field label="凭据" hint="用哪份凭据调用模型服务。凭据在「注册表 → 凭据」里保存一次（服务地址、密钥、默认模型），各节点直接引用。">
             <select
               className="select"
               value={profile.credential_ref ?? ''}
@@ -733,7 +733,8 @@ function SaveNodeAsTemplate({
             original_label: cred?.label ?? p.credential_ref,
           });
         }
-        return { ...p, credential_ref: null };
+        // 凭据引用随模板保留：密钥永远进不了模板，同机复用时实例化自动绑定。
+        return p;
       });
       await templatesApi.create({
         name: name.trim(),

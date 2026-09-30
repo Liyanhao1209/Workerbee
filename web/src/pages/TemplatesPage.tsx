@@ -334,6 +334,7 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [kind, setKind] = useState<TemplateKind>('workflow');
+  const [keepCredentials, setKeepCredentials] = useState(true);
   const [formError, setFormError] = useState<string | null>(null);
   const submit = useSubmit();
 
@@ -365,6 +366,7 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
         kind,
         from_workflow_id: fromWorkflowId,
         from_revision_seq: revisionSeq,
+        keep_credential_refs: keepCredentials,
       }),
     );
     if (saved) onSaved();
@@ -385,8 +387,8 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
         </>
       }
     >
-      <Banner variant="warn" title="凭据不会存进模板">
-        从流程生成模板时，<strong>凭据不会被一起保存</strong>，之后用模板创建流程时需要重新选择。模板只保存流程的结构和配置，不保存运行中的内容（进行中的会话、审批、执行结果等）。
+      <Banner variant="info" title="密钥不会存进模板">
+        模板只保存流程的结构和配置，<strong>密钥本体永远不会被保存</strong>。模板里只保留凭据的引用（指向本机凭据库的一条记录），之后用模板创建流程时会自动绑定同名凭据。模板不保存运行中的内容（进行中的会话、审批、执行结果等）。
       </Banner>
 
       {formError ? (
@@ -447,6 +449,11 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
           />
         </Field>
       </div>
+
+      <label className="check" style={{ marginTop: 'var(--sp-3)' }}>
+        <input type="checkbox" checked={keepCredentials} onChange={(e) => setKeepCredentials(e.target.checked)} />
+        保留凭据引用（本机复用时自动绑定；要把模板分享给别人用时取消勾选）
+      </label>
     </Modal>
   );
 }
@@ -454,6 +461,15 @@ function CreateTemplateModal({ onClose, onSaved }: { onClose: () => void; onSave
 // ===========================================================================
 // 实例化：绑定凭据槽位（TPL-03）
 // ===========================================================================
+
+/** 槽位对应的模板节点上仍保留的凭据引用（同机复用时自动绑定的来源）。 */
+function carriedRefOf(template: Template, slot: string): string | null {
+  const m = /^(.*)\.profiles\[(\d+)\]\.credential_ref$/.exec(slot);
+  if (!m) return null;
+  const cfg = template.payload.nodes.find((n) => n.name === m[1]);
+  const ref = cfg?.profiles?.[Number(m[2])]?.credential_ref;
+  return typeof ref === 'string' && ref ? ref : null;
+}
 
 function BindModal({
   template,
@@ -505,8 +521,8 @@ function BindModal({
         </>
       }
     >
-      <Banner variant="warn" title="这个模板需要重新选择凭据">
-        凭据不会存进模板，请为下面每一项选择本机凭据。不选的项不会被自动补上，创建结果里会标为未绑定。
+      <Banner variant="info" title="凭据只保存引用，不保存密钥">
+        模板里保留的凭据引用会自动绑定本机同名凭据；只有本机找不到（比如模板来自别的机器）的项才需要重新选择。
       </Banner>
 
       {error ? <SubmitError error={error} what="使用模板失败" /> : null}
@@ -524,12 +540,23 @@ function BindModal({
           <tbody>
             {slots.map((slot) => {
               const kind = kindLabelOf(slot.original_kind);
+              const carried = carriedRefOf(template, slot.slot);
+              const carriedUsable =
+                carried !== null && credentialRows.some((c) => c.credential_id === carried);
+              const carriedLabel = carriedUsable
+                ? (credentialRows.find((c) => c.credential_id === carried)?.label ?? carried)
+                : null;
               return (
                 <tr key={slot.slot}>
                   <td className="mono text-xs">{slot.slot}</td>
                   <td>
                     <div>{slot.original_label ?? <span className="dim">未命名</span>}</div>
                     {kind ? <div className="text-xs dim">{kind}</div> : null}
+                    {carriedUsable ? (
+                      <div className="text-xs text-success">引用已保留，将自动绑定「{carriedLabel}」</div>
+                    ) : carried !== null ? (
+                      <div className="text-xs text-warn">原凭据在本机不存在或已撤销，请重新选择</div>
+                    ) : null}
                   </td>
                   <td>
                     {credentials.loading && !credentials.loaded ? (
@@ -537,10 +564,12 @@ function BindModal({
                     ) : (
                       <select
                         className="select"
-                        value={bindings[slot.slot] ?? ''}
+                        value={bindings[slot.slot] ?? (carriedUsable ? carried : '')}
                         onChange={(e) => setBinding(slot.slot, e.target.value)}
                       >
-                        <option value="">不选择（创建结果会标记为未绑定）</option>
+                        <option value="">
+                          {carriedUsable ? '改选…（不选则用自动绑定）' : '不选择（创建结果会标记为未绑定）'}
+                        </option>
                         {credentialRows.map((credential) => (
                           <option key={credential.credential_id} value={credential.credential_id}>
                             {credential.label}（{CREDENTIAL_KIND_LABELS[credential.kind]}）

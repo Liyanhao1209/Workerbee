@@ -504,6 +504,7 @@ export interface CredentialRef {
   kind: CredentialKind;
   secret_locator: string | null;
   base_url: string | null;
+  default_model: string | null;
   revoked: boolean;
   created_at?: string;
   updated_at?: string;
