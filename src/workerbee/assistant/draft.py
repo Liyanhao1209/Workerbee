@@ -95,6 +95,11 @@ class DraftNode(_LenientModel):
     """Skill 的 id 清单（不带版本，跟随最新）。"""
     tool_refs: list[str] = Field(default_factory=list)
     required_inputs: list[str] = Field(default_factory=list)
+    basis: Literal["observed", "inferred"] | None = None
+    """流程捕获专用：这个节点是「观察到的」（有材料佐证）还是「推断的」（模型补的）。
+    助手提案不使用该字段（留空）；捕获合成会强制填写并做服务端复核。"""
+    evidence: list[str] = Field(default_factory=list)
+    """流程捕获专用：佐证材料里的引用（``E<event_id>`` / ``A<artifact_id>``）。"""
 
 
 class DraftEdge(_LenientModel):
@@ -104,6 +109,10 @@ class DraftEdge(_LenientModel):
     to_node: str
     output_contract: list[str] = Field(default_factory=list)
     """该边交付的字段名清单；空表示不声明契约（文本交接）。"""
+    basis: Literal["observed", "inferred"] | None = None
+    """流程捕获专用：这条依赖是观察到的还是推断的（同 DraftNode.basis）。"""
+    evidence: list[str] = Field(default_factory=list)
+    """流程捕获专用：佐证材料里的引用（``E<event_id>`` / ``A<artifact_id>``）。"""
 
 
 class DraftProposal(_LenientModel):
