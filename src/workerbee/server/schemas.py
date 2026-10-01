@@ -110,6 +110,7 @@ __all__ = [
     "AssistantThreadListResponse",
     "AssistantMessageResponse",
     "AssistantMessageListResponse",
+    "AssistantDraftResponse",
     "AssistantSendRequest",
     "AssistantSendResponse",
     "AssistantCompactResponse",
@@ -905,6 +906,33 @@ class AssistantThreadRenameRequest(ApiRequest):
     title: str
 
 
+class AssistantDraftResponse(ApiResponse):
+    """一份助手草稿提案（迁移 9 的 assistant_draft 表）。
+
+    ``validation`` 是提案落库（或采用前复核）时刻的校验结论：
+    ``ok`` / ``summary`` / ``diagnostics``（与校验管线同形状）/
+    ``pending_config``（「待配置」项清单，前端标黄）/ ``error``（提案本身
+    无法构造时的大白话原因）。
+    """
+
+    draft_id: str
+    message_id: str
+    thread_id: str
+    kind: str
+    """workflow / node_template。"""
+    name: str = ""
+    description: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    """提案原文（节点与连线清单）。"""
+    validation: dict[str, Any] = Field(default_factory=dict)
+    status: str = "pending"
+    """pending / adopted / rejected（单向流转）。"""
+    adopted_ref: str | None = None
+    """采用产物的 id：workflow 提案是 workflow_id，节点模板是 template_id。"""
+    created_at: str
+    updated_at: str
+
+
 class AssistantMessageResponse(ApiResponse):
     """一条对话消息。``tokens_*`` 为 None 表示后端没给用量（未知，不是 0）。"""
 
@@ -920,6 +948,8 @@ class AssistantMessageResponse(ApiResponse):
     """True 表示这条回复发生过降级（备用后端、快照裁剪、指引缺失等）。"""
     reasoning: str | None = None
     """助手的推理过程（思维链）。None 表示这次回答没有推理内容（未知 ≠ 空串）。"""
+    drafts: list[AssistantDraftResponse] = Field(default_factory=list)
+    """这条回复携带的草稿提案（通常为空列表）。"""
     created_at: str
 
 

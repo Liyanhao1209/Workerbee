@@ -29,6 +29,7 @@ from ..core.domain import (
     CredentialRef,
     HarnessRegistration,
     InstantiationReport,
+    RevisionSource,
     SkillDoc,
     TaskState,
     ToolLaunch,
@@ -41,8 +42,9 @@ from ..core.domain import (
 )
 from ..core.domain.task import StageState
 from ..core.domain.template import MissingBinding, Template, TemplateKind
-from ..core.graph.validate import ValidationReport, validate
+from ..core.graph.validate import ValidationMode, ValidationReport, validate
 from ..assistant import AssistantConfig, AssistantError
+from ..assistant.draft import DraftInvalid, DraftProposal, proposal_graph
 from ..data.db import ConflictError
 from ..data.event_log import EventActor, EventScope, EventType
 from . import schemas as S
@@ -1483,7 +1485,8 @@ class AssistantService(_Service):
         except KeyError:
             raise NotFound(f"对话不存在: {thread_id}") from None
         return S.AssistantMessageListResponse(
-            messages=[S.AssistantMessageResponse.model_validate(m) for m in messages],
+            # 核心服务已把每条消息的草稿提案挂在 drafts 键上（通常为空列表）。
+            messages=[_message_out(m) for m in messages],
             returned=len(messages),
         )
 
@@ -1499,13 +1502,123 @@ class AssistantService(_Service):
             raise NotFound(f"对话不存在: {thread_id}") from None
         except AssistantError as exc:
             raise BadRequest(exc.detail, hint=exc.hint) from exc
+        message = dict(result["message"])
+        message["drafts"] = result.get("drafts") or []
         return S.AssistantSendResponse(
-            message=S.AssistantMessageResponse.model_validate(result["message"]),
+            message=_message_out(message),
             user_message=S.AssistantMessageResponse.model_validate(result["user_message"]),
             dropped=result["dropped"],
             degraded=result["degraded"],
             degraded_reasons=result["degraded_reasons"],
         )
+
+    # ---- 草稿提案：采用 / 拒绝（这是系统写，所以在网关层，不在助手里） ----
+
+    async def _require_draft(self, draft_id: str) -> dict[str, Any]:
+        draft = await self.store.assistant.get_draft(draft_id)
+        if draft is None:
+            raise NotFound("这条提案不存在（可能来自已被清理的对话）")
+        return draft
+
+    async def adopt_draft(self, draft_id: str) -> S.AssistantDraftResponse:
+        """采用提案：真正创建实体。
+
+        走与手动建图**完全相同**的服务层入口（create_workflow + save_revision /
+        create_template），且 ``publish`` 恒为 False——采用只存为草稿修订，
+        发布留给用户在编辑器里做。采用前按**此刻**的 registry 重新校验一次
+        （提案落库后注册表可能已经变了），结论回写进 draft 的 validation。
+        """
+        draft = await self._require_draft(draft_id)
+        if draft["status"] == "adopted":
+            raise BadRequest("这条提案已经采用过了，不能重复采用")
+        if draft["status"] != "pending":
+            raise BadRequest("这条提案已被拒绝，不能再采用；想要的话让助手再出一份")
+
+        try:
+            proposal = DraftProposal.model_validate(draft["payload"])
+        except ValueError as exc:
+            raise BadRequest(f"提案内容已损坏，无法采用：{exc}") from exc
+        try:
+            graph = proposal_graph(proposal)
+        except DraftInvalid as exc:
+            raise BadRequest(f"提案无法采用：{exc}") from exc
+
+        registry = await self.store.registry.snapshot()
+        report = validate(graph, registry, mode=ValidationMode.DRAFT)
+        validation = {
+            "ok": report.ok(),
+            "summary": report.summary(),
+            "error": None,
+            "diagnostics": [d.model_dump(mode="json") for d in report.diagnostics],
+            "pending_config": (draft["validation"] or {}).get("pending_config") or [],
+        }
+
+        if proposal.kind == "workflow":
+            workflows = WorkflowService(self.engine)
+            wf = await workflows.create_workflow(
+                S.WorkflowCreateRequest(name=proposal.name, description=proposal.description)
+            )
+            await workflows.save_revision(
+                wf.workflow_id,
+                S.RevisionSaveRequest(
+                    graph=graph,
+                    publish=False,
+                    source=RevisionSource.AI_GENERATED,
+                    note="由助手生成的草稿提案；采用后存为草稿修订，发布请到流程编辑器里做",
+                ),
+            )
+            adopted_ref = wf.workflow_id
+        else:
+            template = await TemplateService(self.engine).create_template(
+                S.TemplateCreateRequest(
+                    name=proposal.name,
+                    description=proposal.description,
+                    kind=TemplateKind.NODE,
+                    payload=proposal.to_node_template().payload,
+                )
+            )
+            adopted_ref = template.template_id
+
+        # CAS 迁移状态：并发/重复点击只有一个生效，不产生第二份采用产物。
+        ok = await self.store.assistant.decide_draft(
+            draft_id, to_status="adopted", adopted_ref=adopted_ref, validation=validation
+        )
+        if not ok:
+            raise BadRequest(
+                "这条提案刚刚已被处理（可能是重复点击）；请刷新对话后核对结果，"
+                "注意检查是否多出了流程或模板"
+            )
+        await self._event(
+            EventType.AI_DRAFT_ACCEPTED,
+            scope=EventScope.ASSISTANT,
+            scope_id=draft["thread_id"],
+            payload={
+                "draft_id": draft_id,
+                "kind": proposal.kind,
+                "adopted_ref": adopted_ref,
+                "validation_summary": validation["summary"],
+            },
+        )
+        return _draft_out(await self._require_draft(draft_id))
+
+    async def reject_draft(self, draft_id: str) -> S.AssistantDraftResponse:
+        """拒绝提案：不产生任何实体，但拒绝本身留痕（AI_DRAFT_REJECTED）。"""
+        draft = await self._require_draft(draft_id)
+        if draft["status"] == "rejected":
+            raise BadRequest("这条提案已经拒绝过了")
+        if draft["status"] != "pending":
+            raise BadRequest("这条提案已被采用，不能再拒绝")
+        ok = await self.store.assistant.decide_draft(draft_id, to_status="rejected")
+        if not ok:
+            raise BadRequest("这条提案刚刚已被处理（可能是重复点击）；请刷新对话后再看")
+        await self._event(
+            EventType.AI_DRAFT_REJECTED,
+            scope=EventScope.ASSISTANT,
+            scope_id=draft["thread_id"],
+            payload={"draft_id": draft_id, "kind": draft["kind"]},
+        )
+        return _draft_out(await self._require_draft(draft_id))
+
 
     async def compact(self, thread_id: str) -> S.AssistantCompactResponse:
         """手动「整理前文」。这是唯一会额外调用一次模型的记忆操作（用户显式触发）。"""
@@ -1632,6 +1745,23 @@ def _session_record(row: Any) -> S.SessionRecord:
         created_at=pick("created_at"),
         last_heartbeat=pick("last_heartbeat"),
     )
+
+
+def _draft_out(row: dict[str, Any]) -> S.AssistantDraftResponse:
+    """草稿行 → 响应。name/description 是提案内容的顶层字段，提取出来让前端少拆一层。"""
+    payload = row.get("payload") or {}
+    return S.AssistantDraftResponse(
+        **row,
+        name=str(payload.get("name") or ""),
+        description=payload.get("description"),
+    )
+
+
+def _message_out(row: dict[str, Any]) -> S.AssistantMessageResponse:
+    """消息行 → 响应；附带的草稿提案逐条过 _draft_out（补 name/description）。"""
+    data = dict(row)
+    data["drafts"] = [_draft_out(d) for d in data.get("drafts") or []]
+    return S.AssistantMessageResponse.model_validate(data)
 
 
 def _workflow_out(wf: WorkflowDefinition) -> S.WorkflowResponse:

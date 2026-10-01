@@ -79,6 +79,25 @@ async def compact(
     return await services.assistant.compact(thread_id)
 
 
+@router.post(
+    "/api/assistant/drafts/{draft_id}/adopt",
+    response_model=S.AssistantDraftResponse,
+    summary="采用草稿提案（存为草稿修订，不自动发布）",
+)
+async def adopt_draft(draft_id: str, services: ServicesDep) -> S.AssistantDraftResponse:
+    """采用走与手动建图相同的服务层入口；publish 恒为 False，不接受 publish 参数。"""
+    return await services.assistant.adopt_draft(draft_id)
+
+
+@router.post(
+    "/api/assistant/drafts/{draft_id}/reject",
+    response_model=S.AssistantDraftResponse,
+    summary="拒绝草稿提案（留痕，不产生任何实体）",
+)
+async def reject_draft(draft_id: str, services: ServicesDep) -> S.AssistantDraftResponse:
+    return await services.assistant.reject_draft(draft_id)
+
+
 @router.get(
     "/api/assistant/config",
     response_model=S.AssistantConfigResponse,
