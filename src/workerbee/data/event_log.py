@@ -99,6 +99,8 @@ class EventType(StrEnum):
     APPROVAL_UNDELIVERABLE = "approval.undeliverable"
     AI_DRAFT_PROPOSED = "ai.draft_proposed"
     AI_DRAFT_ACCEPTED = "ai.draft_accepted"
+    AI_DRAFT_REJECTED = "ai.draft_rejected"
+    """助手提案被用户拒绝：拒绝也要留痕（与采用同一条纪律）。"""
     SECRET_BOUND = "secret.bound"
     SECRET_REVOKED = "secret.revoked"
 

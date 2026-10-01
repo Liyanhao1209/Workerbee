@@ -1526,7 +1526,98 @@ class AssistantRepository:
             > 0
         )
 
+    # ---- 草稿提案（assistant_draft，迁移 9） ----
+
+    async def create_draft(
+        self,
+        *,
+        draft_id: str,
+        message_id: str,
+        thread_id: str,
+        kind: str,
+        payload: dict[str, Any],
+        validation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """落一份草稿提案。状态恒为 pending：采用/拒绝是之后用户的显式决定。"""
+        now = utcnow().isoformat()
+        await self.db.execute(
+            """INSERT INTO assistant_draft(draft_id, message_id, thread_id, kind,
+                   payload, validation, status, adopted_ref, created_at, updated_at)
+               VALUES (?,?,?,?,?,?, 'pending', NULL, ?,?)""",
+            (draft_id, message_id, thread_id, kind, dumps(payload), dumps(validation), now, now),
+        )
+        return {
+            "draft_id": draft_id,
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "kind": kind,
+            "payload": payload,
+            "validation": validation,
+            "status": "pending",
+            "adopted_ref": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+        row = await self.db.fetch_one(
+            "SELECT * FROM assistant_draft WHERE draft_id=?", (draft_id,)
+        )
+        return self._to_draft(row) if row else None
+
+    async def list_drafts_for_thread(self, thread_id: str) -> list[dict[str, Any]]:
+        rows = await self.db.fetch_all(
+            "SELECT * FROM assistant_draft WHERE thread_id=? ORDER BY created_at, rowid",
+            (thread_id,),
+        )
+        return [self._to_draft(r) for r in rows]
+
+    async def decide_draft(
+        self,
+        draft_id: str,
+        *,
+        to_status: str,
+        adopted_ref: str | None = None,
+        validation: dict[str, Any] | None = None,
+    ) -> bool:
+        """采用/拒绝的 CAS：只允许 pending → adopted|rejected。
+
+        并发或重复点击时只有一个请求能迁移状态；失败方拿到 False，
+        由服务层回 400 大白话说明（不产生第二份采用产物）。
+        """
+        assert to_status in ("adopted", "rejected")
+        return (
+            await self.db.execute_rowcount(
+                """UPDATE assistant_draft
+                   SET status=?, adopted_ref=?, validation=COALESCE(?, validation), updated_at=?
+                   WHERE draft_id=? AND status='pending'""",
+                (
+                    to_status,
+                    adopted_ref,
+                    dumps(validation) if validation is not None else None,
+                    utcnow().isoformat(),
+                    draft_id,
+                ),
+            )
+            > 0
+        )
+
     # ---- mappers ----
+
+    @staticmethod
+    def _to_draft(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "draft_id": row["draft_id"],
+            "message_id": row["message_id"],
+            "thread_id": row["thread_id"],
+            "kind": row["kind"],
+            "payload": loads(row["payload"], {}),
+            "validation": loads(row["validation"], {}),
+            "status": row["status"],
+            "adopted_ref": row["adopted_ref"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     @staticmethod
     def _to_thread(row: sqlite3.Row) -> dict[str, Any]:

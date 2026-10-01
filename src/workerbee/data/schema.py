@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -461,6 +461,33 @@ CREATE INDEX IF NOT EXISTS idx_assistant_message_thread
 -- 累积、分开入库，界面据此渲染可折叠的「思考过程」区。nullable——非思考
 -- 模型没有推理内容，NULL 如实表示「没有」，不是空串。
 ALTER TABLE assistant_message ADD COLUMN reasoning TEXT;
+""",
+    ),
+    (
+        9,
+        """
+-- 助手草稿提案（Base Assistant 建图提案）：模型回复里的 workerbee-draft 块
+-- 经解析与校验后落库，前端渲染成卡片。「采用/拒绝」是用户的显式决定，
+-- 状态机 pending→adopted|rejected 单向流转（采用/拒绝 CAS 在仓储层）。
+-- payload 是提案原文（JSON），validation 是**落库时刻**的校验结论
+-- （含错误清单与「待配置」项）；采用前会按当时的 registry 重新校验一次。
+-- adopted_ref 记录采用产物的 id（workflow_id 或 template_id）。
+CREATE TABLE IF NOT EXISTS assistant_draft (
+    draft_id    TEXT PRIMARY KEY,
+    message_id  TEXT NOT NULL,
+    thread_id   TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    payload     TEXT NOT NULL DEFAULT '{}',
+    validation  TEXT NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    adopted_ref TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    FOREIGN KEY (message_id) REFERENCES assistant_message(message_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_draft_thread
+    ON assistant_draft(thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_assistant_draft_message ON assistant_draft(message_id);
 """,
     ),
 ]
