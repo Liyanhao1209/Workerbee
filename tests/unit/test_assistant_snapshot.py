@@ -104,6 +104,33 @@ async def test_snapshot_without_source_is_explicitly_empty() -> None:
     assert snap.degraded  # 如实标注「看不到系统状态」
 
 
+async def test_registry_section_lists_referenceable_entities() -> None:
+    """registry 分区是可引用实体清单：id、名称、可用性都在；凭据绝无密值。"""
+    source = FakeSource(
+        registry={
+            "harnesses": [{"harness_id": "h1", "name": "Claude", "enabled": True,
+                           "last_probe_ok": True}],
+            "credentials": [{"credential_id": "c1", "label": "API",
+                             "base_url": "https://x.example.com",
+                             "default_model": "gpt-test", "revoked": False},
+                            {"credential_id": "c2", "label": "旧凭据",
+                             "base_url": None, "default_model": None, "revoked": True}],
+            "skills": [{"skill_id": "s1", "name": "写周报", "enabled": True}],
+            "tools": [{"tool_id": "t1", "name": "查日历", "enabled": False}],
+        }
+    )
+    snap = await build_snapshot(source, budget=6000)
+    text = snap.text
+    assert "id=h1" in text and "Claude" in text
+    assert "id=c1" in text and "https://x.example.com" in text and "gpt-test" in text
+    assert "id=c2" in text and "已撤销" in text  # 撤销状态如实展示
+    assert "id=s1" in text and "写周报" in text
+    assert "id=t1" in text and "停用" in text
+    # 密值绝不出现在 registry 分区（这里连字段都不该有）
+    assert "secret" not in text.lower()
+    assert "api_key" not in text.lower()
+
+
 async def test_snapshot_passes_through_redactor() -> None:
     secret = "sk-live-abcdef0123456789"
     source = FakeSource(

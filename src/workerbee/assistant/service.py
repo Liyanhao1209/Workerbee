@@ -25,12 +25,14 @@ import json
 from typing import Any, Callable, Literal, Sequence
 
 from ..core.domain.base import DomainModel, new_id, utcnow
+from ..core.graph.validate import ValidationMode, validate
 from ..core.runtime.notifier import Notification
 from ..data.db import Database
 from ..data.event_log import EventActor, EventScope, EventType
 from ..data.llm.backend import LLMBackend, LLMChunk, LLMError, LLMMessage
 from ..data.llm.router import BackendConfig, LLMRouter
 from ..data.store import Store
+from .draft import DraftInvalid, collect_pending, extract_proposal, proposal_graph
 from .guidebook import DEFAULT_GUIDEBOOK_BUDGET, load_guidebook
 from .memory import (
     DEFAULT_WINDOW_CHARS,
@@ -67,11 +69,47 @@ AUTO_TITLE_CHARS = 20
 _ROLE_PROMPT = """你是 Workerbee（本机多智能体工作流编排工具）的内置助手。
 
 规则：
-- 你只能回答问题、解释概念、指引操作路径；你不能替用户改任何配置、建流程、
-  提交任务或碰凭据。需要动手时，告诉用户到哪个页面、点哪里。
+- 你只能回答问题、解释概念、指引操作路径、以及按下面的约定**提议**流程或节点的
+  草稿；你不能替用户改任何配置、直接创建流程、提交任务或碰凭据。需要动手时，
+  告诉用户到哪个页面、点哪里；草稿提案也要等用户点「采用」才会生效。
 - 回答基于下面给出的「使用指引」和「系统当前状态快照」。快照是发消息那一刻的
   状态；快照里没有的信息就说不知道，不要编造。
 - 用大白话中文回答，先给结论，再给操作步骤。不要暴露内部字段名与表名。"""
+
+_DRAFT_PROMPT = """## 生成流程/节点草稿提案
+
+当用户要求创建或生成一个流程（workflow）、或一个可复用的节点模板时，除了解释，
+还要在回复末尾输出一个提案块（围栏语言标记 workerbee-draft，内容是一个 JSON）：
+
+```workerbee-draft
+{"kind": "workflow", "name": "流程名", "description": "……",
+ "nodes": [{"node_id": "planner", "name": "规划", "role": "规划者",
+            "system_prompt": "……",
+            "profiles": [{"harness_ref": "<harness id>", "model_name": "<模型名>",
+                          "credential_ref": "<凭据 id>", "reasoning_effort": null}],
+            "skill_refs": ["<Skill id>"], "tool_refs": ["<工具 id>"]}],
+ "edges": [{"from_node": "planner", "to_node": "coder",
+            "output_contract": ["plan"]}]}
+```
+
+字段约定：
+- kind："workflow"（整条流程）或 "node_template"（节点模板；此时 nodes 恰好一个、
+  不带 edges）。
+- nodes[].node_id：简短英文标识（如 "planner"）；边的端点用 node_id 或节点名。
+- nodes[].profiles[]：harness_ref / model_name / credential_ref / reasoning_effort，
+  均可留空（null 或省略）表示待配置。
+- edges[].output_contract：该边交付的字段名清单，可省略（不声明契约=文本交接）。
+- 可选 "notes": ["……"]，用于标注待配置项。
+
+纪律：
+- 只能引用上面「注册表概览」清单里列出的实体 id（harness/凭据/Skill/工具）。
+  清单里没有的不要编造：对应字段留空，并在 description 或 notes 里写清
+  「待配置：缺×××」。
+- 提案只是草稿：用户点「采用」后才会创建，而且只存为草稿修订，不会自动发布——
+  发布要用户去流程编辑器里做。请在回复里如实说明这一点。
+- 一条回复至多输出一个提案块；不支持「修改某个既有流程」的提案——要改既有流程，
+  告诉用户去流程编辑器里改。
+- 你不能创建凭据、Skill 或工具，更不能输出任何密钥内容。"""
 
 _COMPACT_PROMPT = """下面是用户与助手的一段较早对话，以及（可能有的）此前整理过的摘要。
 请把它们压缩成一段简短的中文记忆，保留：用户关心的问题、已给出的结论、
@@ -244,8 +282,19 @@ class AssistantService:
         return thread
 
     async def list_messages(self, thread_id: str) -> list[dict[str, Any]]:
+        """按时间正序取回历史；每条消息带上它的草稿提案（通常为空列表）。
+
+        提案与消息一次拿齐，前端不必逐条再查。
+        """
         await self._require_thread(thread_id)
-        return await self.store.assistant.list_messages(thread_id)
+        messages = await self.store.assistant.list_messages(thread_id)
+        drafts = await self.store.assistant.list_drafts_for_thread(thread_id)
+        by_message: dict[str, list[dict[str, Any]]] = {}
+        for d in drafts:
+            by_message.setdefault(d["message_id"], []).append(d)
+        for m in messages:
+            m["drafts"] = by_message.get(m["message_id"], [])
+        return messages
 
     # ------------------------------------------------------------------
     # 配置
@@ -349,6 +398,18 @@ class AssistantService:
         usage = final.usage
         backend_name = final.backend or "unknown"
 
+        # 草稿提案：解析回复里的 workerbee-draft 块并按此刻的 registry 做草稿档校验。
+        # 这一步只做只读操作；任何失败都不拖垮本次问答——回复照常落库，
+        # 只是没有提案卡片，且失败事实记进降级说明。
+        try:
+            prepared_draft = await self._prepare_draft(safe_reply)
+        except Exception as exc:  # noqa: BLE001 - 提案处理失败不是一次问答的失败
+            degraded_notes.append(
+                f"提案解析或校验失败（{type(exc).__name__}），本次回复没有生成草稿卡片"
+            )
+            degraded = True
+            prepared_draft = None
+
         user_message = await self.store.assistant.append_message(
             message_id=new_id(), thread_id=thread_id, role="user", content=safe_text
         )
@@ -363,6 +424,36 @@ class AssistantService:
             degraded=degraded,
             reasoning=safe_reasoning,
         )
+
+        # 草稿行挂在回复消息上（外键），因此在消息落库之后插入。
+        draft_row: dict[str, Any] | None = None
+        if prepared_draft is not None:
+            draft_row = await self.store.assistant.create_draft(
+                draft_id=new_id(),
+                message_id=reply["message_id"],
+                thread_id=thread_id,
+                kind=prepared_draft["kind"],
+                payload=prepared_draft["payload"],
+                validation=prepared_draft["validation"],
+            )
+            await self.store.events.append(
+                scope=EventScope.ASSISTANT,
+                type=EventType.AI_DRAFT_PROPOSED,
+                actor=EventActor.AI,
+                scope_id=thread_id,
+                payload={
+                    "draft_id": draft_row["draft_id"],
+                    "message_id": reply["message_id"],
+                    "kind": draft_row["kind"],
+                    "validation_summary": draft_row["validation"].get("summary"),
+                    "diagnostic_count": len(
+                        draft_row["validation"].get("diagnostics") or []
+                    ),
+                    "pending_config_count": len(
+                        draft_row["validation"].get("pending_config") or []
+                    ),
+                },
+            )
 
         # 自动标题：线程还没有名字时，取本次（首条）用户消息的前 20 字落库。
         if not thread.get("title"):
@@ -415,6 +506,7 @@ class AssistantService:
         return {
             "user_message": user_message,
             "message": reply,
+            "drafts": [draft_row] if draft_row is not None else [],
             "dropped": window.dropped,
             "degraded": degraded,
             "degraded_reasons": degraded_notes + list(final.degraded_reasons),
@@ -441,6 +533,57 @@ class AssistantService:
             )
         except Exception:  # noqa: BLE001 - 推送通道的故障不该打断一次问答
             pass
+
+    # ------------------------------------------------------------------
+    # 草稿提案（解析 + 校验；采用/拒绝在 server 服务层，因为那是系统写）
+    # ------------------------------------------------------------------
+
+    async def _prepare_draft(self, reply_text: str) -> dict[str, Any] | None:
+        """解析回复里的提案块并按此刻的 registry 做草稿档校验（WF-05 的 draft 档）。
+
+        返回 ``None`` 表示这条回复没有（可解析的）提案——这不是错误。
+        校验结论全部写进 ``validation``：诊断、待配置项、以及提案内容本身的
+        构造错误（如节点模板给了两个节点）都如实记录，前端据此渲染卡片。
+        """
+        proposal = extract_proposal(reply_text)
+        if proposal is None:
+            return None
+
+        registry_store = self.store.registry
+        registry = await registry_store.snapshot()
+        pending = collect_pending(
+            proposal,
+            harness_ids=[h.harness_id for h in await registry_store.list_harnesses()],
+            credential_ids=[c.credential_id for c in await registry_store.list_credentials()],
+            skill_ids=[s.skill_id for s in await registry_store.list_skills()],
+            tool_ids=[t.tool_id for t in await registry_store.list_tools()],
+        )
+
+        diagnostics: list[dict[str, Any]] = []
+        error: str | None = None
+        try:
+            graph = proposal_graph(proposal)
+        except DraftInvalid as exc:
+            error = str(exc)
+            summary = f"提案无法构造：{exc}"
+        else:
+            report = validate(graph, registry, mode=ValidationMode.DRAFT)
+            diagnostics = [d.model_dump(mode="json") for d in report.diagnostics]
+            summary = report.summary()
+
+        has_errors = any(d["severity"] == "error" for d in diagnostics)
+        validation = {
+            "ok": error is None and not has_errors,
+            "summary": summary,
+            "error": error,
+            "diagnostics": diagnostics,
+            "pending_config": pending,
+        }
+        return {
+            "kind": proposal.kind,
+            "payload": proposal.model_dump(mode="json"),
+            "validation": validation,
+        }
 
     # ------------------------------------------------------------------
     # 手动整理前文（唯一会产生额外调用的记忆操作，用户显式触发）
@@ -621,6 +764,7 @@ class AssistantService:
         parts.append(
             "## 使用指引\n\n" + (guidebook or "（使用指引文档还没写好，这一部分为空）")
         )
+        parts.append(_DRAFT_PROMPT)
         parts.append(
             "## 系统当前状态快照\n\n"
             + (snapshot or "（本次取不到系统状态快照，回答时不要编造系统状态）")

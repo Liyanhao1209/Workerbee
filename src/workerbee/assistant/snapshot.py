@@ -48,7 +48,11 @@ class SnapshotSource(Protocol):
         ...
 
     async def registry_overview(self) -> dict[str, Any]:
-        """registry 概览：harness 列表与可用性、凭据/Skill/工具数量（绝无密值）。"""
+        """registry 概览：**可引用实体清单**——harness（id+名称+可用性）、
+
+        凭据（id+label+base_url+默认模型，绝无密值）、Skill（id+名称）、
+        MCP 工具（id+名称）。助手生成草稿提案时只能引用这里列出的 id。
+        """
         ...
 
     async def recent_error_events(self, limit: int) -> list[dict[str, Any]]:
@@ -205,8 +209,12 @@ async def _render_tasks(source: SnapshotSource, limit: int) -> str:
 
 
 async def _render_registry(source: SnapshotSource) -> str:
+    """registry 分区：可引用实体清单（id 是给提案用的引用键，必须出现在文本里）。
+
+    凭据只列引用与接入信息（label / base_url / default_model），绝无密值。
+    """
     overview = await source.registry_overview()
-    lines = ["## 注册表概览"]
+    lines = ["## 注册表概览（可引用的实体清单；生成提案时只能用这里的 id）"]
     harnesses = overview.get("harnesses") or []
     if harnesses:
         lines.append("- harness：")
@@ -214,18 +222,43 @@ async def _render_registry(source: SnapshotSource) -> str:
             probed = h.get("last_probe_ok")
             probe_text = {True: "探测正常", False: "探测失败", None: "未探测"}[probed]
             lines.append(
-                f"  - {h.get('name') or h.get('harness_id')}"
+                f"  - id={h.get('harness_id')} 名称={h.get('name') or h.get('harness_id')}"
                 f"（{'启用' if h.get('enabled') else '停用'}，{probe_text}）"
             )
     else:
         lines.append("- 还没有登记任何 harness")
-    lines.append(
-        "- 凭据 {cred} 条，Skill {skill} 个，工具 {tool} 个".format(
-            cred=overview.get("credential_count", 0),
-            skill=overview.get("skill_count", 0),
-            tool=overview.get("tool_count", 0),
-        )
-    )
+    credentials = overview.get("credentials") or []
+    if credentials:
+        lines.append("- 凭据（只有引用与接入信息，没有密钥本体）：")
+        for c in credentials:
+            bits = [f"id={c.get('credential_id')}", f"label={c.get('label')}"]
+            if c.get("base_url"):
+                bits.append(f"base_url={c.get('base_url')}")
+            if c.get("default_model"):
+                bits.append(f"默认模型={c.get('default_model')}")
+            lines.append("  - " + " ".join(bits) + ("（已撤销）" if c.get("revoked") else ""))
+    else:
+        lines.append("- 还没有登记任何凭据")
+    skills = overview.get("skills") or []
+    if skills:
+        lines.append("- Skill：")
+        for s in skills:
+            lines.append(
+                f"  - id={s.get('skill_id')} 名称={s.get('name') or s.get('skill_id')}"
+                + ("" if s.get("enabled", True) else "（停用）")
+            )
+    else:
+        lines.append("- 还没有登记任何 Skill")
+    tools = overview.get("tools") or []
+    if tools:
+        lines.append("- MCP 工具：")
+        for t in tools:
+            lines.append(
+                f"  - id={t.get('tool_id')} 名称={t.get('name') or t.get('tool_id')}"
+                + ("" if t.get("enabled", True) else "（停用）")
+            )
+    else:
+        lines.append("- 还没有登记任何 MCP 工具")
     return "\n".join(lines)
 
 

@@ -1395,8 +1395,8 @@ class AssistantSnapshotSource:
         ]
 
     async def registry_overview(self) -> dict[str, Any]:
+        """可引用实体清单。凭据只给引用与接入信息——密值永不出 registry（AUTH-02）。"""
         registry = self._services.engine.store.registry
-        harnesses = await registry.list_harnesses()
         return {
             "harnesses": [
                 {
@@ -1405,11 +1405,26 @@ class AssistantSnapshotSource:
                     "enabled": h.enabled,
                     "last_probe_ok": h.last_probe_ok,
                 }
-                for h in harnesses
+                for h in await registry.list_harnesses()
             ],
-            "credential_count": len(await registry.list_credentials()),
-            "skill_count": len(await registry.list_skills()),
-            "tool_count": len(await registry.list_tools()),
+            "credentials": [
+                {
+                    "credential_id": c.credential_id,
+                    "label": c.label,
+                    "base_url": c.base_url,
+                    "default_model": c.default_model,
+                    "revoked": c.revoked,
+                }
+                for c in await registry.list_credentials()
+            ],
+            "skills": [
+                {"skill_id": s.skill_id, "name": s.name, "enabled": s.enabled}
+                for s in await registry.list_skills()
+            ],
+            "tools": [
+                {"tool_id": t.tool_id, "name": t.name, "enabled": t.enabled}
+                for t in await registry.list_tools()
+            ],
         }
 
     async def recent_error_events(self, limit: int) -> list[dict[str, Any]]:

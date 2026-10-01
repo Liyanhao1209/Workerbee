@@ -57,7 +57,11 @@ class FakeSnapshotSource:
     async def registry_overview(self):
         return {"harnesses": [{"harness_id": "h1", "name": "Claude", "enabled": True,
                                "last_probe_ok": True}],
-                "credential_count": 1, "skill_count": 0, "tool_count": 0}
+                "credentials": [{"credential_id": "cred-1", "label": "测试 API",
+                                 "base_url": "https://llm.example.com/v1",
+                                 "default_model": "gpt-test", "revoked": False}],
+                "skills": [{"skill_id": "s1", "name": "写周报", "enabled": True}],
+                "tools": []}
 
     async def recent_error_events(self, limit):
         return []
@@ -123,6 +127,12 @@ async def test_full_flow_and_prompt_contents(store) -> None:
     assert "Workerbee" in system_text  # guidebook 内容真的进去了
     assert "系统当前状态快照" in system_text
     assert "节点超时" in system_text  # 快照里的失败任务真的进去了
+    # 可引用实体清单真的进了 prompt（提案纪律依赖它：只能引用清单里的 id）
+    assert "id=h1" in system_text
+    assert "id=cred-1" in system_text
+    assert "id=s1" in system_text
+    # 提案规则（workerbee-draft 块）真的进了 prompt
+    assert "workerbee-draft" in system_text
     assert messages[-1].role == "user"
     assert messages[-1].content == "现在有什么任务失败了？"
 
