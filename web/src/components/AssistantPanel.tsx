@@ -12,7 +12,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { registry } from '../api/endpoints';
-import type { AssistantConfigUpdate, AssistantMessage, CredentialRef } from '../api/types';
+import type {
+  AssistantConfigUpdate,
+  AssistantDraft,
+  AssistantMessage,
+  CredentialRef,
+} from '../api/types';
 import { renderMarkdown } from '../lib/markdown';
 import { useAssistant, type AssistantFailure } from '../store/assistant';
 import { Banner, Empty, Field, Loading, Modal } from './common';
@@ -416,7 +421,160 @@ function ChatMessage({
               : ''}
           </div>
         ) : null}
+        {!isUser
+          ? (message.drafts ?? []).map((d) => <DraftCard key={d.draft_id} draft={d} />)
+          : null}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 草稿提案卡片：提案类型、节点清单、校验结论、「待配置」项，以及采用/拒绝按钮。
+ *
+ * 采用才真正创建实体（走与手动建图相同的服务层入口），且只存为草稿修订——
+ * 卡片上如实写明「采用后存为草稿，去流程编辑器里发布」。
+ */
+function DraftCard({ draft }: { draft: AssistantDraft }): JSX.Element {
+  const adoptDraft = useAssistant((s) => s.adoptDraft);
+  const rejectDraft = useAssistant((s) => s.rejectDraft);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<AssistantFailure | null>(null);
+
+  const isTemplate = draft.kind === 'node_template';
+  const kindLabel = isTemplate ? '节点模板' : '流程';
+  const validation = draft.validation;
+  const diagnostics = validation?.diagnostics ?? [];
+  const problems = diagnostics.filter((d) => d.severity === 'error' || d.severity === 'warning');
+  const pending = validation?.pending_config ?? [];
+  const nodes = draft.payload?.nodes ?? [];
+  const notes = draft.payload?.notes ?? [];
+
+  const run = async (action: 'adopt' | 'reject'): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    const failure =
+      action === 'adopt' ? await adoptDraft(draft.draft_id) : await rejectDraft(draft.draft_id);
+    setBusy(false);
+    if (failure) setError(failure);
+  };
+
+  const onReject = (): void => {
+    if (
+      window.confirm(
+        `确认拒绝这份${kindLabel}提案？拒绝后这张卡片不能再采用，想要的话需要让助手再出一份。`,
+      )
+    ) {
+      void run('reject');
+    }
+  };
+
+  return (
+    <div className="draft-card">
+      <div className="draft-card__title">
+        提案：{kindLabel}「{draft.name || '未命名'}」
+      </div>
+      {draft.description ? <div>{draft.description}</div> : null}
+
+      {nodes.length > 0 ? (
+        <div className="draft-card__section">
+          <div>节点（{nodes.length} 个）：</div>
+          <ul className="draft-card__list">
+            {nodes.map((n, i) => {
+              const profile = n.profiles?.[0];
+              const harness = profile?.harness_ref || '待配置';
+              const model = profile?.model_name || 'harness 默认';
+              return (
+                <li key={n.node_id ?? i}>
+                  {n.name}（harness：{harness} · 模型：{model}）
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
+
+      {validation ? (
+        <div className="draft-card__section">
+          <div>校验：{validation.error ? `提案有问题——${validation.error}` : validation.summary}</div>
+          {problems.length > 0 ? (
+            <ul className="draft-card__list">
+              {problems.map((d, i) => (
+                <li key={i}>{d.message}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+
+      {pending.length > 0 ? (
+        <div className="draft-card__section">
+          {pending.map((p, i) => (
+            <div key={i} className="draft-card__pending">
+              待配置：{p}
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {notes.map((n, i) => (
+        <div key={i} className="draft-card__note">
+          {n}
+        </div>
+      ))}
+
+      {draft.status === 'pending' ? (
+        <>
+          <div className="draft-card__note">
+            {isTemplate
+              ? '采用后创建为节点模板，可在模板页查看。'
+              : '采用后存为草稿，去流程编辑器里发布。'}
+          </div>
+          <div className="draft-card__actions">
+            <button
+              type="button"
+              className="btn btn--primary btn--sm"
+              disabled={busy}
+              onClick={() => void run('adopt')}
+            >
+              {busy ? '处理中…' : '采用'}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              disabled={busy}
+              onClick={onReject}
+            >
+              拒绝
+            </button>
+          </div>
+        </>
+      ) : draft.status === 'adopted' ? (
+        <div className="draft-card__note">
+          已采用。
+          {isTemplate ? (
+            <>
+              <Link to="/templates">到模板页查看</Link>。
+            </>
+          ) : draft.adopted_ref ? (
+            <>
+              <Link to={`/workflows/${encodeURIComponent(draft.adopted_ref)}`}>
+                打开流程（草稿，发布后才会生效）
+              </Link>
+              。
+            </>
+          ) : null}
+        </div>
+      ) : (
+        <div className="draft-card__note">已拒绝。</div>
+      )}
+
+      {error ? (
+        <div className="draft-card__error">
+          {error.detail}
+          {error.hint ? `（${error.hint}）` : ''}
+        </div>
+      ) : null}
     </div>
   );
 }

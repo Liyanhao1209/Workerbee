@@ -72,6 +72,9 @@ interface AssistantStore {
   reloadMessages: () => Promise<void>;
   send: (content: string) => Promise<boolean>;
   compact: () => Promise<AssistantCompactResult | null>;
+  /** 采用/拒绝草稿提案；返回 null 表示成功，失败返回后端错误由卡片展示。 */
+  adoptDraft: (draftId: string) => Promise<AssistantFailure | null>;
+  rejectDraft: (draftId: string) => Promise<AssistantFailure | null>;
   refreshConfig: () => Promise<void>;
   /** 返回 null 表示成功；失败返回后端错误（含引导文案）由调用方展示。 */
   updateConfig: (body: AssistantConfigUpdate) => Promise<AssistantFailure | null>;
@@ -209,6 +212,27 @@ export const useAssistant = create<AssistantStore>((set, get) => ({
     } catch (err) {
       set({ compacting: false, sendError: asFailure(err, '整理前文失败。') });
       return null;
+    }
+  },
+
+  adoptDraft: async (draftId) => {
+    try {
+      await assistantApi.adoptDraft(draftId);
+      // 卡片状态以服务端为准重拉，不在本地乐观改写。
+      await get().reloadMessages();
+      return null;
+    } catch (err) {
+      return asFailure(err, '采用提案失败。');
+    }
+  },
+
+  rejectDraft: async (draftId) => {
+    try {
+      await assistantApi.rejectDraft(draftId);
+      await get().reloadMessages();
+      return null;
+    } catch (err) {
+      return asFailure(err, '拒绝提案失败。');
     }
   },
 

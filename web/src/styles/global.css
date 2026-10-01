@@ -874,6 +874,46 @@ kbd,
   color: var(--fg-3);
   margin-bottom: var(--sp-1);
 }
+/* 助手草稿提案卡片：跟在助手气泡下面，独立于气泡排版。 */
+.draft-card {
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  padding: var(--sp-2) var(--sp-3);
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+  color: var(--fg-2);
+}
+.draft-card__title {
+  font-size: var(--fs-sm);
+  color: var(--fg-1);
+  margin-bottom: var(--sp-1);
+}
+.draft-card__section {
+  margin-top: var(--sp-1);
+}
+.draft-card__list {
+  margin: 0;
+  padding-left: var(--sp-4);
+}
+.draft-card__pending {
+  color: var(--st-warn);
+}
+.draft-card__note {
+  margin-top: var(--sp-1);
+  color: var(--fg-3);
+}
+.draft-card__actions {
+  margin-top: var(--sp-2);
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+.draft-card__error {
+  margin-top: var(--sp-1);
+  color: var(--st-danger);
+}
+
 .chat-composer {
   border-top: 1px solid var(--line);
   padding: var(--sp-2) var(--sp-3);

@@ -1000,6 +1000,63 @@ export interface AssistantThread {
   updated_at: string;
 }
 
+export interface AssistantDraftDiagnostic {
+  code: string;
+  severity: 'error' | 'warning' | 'info';
+  message: string;
+  node_id: string | null;
+  node_name: string | null;
+  slot: string | null;
+  hint: string | null;
+}
+
+/** 提案落库（或采用前复核）时刻的校验结论。 */
+export interface AssistantDraftValidation {
+  ok: boolean;
+  summary: string;
+  /** 提案本身无法构造时的大白话原因（如节点模板给了两个节点）。 */
+  error: string | null;
+  diagnostics: AssistantDraftDiagnostic[];
+  /** 「待配置」项清单：留空的槽位 + 引用了清单外实体的槽位。 */
+  pending_config: string[];
+}
+
+/** 提案里的一个节点（字段与提案 JSON 对齐）。 */
+export interface AssistantDraftNode {
+  node_id: string | null;
+  name: string;
+  role: string | null;
+  system_prompt: string | null;
+  profiles: {
+    harness_ref: string | null;
+    model_name: string | null;
+    credential_ref: string | null;
+    reasoning_effort: string | null;
+  }[];
+  skill_refs: string[];
+  tool_refs: string[];
+  required_inputs: string[];
+}
+
+export interface AssistantDraft {
+  draft_id: string;
+  message_id: string;
+  thread_id: string;
+  /** workflow / node_template */
+  kind: string;
+  name: string;
+  description: string | null;
+  /** 提案原文（节点与连线清单）。 */
+  payload: { nodes?: AssistantDraftNode[]; notes?: string[] } & Record<string, unknown>;
+  validation: AssistantDraftValidation;
+  /** pending / adopted / rejected（单向流转）。 */
+  status: string;
+  /** 采用产物的 id：workflow 提案是 workflow_id，节点模板是 template_id。 */
+  adopted_ref: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AssistantMessage {
   message_id: string;
   thread_id: string;
@@ -1014,6 +1071,8 @@ export interface AssistantMessage {
   degraded: boolean;
   /** 助手的推理过程（思维链）；null = 这次回答没有推理内容。 */
   reasoning: string | null;
+  /** 这条回复携带的草稿提案（通常为空列表）。 */
+  drafts: AssistantDraft[];
   created_at: string;
 }
 

@@ -12,6 +12,7 @@ import type {
   AssistantCompactResult,
   AssistantConfig,
   AssistantConfigUpdate,
+  AssistantDraft,
   AssistantMessage,
   AssistantSendResult,
   AssistantThread,
@@ -461,6 +462,18 @@ export const assistant = {
 
   updateConfig: (body: AssistantConfigUpdate) =>
     request<AssistantConfig>('/api/assistant/config', { method: 'PUT', body }),
+
+  /** 采用草稿提案：真正创建实体（流程存为草稿修订，不自动发布）。 */
+  adoptDraft: (draftId: string) =>
+    request<AssistantDraft>(`/api/assistant/drafts/${encodeURIComponent(draftId)}/adopt`, {
+      method: 'POST',
+    }),
+
+  /** 拒绝草稿提案：留痕，不产生任何实体。 */
+  rejectDraft: (draftId: string) =>
+    request<AssistantDraft>(`/api/assistant/drafts/${encodeURIComponent(draftId)}/reject`, {
+      method: 'POST',
+    }),
 };
 
 /** 供页面复用：从节点列表里取名字，用于诊断与预览的定位文案。 */
