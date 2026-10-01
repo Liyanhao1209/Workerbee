@@ -116,6 +116,13 @@ __all__ = [
     "AssistantCompactResponse",
     "AssistantConfigResponse",
     "AssistantConfigUpdateRequest",
+    "CaptureRunCreateRequest",
+    "CaptureRunResponse",
+    "CaptureRunListResponse",
+    "CaptureMaterialSummary",
+    "CaptureRunDetailResponse",
+    "CaptureDraftResponse",
+    "CaptureDraftAdoptRequest",
     # 领域模型的再导出：前端契约与领域字段集保持一致
     "Approval",
     "Attempt",
@@ -1016,6 +1023,92 @@ class AssistantConfigUpdateRequest(ApiRequest):
     window_rounds: int | None = Field(default=None, ge=1, le=100)
     window_chars: int | None = Field(default=None, ge=500, le=200000)
     snapshot_budget: int | None = Field(default=None, ge=500, le=100000)
+
+
+# ===========================================================================
+# 流程捕获（Graph Capture，WF-03）
+# ===========================================================================
+
+
+class CaptureRunCreateRequest(ApiRequest):
+    """新建捕获任务：写任务说明、选一个基础候选。系统会**真实执行**一次。"""
+
+    name: str
+    instructions: str
+    """任务说明——就是发给基础模型去执行的那段话。"""
+    harness_ref: str
+    model_name: str | None = None
+    """留空表示用 harness 的默认模型（与节点候选同一口径）。"""
+    credential_ref: str | None = None
+
+
+class CaptureRunResponse(ApiResponse):
+    """一次捕获任务的台账。执行状态的事实源是任务表，``status`` 是它的收敛。"""
+
+    run_id: str
+    name: str
+    workflow_id: str
+    """捕获专用的临时单节点 Workflow。它不进默认流程列表。"""
+    task_id: str | None = None
+    """真实执行的任务 id；发射失败时为 None。"""
+    profile: dict[str, Any] = Field(default_factory=dict)
+    """基础候选快照（harness/模型/凭据引用 + 任务说明）。"""
+    status: str = "running"
+    """running / completed / failed。"""
+    created_at: str
+    updated_at: str
+
+
+class CaptureRunListResponse(ApiResponse):
+    runs: list[CaptureRunResponse] = Field(default_factory=list)
+    returned: int = 0
+
+
+class CaptureMaterialSummary(ApiResponse):
+    """材料汇编的概览。「被裁过」必须可见——trimmed 非空说明材料不是全貌。"""
+
+    tool_calls: int = 0
+    artifacts: int = 0
+    has_plan: bool = False
+    """模型是否在输出里显式写了执行计划。False 时草案的划分几乎全是推断。"""
+    chars: int = 0
+    trimmed: list[str] = Field(default_factory=list)
+
+
+class CaptureDraftResponse(ApiResponse):
+    """一份捕获草案（capture_draft 表）。
+
+    ``payload`` 是提案原文，节点/连线带 ``basis``（observed/inferred）与
+    ``evidence`` 标注；``validation`` 含校验结论、「待配置」项与服务端
+    复核的降级记录（``downgrades``）。
+    """
+
+    draft_id: str
+    run_id: str
+    name: str = ""
+    description: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    validation: dict[str, Any] = Field(default_factory=dict)
+    status: str = "pending"
+    """pending / adopted / rejected（单向流转）。"""
+    adopted_ref: str | None = None
+    """采用产物的 id：workflow_id 或 template_id。"""
+    created_at: str
+    updated_at: str
+
+
+class CaptureRunDetailResponse(ApiResponse):
+    run: CaptureRunResponse
+    task_state: str | None = None
+    """任务的可观测状态（queued/running/succeeded/...）。没发射成功时为 None。"""
+    material: CaptureMaterialSummary | None = None
+    drafts: list[CaptureDraftResponse] = Field(default_factory=list)
+
+
+class CaptureDraftAdoptRequest(ApiRequest):
+    """采用草案。``as_template=True`` 时存为模板而不是建流程。"""
+
+    as_template: bool = False
 
 
 StorageReportResponse.model_rebuild()

@@ -6,10 +6,10 @@
 
 from __future__ import annotations
 
-from . import approvals, assistant, nodes, registry, system, tasks, templates, workflows
+from . import approvals, assistant, capture, nodes, registry, system, tasks, templates, workflows
 
 __all__ = [
-    "ROUTERS", "approvals", "assistant", "nodes", "registry", "system",
+    "ROUTERS", "approvals", "assistant", "capture", "nodes", "registry", "system",
     "tasks", "templates", "workflows",
 ]
 
@@ -23,4 +23,5 @@ ROUTERS = [
     templates.router,
     approvals.router,
     assistant.router,
+    capture.router,
 ]

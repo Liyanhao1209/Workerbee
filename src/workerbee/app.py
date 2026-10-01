@@ -20,6 +20,7 @@ from pydantic import Field
 from .executables import resolve as resolve_executable
 from .core.domain.base import DomainModel
 from .core.domain.registry import HarnessRegistration
+from .core.domain.workflow import RevisionSource, WorkflowDefinition, WorkflowStatus
 from .core.resources.ledger import ResourceLedger
 from .core.resources.reaper import Reaper, ReaperConfig
 from .core.runtime import lifecycle as lc
@@ -155,6 +156,7 @@ class Engine:
         self.reaper: Reaper | None = None
         self.harness: Any | None = None
         self.assistant: Any | None = None
+        self.capture: Any | None = None
 
         self._secret_store: Any = None
         self._redactor: Any = None
@@ -602,6 +604,17 @@ class Engine:
             redactor=self._redactor,
         )
 
+        # 流程捕获（WF-03）。系统写入口（建临时 Workflow、发射任务）以钩子协议
+        # 注入既有实现——capture/ 不 import server 层，与 assistant 同一纪律。
+        from .capture import CaptureService as CaptureCore
+
+        self.capture = CaptureCore(
+            store=self.store,
+            hooks=_EngineCaptureHooks(self),
+            secret_resolver=lambda: self._secret_store,
+            redactor=self._redactor,
+        )
+
     async def _build_llm(self) -> Any | None:
         from .data.llm import LLMRouter
 
@@ -818,6 +831,9 @@ class Engine:
         if self.assistant is not None:
             with contextlib.suppress(Exception):
                 await self.assistant.aclose()
+        if self.capture is not None:
+            with contextlib.suppress(Exception):
+                await self.capture.aclose()
         with contextlib.suppress(Exception):
             await self.store.events.append(
                 scope=_scope("system"),
@@ -1484,3 +1500,52 @@ class _UnavailableHarness:
         from .adapters.sdk.protocol import AdapterError, ErrorCode
 
         raise AdapterError(ErrorCode.NOT_SUPPORTED, "适配层不可用")
+
+
+class _EngineCaptureHooks:
+    """把内核的既有入口适配给 capture 的 hooks 协议（capture/ 不 import server）。
+
+    三条钩子各自复用一条已有纪律：
+
+    - ``create_workflow`` 走 workflows 仓储的 ``create``，与人工建流程同一条路径；
+    - ``save_revision`` 走 ``save_revision`` 的 CAS（发布时 expected_revision_seq=0，
+      即「新建首修订」，与 server 层首次发布同一约定）；
+    - ``submit`` 直接委托 ``Engine.submit``，能力快照补齐与发射校验全部复用。
+    """
+
+    def __init__(self, engine: "Engine") -> None:
+        self._engine = engine
+
+    async def create_workflow(self, *, name: str, description: str | None) -> str:
+        wf = WorkflowDefinition(name=name, description=description, status=WorkflowStatus.DRAFT)
+        await self._engine.store.workflows.create(wf)
+        return wf.workflow_id
+
+    async def save_revision(
+        self, *, workflow_id: str, graph: Any, publish: bool, source: Any, note: str | None
+    ) -> None:
+        from .core.domain.workflow import WorkflowRevision
+
+        store = self._engine.store
+        async with store.db.transaction():
+            seq = await store.workflows.next_revision_seq(workflow_id)
+            rev = WorkflowRevision(
+                workflow_id=workflow_id,
+                revision_seq=seq,
+                graph=graph,
+                source=source,
+                is_published=publish,
+                note=note,
+            )
+            await store.workflows.save_revision(
+                rev, publish=publish, expected_revision_seq=0 if publish else None
+            )
+
+    async def submit(
+        self, *, workflow_id: str, input_payload: dict, idempotency_key: str | None
+    ) -> dict:
+        return await self._engine.submit(
+            workflow_id=workflow_id,
+            input_payload=input_payload,
+            idempotency_key=idempotency_key,
+        )

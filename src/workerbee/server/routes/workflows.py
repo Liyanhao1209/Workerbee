@@ -19,8 +19,12 @@ ToggleResult = Union[S.TogglePreviewResponse, S.NodeToggleResponse]
 async def list_workflows(
     services: ServicesDep,
     include_deleted: bool = False,
+    include_capture: bool = False,
 ) -> S.WorkflowListResponse:
-    return await services.workflows.list_workflows(include_deleted=include_deleted)
+    """捕获专用的临时 Workflow 默认不出现在列表里；``include_capture=true`` 可见。"""
+    return await services.workflows.list_workflows(
+        include_deleted=include_deleted, include_capture=include_capture
+    )
 
 
 @router.post("/api/workflows", response_model=S.WorkflowResponse, summary="新建流程")

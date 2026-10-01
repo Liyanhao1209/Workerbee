@@ -45,6 +45,7 @@ from ..core.domain.template import MissingBinding, Template, TemplateKind
 from ..core.graph.validate import ValidationMode, ValidationReport, validate
 from ..assistant import AssistantConfig, AssistantError
 from ..assistant.draft import DraftInvalid, DraftProposal, proposal_graph
+from ..capture import CaptureError
 from ..data.db import ConflictError
 from ..data.event_log import EventActor, EventScope, EventType
 from . import schemas as S
@@ -496,8 +497,15 @@ class SystemService(_Service):
 class WorkflowService(_Service):
     """定义层用例。发明确不在内核，故在此实现；修订的不可变性由仓储保证。"""
 
-    async def list_workflows(self, *, include_deleted: bool = False) -> S.WorkflowListResponse:
+    async def list_workflows(
+        self, *, include_deleted: bool = False, include_capture: bool = False
+    ) -> S.WorkflowListResponse:
         items = await self.store.workflows.list(include_deleted=include_deleted)
+        if not include_capture:
+            # 捕获专用 Workflow 是为跑捕获任务建的临时定义，不进默认列表；
+            # 关联关系在 capture_run 表，不给 workflow 加列。
+            capture_ids = await self.store.capture.capture_workflow_ids()
+            items = [w for w in items if w.workflow_id not in capture_ids]
         return S.WorkflowListResponse(
             workflows=[_workflow_out(w) for w in items], returned=len(items)
         )
@@ -1670,6 +1678,197 @@ class AssistantService(_Service):
 
 
 # ===========================================================================
+# 流程捕获（Graph Capture）
+# ===========================================================================
+
+
+class CaptureService(_Service):
+    """流程捕获的网关门面。核心编排在 ``engine.capture``（capture/service.py），
+    本层只做参数校验、错误翻译与采用/拒绝（系统写，纪律同助手提案）。"""
+
+    def _core(self) -> Any:
+        svc = getattr(self.engine, "capture", None)
+        if svc is None:
+            raise BadRequest("捕获服务未装配，本轮内核不支持流程捕获")
+        return svc
+
+    # ---- 捕获任务 ----
+
+    async def create_run(self, req: S.CaptureRunCreateRequest) -> S.CaptureRunResponse:
+        name = req.name.strip()
+        if not name:
+            raise BadRequest("给这次捕获起个名字。")
+        instructions = req.instructions.strip()
+        if not instructions:
+            raise BadRequest("任务说明不能为空——捕获就是拿这段话真实执行一次。")
+        try:
+            run = await self._core().create_run(
+                name=name,
+                instructions=instructions,
+                harness_ref=req.harness_ref,
+                model_name=req.model_name,
+                credential_ref=req.credential_ref,
+            )
+        except CaptureError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.CaptureRunResponse.model_validate(run)
+
+    async def list_runs(self) -> S.CaptureRunListResponse:
+        runs = await self._core().list_runs()
+        return S.CaptureRunListResponse(
+            runs=[S.CaptureRunResponse.model_validate(r) for r in runs],
+            returned=len(runs),
+        )
+
+    async def get_run(self, run_id: str) -> S.CaptureRunDetailResponse:
+        try:
+            detail = await self._core().run_detail(run_id)
+        except KeyError:
+            raise NotFound(f"捕获记录不存在: {run_id}") from None
+        return S.CaptureRunDetailResponse(
+            run=S.CaptureRunResponse.model_validate(detail["run"]),
+            task_state=detail["task_state"],
+            material=S.CaptureMaterialSummary.model_validate(detail["material"])
+            if detail["material"] is not None
+            else None,
+            drafts=[_capture_draft_out(d) for d in detail["drafts"]],
+        )
+
+    # ---- 草案合成（显式触发的一次模型调用） ----
+
+    async def generate_draft(self, run_id: str) -> S.CaptureDraftResponse:
+        try:
+            draft = await self._core().generate_draft(run_id)
+        except KeyError:
+            raise NotFound(f"捕获记录不存在: {run_id}") from None
+        except CaptureError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return _capture_draft_out(draft)
+
+    async def get_draft(self, draft_id: str) -> S.CaptureDraftResponse:
+        return _capture_draft_out(await self._require_capture_draft(draft_id))
+
+    async def _require_capture_draft(self, draft_id: str) -> dict[str, Any]:
+        draft = await self.store.capture.get_draft(draft_id)
+        if draft is None:
+            raise NotFound("这份捕获草案不存在")
+        return draft
+
+    # ---- 采用 / 拒绝（系统写，与助手提案同一纪律） ----
+
+    async def adopt_draft(
+        self, draft_id: str, req: S.CaptureDraftAdoptRequest | None
+    ) -> S.CaptureDraftResponse:
+        """采用草案：真正创建实体。
+
+        走与手动建图**完全相同**的服务层入口（create_workflow + save_revision /
+        create_template），且 ``publish`` 恒为 False——采用只存为草稿修订，
+        发布留给用户在编辑器里做。采用前按**此刻**的 registry 重新校验一次
+        （草案落库后注册表可能已经变了），结论回写进 draft 的 validation。
+        """
+        req = req or S.CaptureDraftAdoptRequest()
+        draft = await self._require_capture_draft(draft_id)
+        if draft["status"] == "adopted":
+            raise BadRequest("这份草案已经采用过了，不能重复采用")
+        if draft["status"] != "pending":
+            raise BadRequest("这份草案已被拒绝，不能再采用；想要的话重新生成一份")
+
+        try:
+            proposal = DraftProposal.model_validate(draft["payload"])
+        except ValueError as exc:
+            raise BadRequest(f"草案内容已损坏，无法采用：{exc}") from exc
+        try:
+            graph = proposal_graph(proposal)
+        except DraftInvalid as exc:
+            raise BadRequest(f"草案无法采用：{exc}") from exc
+
+        registry = await self.store.registry.snapshot()
+        report = validate(graph, registry, mode=ValidationMode.DRAFT)
+        stored = draft["validation"] or {}
+        validation = {
+            "ok": report.ok(),
+            "summary": report.summary(),
+            "error": None,
+            "diagnostics": [d.model_dump(mode="json") for d in report.diagnostics],
+            "pending_config": stored.get("pending_config") or [],
+            "downgrades": stored.get("downgrades") or [],
+        }
+
+        if req.as_template:
+            # 「存为模板」走现有模板创建入口；模板载荷结构性装不下密钥本体。
+            template = await TemplateService(self.engine).create_template(
+                S.TemplateCreateRequest(
+                    name=proposal.name,
+                    description=proposal.description,
+                    kind=TemplateKind.WORKFLOW,
+                    payload=Template.from_nodes(
+                        graph.nodes,
+                        graph.edges,
+                        name=proposal.name,
+                        kind=TemplateKind.WORKFLOW,
+                        description=proposal.description,
+                    ).payload,
+                )
+            )
+            adopted_ref = template.template_id
+        else:
+            workflows = WorkflowService(self.engine)
+            wf = await workflows.create_workflow(
+                S.WorkflowCreateRequest(name=proposal.name, description=proposal.description)
+            )
+            await workflows.save_revision(
+                wf.workflow_id,
+                S.RevisionSaveRequest(
+                    graph=graph,
+                    publish=False,
+                    source=RevisionSource.GRAPH_CAPTURE,
+                    note="由流程捕获合成的草案；采用后存为草稿修订，发布请到流程编辑器里做",
+                ),
+            )
+            adopted_ref = wf.workflow_id
+
+        # CAS 迁移状态：并发/重复点击只有一个生效，不产生第二份采用产物。
+        ok = await self.store.capture.decide_draft(
+            draft_id, to_status="adopted", adopted_ref=adopted_ref, validation=validation
+        )
+        if not ok:
+            raise BadRequest(
+                "这份草案刚刚已被处理（可能是重复点击）；请刷新后核对结果，"
+                "注意检查是否多出了流程或模板"
+            )
+        await self._event(
+            EventType.CAPTURE_DRAFT_ADOPTED,
+            scope=EventScope.CAPTURE,
+            scope_id=draft["run_id"],
+            payload={
+                "draft_id": draft_id,
+                "adopted_ref": adopted_ref,
+                "as_template": req.as_template,
+                "validation_summary": validation["summary"],
+            },
+        )
+        return _capture_draft_out(await self._require_capture_draft(draft_id))
+
+    async def reject_draft(self, draft_id: str) -> S.CaptureDraftResponse:
+        """拒绝草案：不产生任何实体，但拒绝本身留痕（与采用同一条纪律）。"""
+        draft = await self._require_capture_draft(draft_id)
+        if draft["status"] == "rejected":
+            raise BadRequest("这份草案已经拒绝过了")
+        if draft["status"] != "pending":
+            raise BadRequest("这份草案已被采用，不能再拒绝")
+        ok = await self.store.capture.decide_draft(draft_id, to_status="rejected")
+        if not ok:
+            raise BadRequest("这份草案刚刚已被处理（可能是重复点击）；请刷新后再看")
+        await self._event(
+            EventType.CAPTURE_DRAFT_REJECTED,
+            scope=EventScope.CAPTURE,
+            scope_id=draft["run_id"],
+            payload={"draft_id": draft_id},
+        )
+        return _capture_draft_out(await self._require_capture_draft(draft_id))
+
+
+# ===========================================================================
 # 容器
 # ===========================================================================
 
@@ -1687,6 +1886,7 @@ class Services:
         self.templates = TemplateService(engine)
         self.approvals = ApprovalService(engine)
         self.assistant = AssistantService(engine)
+        self.capture = CaptureService(engine)
 
 
 # ===========================================================================
@@ -1744,6 +1944,16 @@ def _session_record(row: Any) -> S.SessionRecord:
         state=str(pick("state") or "unknown"),
         created_at=pick("created_at"),
         last_heartbeat=pick("last_heartbeat"),
+    )
+
+
+def _capture_draft_out(row: dict[str, Any]) -> S.CaptureDraftResponse:
+    """捕获草案行 → 响应。name/description 是提案内容的顶层字段，提取出来让前端少拆一层。"""
+    payload = row.get("payload") or {}
+    return S.CaptureDraftResponse(
+        **row,
+        name=str(payload.get("name") or ""),
+        description=payload.get("description"),
     )
 
 

@@ -15,19 +15,39 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Protocol
+import json
+from typing import Any, Callable, Protocol
 
+from ..assistant.draft import (
+    DraftInvalid,
+    DraftProposal,
+    collect_pending,
+    extract_proposal,
+    proposal_graph,
+)
+from ..assistant.service import (
+    AssistantConfig,
+    BackendFactory,
+    _default_backend_factory,
+    load_config,
+)
 from ..core.domain.base import new_id
 from ..core.domain.node import ExecutionProfile, NodeDefinition
 from ..core.domain.task import TaskState
 from ..core.domain.workflow import GraphSpec, RevisionSource
+from ..core.graph.validate import ValidationMode, validate
 from ..data.event_log import EventActor, EventScope, EventType
+from ..data.llm.backend import LLMError, LLMMessage
+from ..data.llm.router import LLMRouter
 from ..data.store import Store
 from .material import CaptureMaterial, assemble_material
+from .synthesis import SYSTEM_PROMPT, build_synthesis_prompt, review_basis
 
 __all__ = [
     "CaptureService",
     "CaptureError",
+    "CaptureNotConfigured",
+    "CaptureLocked",
     "CaptureRunHooks",
     "CAPTURE_NAME_PREFIX",
     "PLAN_GUIDANCE",
@@ -52,6 +72,14 @@ class CaptureError(RuntimeError):
         super().__init__(detail)
         self.detail = detail
         self.hint = hint
+
+
+class CaptureNotConfigured(CaptureError):
+    """合成用的模型没配置。捕获合成复用助手配置（不另开一套凭据）。"""
+
+
+class CaptureLocked(CaptureError):
+    """凭据库未解锁，读不到合成模型的密钥。"""
 
 
 class CaptureRunHooks(Protocol):
@@ -89,21 +117,38 @@ class CaptureRunHooks(Protocol):
 _FAILED_TASK_STATES = {TaskState.FAILED, TaskState.CANCELLED, TaskState.BLOCKED}
 
 
+#: 合成的单次调用超时（秒）。这是一次显式触发的同步调用，不能无限挂住。
+SYNTHESIS_TIMEOUT_S = 120.0
+
+
 class CaptureService:
-    """捕获用例的编排核心。"""
+    """捕获用例的编排核心。
+
+    ``secret_resolver`` 是「取当前凭据库」的回调而不是凭据库本身
+    （解锁发生在引擎生命周期中段，与助手同一条纪律）。
+    ``backend_factory`` 测试注入假后端；生产默认走 assistant 的装配
+    （按 assistant_config 的 api_protocol 选 openai_compat / anthropic）。
+    """
 
     def __init__(
         self,
         *,
         store: Store,
         hooks: CaptureRunHooks,
+        secret_resolver: Callable[[], Any] | None = None,
         redactor: Callable[[Any], Any] | None = None,
+        backend_factory: BackendFactory | None = None,
         material_budget: int = 12_000,
+        call_timeout: float = SYNTHESIS_TIMEOUT_S,
     ) -> None:
         self.store = store
         self.hooks = hooks
+        self._secret_resolver = secret_resolver or (lambda: None)
         self.redactor = redactor
+        self.backend_factory = backend_factory
         self.material_budget = material_budget
+        self.call_timeout = call_timeout
+        self._router_cache: tuple[str, LLMRouter] | None = None
 
     # ------------------------------------------------------------------
     # 捕获任务
@@ -268,6 +313,226 @@ class CaptureService:
             budget_chars=self.material_budget,
             redactor=self.redactor,
         )
+
+    # ------------------------------------------------------------------
+    # 草案合成（显式触发的一次模型调用）
+    # ------------------------------------------------------------------
+
+    async def generate_draft(self, run_id: str) -> dict[str, Any]:
+        """从捕获材料合成流程草案并落库。
+
+        前置条件如实检查：run 存在、任务已跑完（终态）。失败一律抛
+        :class:`CaptureError`（可重试），不产生半截草案。
+        """
+        run = await self.get_run(run_id)
+        if not run["task_id"]:
+            raise CaptureError("这次捕获的任务没有跑起来，没有材料可以合成")
+        task = await self.store.tasks.get_task(run["task_id"])
+        if task is None:
+            raise CaptureError("捕获任务对应的执行记录不存在")
+        if task.observed_state not in (
+            TaskState.SUCCEEDED,
+            TaskState.FAILED,
+            TaskState.CANCELLED,
+            TaskState.BLOCKED,
+        ):
+            raise CaptureError(
+                "任务还在跑，跑完才能生成流程草案",
+                hint="到任务详情页看实时进展；结束后再来点「生成流程草案」",
+            )
+
+        material = await self.assemble(run["task_id"])
+        router, _config = await self._require_backend()
+
+        registry_store = self.store.registry
+        harnesses = await registry_store.list_harnesses()
+        credentials = await registry_store.list_credentials()
+        skills = await registry_store.list_skills()
+        tools = await registry_store.list_tools()
+
+        messages = [
+            LLMMessage(role="system", content=SYSTEM_PROMPT),
+            LLMMessage(
+                role="user",
+                content=build_synthesis_prompt(
+                    material,
+                    base_profile=run["profile"],
+                    harness_ids=[h.harness_id for h in harnesses],
+                    credential_ids=[c.credential_id for c in credentials],
+                    skill_ids=[s.skill_id for s in skills],
+                    tool_ids=[t.tool_id for t in tools],
+                ),
+            ),
+        ]
+        try:
+            response = await router.complete(messages, timeout=self.call_timeout)
+        except LLMError as exc:
+            raise CaptureError(
+                f"草案合成的模型调用失败：{exc}",
+                hint="模型服务可能暂时不可用；稍后再试。本次执行的结果不受影响",
+            ) from exc
+
+        reply = self._redact(response.text)
+        proposal = extract_proposal(reply)
+        if proposal is None:
+            raise CaptureError(
+                "模型没有按约定输出流程草案（没有可解析的 workerbee-draft 块）",
+                hint="再试一次；反复失败说明当前模型不适合做合成，可在助手设置里换一个",
+            )
+        if proposal.kind != "workflow":
+            raise CaptureError(
+                "草案合成只产出整条流程（workflow）的提案，模型给了别的形态",
+                hint="再试一次",
+            )
+
+        # observed 复核：evidence 不在本次材料里的标注强制降级为 inferred，
+        # 降级事实进草案说明与事件——模型不能给自己贴金（D-12）。
+        downgrades = review_basis(proposal, material.evidence_set())
+
+        pending = collect_pending(
+            proposal,
+            harness_ids=[h.harness_id for h in harnesses],
+            credential_ids=[c.credential_id for c in credentials],
+            skill_ids=[s.skill_id for s in skills],
+            tool_ids=[t.tool_id for t in tools],
+        )
+        # AC-16：与手动草稿、助手提案走同一条校验管线（draft 档）。
+        try:
+            graph = proposal_graph(proposal)
+        except DraftInvalid as exc:
+            raise CaptureError(f"模型给出的草案无法构造流程：{exc}", hint="再试一次") from exc
+        registry = await registry_store.snapshot()
+        report = validate(graph, registry, mode=ValidationMode.DRAFT)
+
+        usage = response.usage
+        validation = {
+            "ok": report.ok(),
+            "summary": report.summary(),
+            "error": None,
+            "diagnostics": [d.model_dump(mode="json") for d in report.diagnostics],
+            "pending_config": pending,
+            "downgrades": downgrades,
+        }
+        draft = await self.store.capture.create_draft(
+            draft_id=new_id(),
+            run_id=run_id,
+            payload=proposal.model_dump(mode="json"),
+            validation=validation,
+        )
+        await self.store.events.append(
+            scope=EventScope.CAPTURE,
+            type=EventType.CAPTURE_DRAFT_GENERATED,
+            actor=EventActor.AI,
+            scope_id=run_id,
+            task_id=run["task_id"],
+            payload={
+                "draft_id": draft["draft_id"],
+                "backend": response.backend,
+                "model": response.model,
+                "tokens_in": usage.input_tokens if usage else None,
+                "tokens_out": usage.output_tokens if usage else None,
+                "validation_summary": validation["summary"],
+                "downgrade_count": len(downgrades),
+                "material_chars": material.total_chars,
+                "material_trimmed": material.trimmed,
+                "material_has_plan": material.has_plan,
+            },
+        )
+        return draft
+
+    async def get_draft(self, draft_id: str) -> dict[str, Any]:
+        draft = await self.store.capture.get_draft(draft_id)
+        if draft is None:
+            raise KeyError(draft_id)
+        return draft
+
+    # ------------------------------------------------------------------
+    # 后端装配（复用助手配置，不另开一套凭据）
+    # ------------------------------------------------------------------
+
+    async def _require_backend(self) -> tuple[LLMRouter, AssistantConfig]:
+        """按助手的配置装配合成后端链。各种「不可用」都在这里明确报出，
+        文案指向助手设置——配置就是同一份，UI 要如实说明这一点。"""
+        config = await load_config(self.store.db)
+        if not config.enabled:
+            raise CaptureNotConfigured(
+                "还没有配置合成用的模型",
+                hint="捕获合成复用助手的模型配置：到助手面板的设置里打开开关并选择凭据",
+            )
+        if not config.credential_ref:
+            raise CaptureNotConfigured(
+                "还没有给助手选模型凭据",
+                hint="捕获合成复用助手的模型配置：到助手面板的设置里选一条凭据",
+            )
+        credential = await self.store.registry.get_credential(config.credential_ref)
+        if credential is None:
+            raise CaptureNotConfigured(
+                "助手配置指向的凭据已经不存在了",
+                hint="到助手面板的设置里重新选择一条凭据",
+            )
+        if credential.revoked:
+            raise CaptureNotConfigured(
+                f"助手用的凭据「{credential.label}」已被撤销",
+                hint="恢复该凭据，或到助手面板的设置里换一条",
+            )
+        if not credential.secret_locator:
+            raise CaptureNotConfigured(
+                f"凭据「{credential.label}」没有密钥内容（harness 登录态不能用于合成）",
+                hint="建一条含 Base URL 和 Key 的凭据，再到助手设置里选它",
+            )
+        if not (config.model_override or credential.default_model):
+            raise CaptureNotConfigured(
+                f"凭据「{credential.label}」没有默认模型名，不知道该用哪个模型合成",
+                hint="在助手面板的设置里填一个模型名，或给凭据补上默认模型",
+            )
+        secrets = self._secret_resolver()
+        if secrets is None:
+            raise CaptureLocked(
+                "凭据库还没有解锁，读不到合成模型的密钥",
+                hint="用带口令的方式重启内核（--passphrase 或 WORKERBEE_PASSPHRASE）后重试",
+            )
+
+        cache_key = json.dumps(
+            {
+                "ref": config.credential_ref,
+                "locator": credential.secret_locator,
+                "base_url": credential.base_url,
+                "model": config.model_override or credential.default_model,
+                "api_protocol": config.api_protocol,
+                "factory": id(self.backend_factory),
+            },
+            sort_keys=True,
+        )
+        if self._router_cache is not None and self._router_cache[0] == cache_key:
+            return self._router_cache[1], config
+
+        await self.aclose()
+        factory = self.backend_factory or _default_backend_factory
+        backend = factory(config, credential, secrets)
+        router = (
+            backend if isinstance(backend, LLMRouter) else LLMRouter([backend], name="capture")
+        )
+        self._router_cache = (cache_key, router)
+        return router, config
+
+    async def aclose(self) -> None:
+        """收束缓存的后端（关闭其持有的 HTTP 连接）。引擎 stop 时调用。"""
+        if self._router_cache is not None:
+            _key, router = self._router_cache
+            for backend in getattr(router, "_backends", []):
+                close = getattr(backend, "aclose", None)
+                if close is not None:
+                    await close()
+            self._router_cache = None
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+
+    def _redact(self, value: Any) -> Any:
+        if self.redactor is None or value is None:
+            return value
+        return self.redactor(value)
 
     # ------------------------------------------------------------------
     # 内部

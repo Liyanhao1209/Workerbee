@@ -13,12 +13,22 @@
 """
 
 from .material import CaptureMaterial, assemble_material
-from .service import CAPTURE_NAME_PREFIX, CaptureError, CaptureService
+from .service import (
+    CAPTURE_NAME_PREFIX,
+    CaptureError,
+    CaptureLocked,
+    CaptureNotConfigured,
+    CaptureService,
+)
+from .synthesis import review_basis
 
 __all__ = [
     "CaptureService",
     "CaptureError",
+    "CaptureNotConfigured",
+    "CaptureLocked",
     "CaptureMaterial",
     "assemble_material",
+    "review_basis",
     "CAPTURE_NAME_PREFIX",
 ]
