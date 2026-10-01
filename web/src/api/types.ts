@@ -1118,6 +1118,98 @@ export interface AssistantConfigUpdate {
 }
 
 // ===========================================================================
+// 流程捕获（Graph Capture）—— 字段与 schemas.py 的 Capture* 模型逐字对齐
+// ===========================================================================
+
+/** 一次捕获任务的台账。status 是任务真实状态的收敛：running / completed / failed。 */
+export interface CaptureRun {
+  run_id: string;
+  name: string;
+  /** 捕获专用的临时单节点流程。它不进默认流程列表。 */
+  workflow_id: string;
+  /** 真实执行的任务 id；发射失败时为 null。 */
+  task_id: string | null;
+  /** 基础候选快照（harness/模型/凭据引用 + 任务说明）。 */
+  profile: Record<string, unknown>;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 材料汇编的概览。trimmed 非空说明材料被裁剪过、不是全貌——必须可见。 */
+export interface CaptureMaterialSummary {
+  tool_calls: number;
+  artifacts: number;
+  /** 模型是否在输出里显式写了执行计划。false 时草案的划分几乎全是推断。 */
+  has_plan: boolean;
+  chars: number;
+  trimmed: string[];
+}
+
+/** 草案里的一个节点。basis：observed 有真实执行记录佐证；inferred 是模型补的。 */
+export interface CaptureDraftNode {
+  node_id: string | null;
+  name: string;
+  role: string | null;
+  system_prompt: string | null;
+  profiles: {
+    harness_ref: string | null;
+    model_name: string | null;
+    credential_ref: string | null;
+    reasoning_effort: string | null;
+  }[];
+  skill_refs: string[];
+  tool_refs: string[];
+  required_inputs: string[];
+  basis: 'observed' | 'inferred' | null;
+  /** 佐证材料里的引用（E<event_id> / A<artifact_id>）。 */
+  evidence: string[];
+}
+
+export interface CaptureDraftEdge {
+  from_node: string;
+  to_node: string;
+  output_contract: string[];
+  basis: 'observed' | 'inferred' | null;
+  evidence: string[];
+}
+
+export interface CaptureDraftValidation extends AssistantDraftValidation {
+  /** 复核降级记录：模型标了「观察到的」但佐证对不上材料，被系统强制降级为「推断的」。 */
+  downgrades: { target: string; reason: string }[];
+}
+
+export interface CaptureDraft {
+  draft_id: string;
+  run_id: string;
+  name: string;
+  description: string | null;
+  /** 提案原文（节点与连线清单，含 basis/evidence 溯源标注）。 */
+  payload: {
+    kind?: string;
+    nodes?: CaptureDraftNode[];
+    edges?: CaptureDraftEdge[];
+    notes?: string[];
+  } & Record<string, unknown>;
+  validation: CaptureDraftValidation;
+  /** pending / adopted / rejected（单向流转）。 */
+  status: string;
+  /** 采用产物的 id：存为流程时是 workflow_id，存为模板时是 template_id。 */
+  adopted_ref: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 捕获记录详情（GET /api/capture/runs/{id}）。 */
+export interface CaptureRunDetail {
+  run: CaptureRun;
+  /** 任务的可观测状态（queued/running/succeeded/…）。没发射成功时为 null。 */
+  task_state: TaskState | null;
+  material: CaptureMaterialSummary | null;
+  drafts: CaptureDraft[];
+}
+
+// ===========================================================================
 // WebSocket 推送
 // ===========================================================================
 

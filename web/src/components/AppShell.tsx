@@ -21,6 +21,7 @@ import { Banner } from './common';
 
 const NAV = [
   { to: '/workflows', label: '流程' },
+  { to: '/captures', label: '捕获' },
   { to: '/tasks', label: '任务' },
   { to: '/execution', label: '执行图' },
   { to: '/sessions', label: '会话' },

@@ -17,6 +17,9 @@ import type {
   AssistantSendResult,
   AssistantThread,
   AttentionResponse,
+  CaptureDraft,
+  CaptureRun,
+  CaptureRunDetail,
   CredentialKind,
   CredentialRef,
   DeleteTaskResponse,
@@ -476,9 +479,49 @@ export const assistant = {
     }),
 };
 
+// ---------------------------------------------------------------------------
+// 流程捕获（Graph Capture）
+// ---------------------------------------------------------------------------
+
+export const capture = {
+  /** 新建捕获任务：选基础候选，系统会**真实执行**一次任务说明。 */
+  createRun: (body: {
+    name: string;
+    instructions: string;
+    harness_ref: string;
+    model_name?: string | null;
+    credential_ref?: string | null;
+  }) => request<CaptureRun>('/api/capture/runs', { method: 'POST', body }),
+
+  listRuns: () => request<{ runs: CaptureRun[]; returned: number }>('/api/capture/runs'),
+
+  /** 捕获记录详情：任务状态 + 材料汇编摘要 + 已生成的草案。 */
+  getRun: (runId: string) =>
+    request<CaptureRunDetail>(`/api/capture/runs/${encodeURIComponent(runId)}`),
+
+  /** 生成流程草案：显式触发的一次模型调用（复用助手配置）；任务没跑完返回 400。 */
+  generateDraft: (runId: string) =>
+    request<CaptureDraft>(`/api/capture/runs/${encodeURIComponent(runId)}/drafts`, { method: 'POST' }),
+
+  getDraft: (draftId: string) =>
+    request<CaptureDraft>(`/api/capture/drafts/${encodeURIComponent(draftId)}`),
+
+  /** 采用草案：as_template=false 存为流程草稿修订（不自动发布）；true 存为模板。 */
+  adoptDraft: (draftId: string, body: { as_template: boolean }) =>
+    request<CaptureDraft>(`/api/capture/drafts/${encodeURIComponent(draftId)}/adopt`, {
+      method: 'POST',
+      body,
+    }),
+
+  /** 拒绝草案：留痕，不产生任何实体。 */
+  rejectDraft: (draftId: string) =>
+    request<CaptureDraft>(`/api/capture/drafts/${encodeURIComponent(draftId)}/reject`, {
+      method: 'POST',
+    }),
+};
+
 /** 供页面复用：从节点列表里取名字，用于诊断与预览的定位文案。 */
-export function nodeLabel(nodes: NodeDefinition[], nodeId: string | null | undefined): string {
-  if (!nodeId) return '（未知节点）';
+export function nodeLabel(nodes: NodeDefinition[], nodeId: string | null | undefined): string {  if (!nodeId) return '（未知节点）';
   const node = nodes.find((n) => n.node_id === nodeId);
   return node ? node.name : `节点 ${nodeId.slice(0, 8)}`;
 }
