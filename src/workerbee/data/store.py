@@ -57,6 +57,7 @@ __all__ = [
     "ResourceRepository",
     "ApprovalRepository",
     "AssistantRepository",
+    "CaptureRepository",
 ]
 
 
@@ -1646,6 +1647,184 @@ class AssistantRepository:
 
 
 # ===========================================================================
+# 流程捕获（Graph Capture，迁移 10）
+# ===========================================================================
+
+
+class CaptureRepository:
+    """捕获任务与捕获草案。与 AssistantRepository 一样返回普通字典——
+    它们没有对应的领域实体，字段集就是表结构本身。
+
+    状态机：
+    - run：``running``（任务在途）→ ``completed`` / ``failed``，由服务层在读取时
+      按任务真实状态收敛（任务表才是执行状态的事实源，本表只是台账）。
+    - draft：``pending`` → ``adopted`` | ``rejected`` 单向流转，CAS 防重复决定。
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    # ---- run ----
+
+    async def create_run(
+        self,
+        *,
+        run_id: str,
+        name: str,
+        workflow_id: str,
+        task_id: str | None,
+        profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utcnow().isoformat()
+        await self.db.execute(
+            """INSERT INTO capture_run(run_id, name, workflow_id, task_id, profile,
+                   status, created_at, updated_at)
+               VALUES (?,?,?,?,?, 'running', ?,?)""",
+            (run_id, name, workflow_id, task_id, dumps(profile), now, now),
+        )
+        return {
+            "run_id": run_id,
+            "name": name,
+            "workflow_id": workflow_id,
+            "task_id": task_id,
+            "profile": profile,
+            "status": "running",
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+        row = await self.db.fetch_one(
+            "SELECT * FROM capture_run WHERE run_id=?", (run_id,)
+        )
+        return self._to_run(row) if row else None
+
+    async def list_runs(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        rows = await self.db.fetch_all(
+            "SELECT * FROM capture_run ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        return [self._to_run(r) for r in rows]
+
+    async def update_run_status(self, run_id: str, status: str) -> bool:
+        """收敛 run 状态。只允许单向推进：running → completed|failed。"""
+        assert status in ("completed", "failed")
+        return (
+            await self.db.execute_rowcount(
+                """UPDATE capture_run SET status=?, updated_at=?
+                   WHERE run_id=? AND status='running'""",
+                (status, utcnow().isoformat(), run_id),
+            )
+            > 0
+        )
+
+    async def capture_workflow_ids(self) -> set[str]:
+        """全部捕获专用 Workflow 的 id。流程列表默认据此把它们藏起来——
+        它们是为跑捕获任务而建的临时定义，不是用户要管理的流程。"""
+        rows = await self.db.fetch_all("SELECT DISTINCT workflow_id FROM capture_run")
+        return {r["workflow_id"] for r in rows}
+
+    # ---- draft ----
+
+    async def create_draft(
+        self,
+        *,
+        draft_id: str,
+        run_id: str,
+        payload: dict[str, Any],
+        validation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """落一份捕获草案。状态恒为 pending：采用/拒绝是之后用户的显式决定。"""
+        now = utcnow().isoformat()
+        await self.db.execute(
+            """INSERT INTO capture_draft(draft_id, run_id, payload, validation,
+                   status, adopted_ref, created_at, updated_at)
+               VALUES (?,?,?,?, 'pending', NULL, ?,?)""",
+            (draft_id, run_id, dumps(payload), dumps(validation), now, now),
+        )
+        return {
+            "draft_id": draft_id,
+            "run_id": run_id,
+            "payload": payload,
+            "validation": validation,
+            "status": "pending",
+            "adopted_ref": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+        row = await self.db.fetch_one(
+            "SELECT * FROM capture_draft WHERE draft_id=?", (draft_id,)
+        )
+        return self._to_draft(row) if row else None
+
+    async def list_drafts_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        rows = await self.db.fetch_all(
+            "SELECT * FROM capture_draft WHERE run_id=? ORDER BY created_at, rowid",
+            (run_id,),
+        )
+        return [self._to_draft(r) for r in rows]
+
+    async def decide_draft(
+        self,
+        draft_id: str,
+        *,
+        to_status: str,
+        adopted_ref: str | None = None,
+        validation: dict[str, Any] | None = None,
+    ) -> bool:
+        """采用/拒绝的 CAS：只允许 pending → adopted|rejected。
+
+        并发或重复点击时只有一个请求能迁移状态；失败方拿到 False，
+        由服务层回 400 大白话说明（不产生第二份采用产物）。
+        """
+        assert to_status in ("adopted", "rejected")
+        return (
+            await self.db.execute_rowcount(
+                """UPDATE capture_draft
+                   SET status=?, adopted_ref=?, validation=COALESCE(?, validation), updated_at=?
+                   WHERE draft_id=? AND status='pending'""",
+                (
+                    to_status,
+                    adopted_ref,
+                    dumps(validation) if validation is not None else None,
+                    utcnow().isoformat(),
+                    draft_id,
+                ),
+            )
+            > 0
+        )
+
+    # ---- mappers ----
+
+    @staticmethod
+    def _to_run(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "run_id": row["run_id"],
+            "name": row["name"],
+            "workflow_id": row["workflow_id"],
+            "task_id": row["task_id"],
+            "profile": loads(row["profile"], {}),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _to_draft(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "draft_id": row["draft_id"],
+            "run_id": row["run_id"],
+            "payload": loads(row["payload"], {}),
+            "validation": loads(row["validation"], {}),
+            "status": row["status"],
+            "adopted_ref": row["adopted_ref"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+
+# ===========================================================================
 # 可更新字段白名单与编码
 # ===========================================================================
 
@@ -1739,6 +1918,7 @@ class Store:
         self.resources = ResourceRepository(db)
         self.approvals = ApprovalRepository(db)
         self.assistant = AssistantRepository(db)
+        self.capture = CaptureRepository(db)
         self.events = EventLog(db)
         self.artifacts = ArtifactStore(db)
         self.messages = MessageBus(db)

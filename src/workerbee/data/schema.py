@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -488,6 +488,46 @@ CREATE TABLE IF NOT EXISTS assistant_draft (
 CREATE INDEX IF NOT EXISTS idx_assistant_draft_thread
     ON assistant_draft(thread_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_assistant_draft_message ON assistant_draft(message_id);
+""",
+    ),
+    (
+        10,
+        """
+-- 流程捕获（Graph Capture，WF-03、D-12、AC-16）。
+--
+-- capture_run：一次捕获任务的台账。执行本身搭既有内核的便车——
+-- 系统建一个单节点临时 Workflow（workflow_id 指向它）并正常发射（task_id），
+-- 本表只记「这次执行是为了捕获」这层关联与基础候选快照。
+-- 捕获专用流程不进默认流程列表：列表过滤靠本表的 workflow_id 关联，
+-- 不给 workflow 表加列。
+CREATE TABLE IF NOT EXISTS capture_run (
+    run_id      TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    task_id     TEXT,
+    profile     TEXT NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'running',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_capture_run_workflow ON capture_run(workflow_id);
+
+-- capture_draft：由捕获材料合成的流程草案。payload 是 workerbee-draft 提案原文
+-- （节点/连线带 basis=observed|inferred 与 evidence 标注）；validation 是落库
+-- 时刻的校验结论（含复核降级记录）。采用/拒绝是用户的显式决定，状态机
+-- pending→adopted|rejected 单向流转，CAS 在仓储层（与 assistant_draft 同一纪律）。
+CREATE TABLE IF NOT EXISTS capture_draft (
+    draft_id    TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    payload     TEXT NOT NULL DEFAULT '{}',
+    validation  TEXT NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    adopted_ref TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES capture_run(run_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_capture_draft_run ON capture_draft(run_id, created_at);
 """,
     ),
 ]

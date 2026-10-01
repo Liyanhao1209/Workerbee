@@ -32,6 +32,7 @@ class EventScope(StrEnum):
     APPROVAL = "approval"
     SYSTEM = "system"
     ASSISTANT = "assistant"
+    CAPTURE = "capture"
 
 
 class EventActor(StrEnum):
@@ -119,6 +120,14 @@ class EventType(StrEnum):
     ASSISTANT_MESSAGE = "assistant.message"
     ASSISTANT_BACKEND_DEGRADED = "assistant.backend_degraded"
     ASSISTANT_COMPACTED = "assistant.compacted"
+
+    # 流程捕获（Graph Capture，WF-03）。材料汇编的裁剪与 observed→inferred
+    # 复核降级写进 CAPTURE_DRAFT_GENERATED 的 payload——这两件事必须留痕，
+    # 否则用户会把「裁掉过」「被降级过」看成「材料就长这样」。
+    CAPTURE_RUN_CREATED = "capture.run_created"
+    CAPTURE_DRAFT_GENERATED = "capture.draft_generated"
+    CAPTURE_DRAFT_ADOPTED = "capture.draft_adopted"
+    CAPTURE_DRAFT_REJECTED = "capture.draft_rejected"
 
 
 RedactorFn = Callable[[Any], Any]
