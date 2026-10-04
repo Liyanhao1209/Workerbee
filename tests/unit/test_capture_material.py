@@ -469,3 +469,75 @@ async def test_run_status_converges_from_task(store):
     # 任务成功：run 收敛为 completed
     await store.tasks.update_task("task-1", to_state=TaskState.SUCCEEDED)
     assert (await svc.get_run(run["run_id"]))["status"] == "completed"
+
+
+# ===========================================================================
+# 从既有任务补捕获（create_run_from_task）
+# ===========================================================================
+
+
+async def _finished_existing_task(store, task_id: str = "t-existing") -> None:
+    """造一个已跑完的真实任务：一阶段、一次 attempt（带候选快照）。"""
+    from tests.conftest import make_stage, make_task
+    from workerbee.core.domain.task import Attempt, TaskState
+
+    await store.tasks.create_task_with_stages(
+        make_task(
+            task_id=task_id, workflow_id="w-real",
+            input_payload={"task": "把日志目录里的旧文件清掉"},
+        ),
+        [make_stage(task_id=task_id)],
+    )
+    await store.tasks.create_attempt(
+        Attempt(
+            stage_id="s1", task_id=task_id, node_id="A", attempt_seq=1, profile_id="p1",
+            profile_snapshot={"harness_ref": "h-real", "model_name": "m-real",
+                              "credential_ref": "cred-real"},
+        )
+    )
+    await store.tasks.update_task(task_id, to_state=TaskState.SUCCEEDED)
+
+
+async def test_create_run_from_task_links_existing_task_without_launching(store):
+    """补捕获：不建 Workflow、不发射；run 直连既有任务并立刻收敛到终态。"""
+    await _finished_existing_task(store)
+    hooks = _Hooks()
+    svc = CaptureService(store=store, hooks=hooks)
+
+    run = await svc.create_run_from_task(task_id="t-existing")
+
+    # 不建流程、不发射——这是它与 create_run 的本质区别
+    assert hooks.workflows == [] and hooks.revisions == [] and hooks.submissions == []
+    assert run["origin"] == "from_task"
+    assert run["task_id"] == "t-existing"
+    assert run["workflow_id"] == "w-real", "workflow_id 是任务所属的真实流程（信息关联）"
+    # 缺省名称用任务输入的前 20 字
+    assert run["name"] == "把日志目录里的旧文件清掉"
+    # 基础候选快照来自最近一次 attempt 的 profile_snapshot
+    assert run["profile"]["harness_ref"] == "h-real"
+    assert run["profile"]["model_name"] == "m-real"
+    # 任务已终态 → run 立刻收敛，不会停在「进行中」
+    assert run["status"] == "completed"
+
+    # 留痕：CAPTURE_RUN_CREATED 带 origin 与来源任务
+    events = await store.events.tail()
+    created = [e for e in events if e["type"] == EventType.CAPTURE_RUN_CREATED.value]
+    assert len(created) == 1
+    assert created[0]["payload"]["origin"] == "from_task"
+    assert created[0]["payload"]["source_task_id"] == "t-existing"
+    assert created[0]["payload"]["harness_ref"] == "h-real"
+
+
+async def test_create_run_from_task_guards(store):
+    """任务不存在 → KeyError（404）；任务没有任何 attempt → 400 级错误。"""
+    from tests.conftest import make_task
+
+    svc = CaptureService(store=store, hooks=_Hooks())
+    with pytest.raises(KeyError):
+        await svc.create_run_from_task(task_id="ghost")
+
+    await store.tasks.create_task_with_stages(make_task(task_id="t-idle"), [])
+    with pytest.raises(CaptureError, match="没有执行记录"):
+        await svc.create_run_from_task(task_id="t-idle")
+    # 守卫失败不留台账
+    assert await store.capture.list_runs() == []

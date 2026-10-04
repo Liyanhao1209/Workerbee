@@ -129,6 +129,41 @@ def test_synthesis_prompt_carries_material_and_base_profile():
     assert "observed" in prompt and "inferred" in prompt
 
 
+def test_synthesis_prompt_distinguishes_from_task_material():
+    """既有任务（可能多阶段）的材料形态：提示词说明执行路径是草案的主要依据。"""
+    from workerbee.capture.material import CaptureMaterial
+
+    material = CaptureMaterial(task_id="t1", text="# 执行路径\n1. 扫描（完成）", total_chars=20)
+    prompt = build_synthesis_prompt(
+        material,
+        base_profile={"harness_ref": "h1", "model_name": "m1", "credential_ref": None},
+        origin="from_task",
+        harness_ids=["h1"],
+        credential_ids=[],
+        skill_ids=[],
+        tool_ids=[],
+    )
+    assert "既有任务" in prompt
+    assert "执行路径" in prompt and "主要依据" in prompt
+
+
+def test_synthesis_prompt_is_honest_when_base_profile_missing():
+    """基础候选快照缺失：如实写「未知」，不编造一个看起来像样的默认值。"""
+    from workerbee.capture.material import CaptureMaterial
+
+    prompt = build_synthesis_prompt(
+        CaptureMaterial(task_id="t1", text="材料", total_chars=2),
+        base_profile={},
+        origin="from_task",
+        harness_ids=[],
+        credential_ids=[],
+        skill_ids=[],
+        tool_ids=[],
+    )
+    assert "harness：未知" in prompt
+    assert "模型：未知" in prompt
+
+
 # ===========================================================================
 # 草案合成（端到端核心路径，不经 HTTP）
 # ===========================================================================

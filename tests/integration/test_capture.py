@@ -461,3 +461,186 @@ async def test_unknown_draft_is_404(client: Any) -> None:
     assert (await client.post("/api/capture/drafts/不存在的草案/reject")).status_code == 404
     assert (await client.get("/api/capture/drafts/不存在的草案")).status_code == 404
     assert (await client.get("/api/capture/runs/不存在的记录")).status_code == 404
+
+
+# ===========================================================================
+# 从既有任务补捕获（origin=from_task）
+# ===========================================================================
+
+
+async def _create_two_stage_workflow(client: Any) -> str:
+    """建一条真实的两阶段流程（扫描 → 汇总）并发布，返回 workflow_id。"""
+    created = await client.post("/api/workflows", json={"name": "两阶段流程"})
+    assert created.status_code == 200, created.text
+    workflow_id = created.json()["workflow_id"]
+    saved = await client.post(
+        f"/api/workflows/{workflow_id}/revisions",
+        json={
+            "graph": {
+                "nodes": [
+                    {"node_id": "scan", "name": "扫描", "role": "扫描者",
+                     "profiles": [{"harness_ref": "h-claude"}]},
+                    {"node_id": "sum", "name": "汇总", "role": "汇总者",
+                     "profiles": [{"harness_ref": "h-claude"}]},
+                ],
+                "edges": [{"from_node": "scan", "to_node": "sum"}],
+            },
+            "publish": True,
+            "note": "初版",
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    return workflow_id
+
+
+async def _run_two_stage_task(client: Any, engine: Engine, workflow_id: str) -> str:
+    """发射并手工驱动一个两阶段任务跑到 SUCCEEDED，返回 task_id。"""
+    submitted = await client.post(
+        f"/api/workflows/{workflow_id}/tasks",
+        json={"input_payload": {"task": "扫描目录并汇总结构"}},
+    )
+    assert submitted.status_code in (200, 202), submitted.text
+    task_id = submitted.json()["task_id"]
+    assert task_id
+
+    # 阶段一：扫描（计划正文 + 一次工具调用）
+    await engine.scheduler.tick()
+    rt = next(iter(engine.scheduler._runtimes.values()), None)
+    assert rt is not None, "第一阶段没有被派发，测试前提不成立"
+    await engine.scheduler.on_event(
+        session_ref=rt.session_ref, kind="output", payload={"text": PLAN_OUTPUT}
+    )
+    await engine.scheduler.on_event(
+        session_ref=rt.session_ref,
+        kind="tool_use",
+        payload={"tool_name": "Bash", "tool_use_id": "tu-1", "input": {"command": "ls"}},
+    )
+    await engine.scheduler.on_event(
+        session_ref=rt.session_ref,
+        kind="tool_result",
+        payload={"tool_use_id": "tu-1", "is_error": False},
+    )
+    await engine.scheduler.on_session_ended(session_ref=rt.session_ref, ok=True)
+    await engine.scheduler.tick()
+
+    # 阶段二：汇总
+    rt2 = next(iter(engine.scheduler._runtimes.values()), None)
+    assert rt2 is not None and rt2.session_ref != rt.session_ref, "第二阶段没有被派发"
+    await engine.scheduler.on_event(
+        session_ref=rt2.session_ref, kind="output", payload={"text": "汇总完成"}
+    )
+    await engine.scheduler.on_session_ended(session_ref=rt2.session_ref, ok=True)
+    await engine.scheduler.tick()
+
+    task = await engine.store.tasks.get_task(task_id)
+    assert task.observed_state == TaskState.SUCCEEDED
+    return task_id
+
+
+async def test_create_run_from_task_guards(client: Any, engine: Engine) -> None:
+    await _setup(engine, client)
+
+    # 404：任务不存在
+    missing = await client.post("/api/capture/runs/from_task", json={"task_id": "不存在的任务"})
+    assert missing.status_code == 404
+
+    # 400：任务存在但从没跑过（没有任何 attempt）——没有材料可以捕获
+    workflow_id = await _create_two_stage_workflow(client)
+    submitted = await client.post(
+        f"/api/workflows/{workflow_id}/tasks",
+        json={"input_payload": {"task": "还没跑"}},
+    )
+    assert submitted.status_code in (200, 202), submitted.text
+    idle = await client.post(
+        "/api/capture/runs/from_task", json={"task_id": submitted.json()["task_id"]}
+    )
+    assert idle.status_code == 400
+    assert "没有执行记录" in idle.json()["detail"]
+
+    # 守卫失败不留台账
+    assert (await client.get("/api/capture/runs")).json()["runs"] == []
+
+
+async def test_from_task_run_full_path(
+    client: Any, engine: Engine, backend: FakeLLMBackend
+) -> None:
+    """补捕获全链路：建 run（不建流程）→ 立即生成草案 → 采用与 live 一致。"""
+    await _setup(engine, client)
+    workflow_id = await _create_two_stage_workflow(client)
+    task_id = await _run_two_stage_task(client, engine, workflow_id)
+
+    workflows_before = (await client.get("/api/workflows?include_capture=true")).json()["workflows"]
+
+    created = await client.post("/api/capture/runs/from_task", json={"task_id": task_id})
+    assert created.status_code == 200, created.text
+    run = created.json()
+    assert run["origin"] == "from_task"
+    assert run["task_id"] == task_id
+    assert run["workflow_id"] == workflow_id, "关联任务所属的真实流程（仅信息关联）"
+    assert run["status"] == "completed", "任务已终态，run 应立刻收敛而不是停在「进行中」"
+    # 基础候选快照来自实际执行的 attempt
+    assert run["profile"]["harness_ref"] == "h-claude"
+    # 缺省名称来自任务输入
+    assert "扫描目录" in run["name"]
+
+    # 补捕获不创建任何新 workflow
+    workflows_after = (await client.get("/api/workflows?include_capture=true")).json()["workflows"]
+    assert len(workflows_after) == len(workflows_before)
+
+    # 流程列表绝不能把来源任务所属的真实流程藏起来
+    default = (await client.get("/api/workflows")).json()["workflows"]
+    assert workflow_id in [w["workflow_id"] for w in default]
+
+    # 详情：材料反映两阶段执行（执行路径 + 按阶段分组）
+    detail = (await client.get(f"/api/capture/runs/{run['run_id']}")).json()
+    assert detail["task_state"] == "succeeded"
+    assert detail["material"]["stages"] == 2
+    material = await assemble_material(engine.store, task_id)
+    assert "# 执行路径" in material.text
+    assert "扫描" in material.text and "汇总" in material.text
+
+    # 建后直接能生成草案（任务已终态）；合成提示词如实说明材料形态
+    real_evidence = sorted(e for e in material.evidence_set() if e.startswith("E"))
+    assert real_evidence
+    backend._responses = [
+        _proposal_reply(
+            {
+                "kind": "workflow",
+                "name": "扫描汇总流程",
+                "description": "从既有任务补捕获",
+                "nodes": [
+                    {"node_id": "scan", "name": "扫描", "role": "扫描者",
+                     "profiles": [{"harness_ref": "h-claude"}],
+                     "basis": "observed", "evidence": [real_evidence[0]]},
+                    {"node_id": "sum", "name": "汇总", "role": "汇总者",
+                     "profiles": [{"harness_ref": "h-claude"}],
+                     "basis": "observed", "evidence": [real_evidence[-1]]},
+                ],
+                "edges": [{"from_node": "scan", "to_node": "sum",
+                           "basis": "observed", "evidence": [real_evidence[0]]}],
+            }
+        )
+    ]
+    generated = await client.post(f"/api/capture/runs/{run['run_id']}/drafts")
+    assert generated.status_code == 200, generated.text
+    draft = generated.json()
+    user_message = backend.calls[0][-1].content
+    assert "既有任务" in user_message, "提示词必须说明材料来自既有任务"
+    assert "执行路径" in user_message and "主要依据" in user_message
+
+    # 采用路径与 live run 一致：存为草稿修订、source=graph_capture、不发布
+    adopted = await client.post(f"/api/capture/drafts/{draft['draft_id']}/adopt")
+    assert adopted.status_code == 200, adopted.text
+    new_workflow_id = adopted.json()["adopted_ref"]
+    revisions = (await client.get(f"/api/workflows/{new_workflow_id}/revisions")).json()
+    rev = revisions["revisions"][0]
+    assert rev["source"] == "graph_capture"
+    assert rev["is_published"] is False
+    assert [n["node_id"] for n in rev["graph"]["nodes"]] == ["scan", "sum"]
+
+    # 事件留痕：CAPTURE_RUN_CREATED 带 origin 与来源任务
+    events = await _events(client)
+    created_events = [e for e in events if e["type"] == EventType.CAPTURE_RUN_CREATED.value]
+    assert len(created_events) == 1
+    assert created_events[0]["payload"]["origin"] == "from_task"
+    assert created_events[0]["payload"]["source_task_id"] == task_id

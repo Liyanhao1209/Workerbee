@@ -1715,6 +1715,21 @@ class CaptureService(_Service):
             raise BadRequest(exc.detail, hint=exc.hint) from exc
         return S.CaptureRunResponse.model_validate(run)
 
+    async def create_run_from_task(self, req: S.CaptureRunFromTaskRequest) -> S.CaptureRunResponse:
+        """从既有任务补捕获：不重新执行，直接关联那个任务的执行记录。"""
+        task_id = req.task_id.strip()
+        if not task_id:
+            raise BadRequest("选一个已经跑过的任务。")
+        try:
+            run = await self._core().create_run_from_task(
+                task_id=task_id, name=req.name.strip() if req.name else None
+            )
+        except KeyError:
+            raise NotFound(f"任务不存在: {task_id}") from None
+        except CaptureError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.CaptureRunResponse.model_validate(run)
+
     async def list_runs(self) -> S.CaptureRunListResponse:
         runs = await self._core().list_runs()
         return S.CaptureRunListResponse(

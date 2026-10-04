@@ -117,6 +117,7 @@ __all__ = [
     "AssistantConfigResponse",
     "AssistantConfigUpdateRequest",
     "CaptureRunCreateRequest",
+    "CaptureRunFromTaskRequest",
     "CaptureRunResponse",
     "CaptureRunListResponse",
     "CaptureMaterialSummary",
@@ -1042,17 +1043,32 @@ class CaptureRunCreateRequest(ApiRequest):
     credential_ref: str | None = None
 
 
+class CaptureRunFromTaskRequest(ApiRequest):
+    """从既有任务补捕获：任务已经跑过，直接把它的执行记录转成流程草案。
+
+    **不重新执行任务**——没有执行记录（没有任何 attempt）的任务会被拒绝。
+    """
+
+    task_id: str
+    name: str | None = None
+    """留空时用任务输入的前 20 个字。"""
+
+
 class CaptureRunResponse(ApiResponse):
     """一次捕获任务的台账。执行状态的事实源是任务表，``status`` 是它的收敛。"""
 
     run_id: str
     name: str
+    origin: str = "live"
+    """live：专门为捕获跑的临时流程；from_task：从既有任务补捕获。"""
     workflow_id: str
-    """捕获专用的临时单节点 Workflow。它不进默认流程列表。"""
+    """live 时是捕获专用的临时单节点 Workflow（不进默认流程列表）；
+    from_task 时是来源任务所属的真实流程（仅作信息关联，不会被隐藏）。"""
     task_id: str | None = None
     """真实执行的任务 id；发射失败时为 None。"""
     profile: dict[str, Any] = Field(default_factory=dict)
-    """基础候选快照（harness/模型/凭据引用 + 任务说明）。"""
+    """基础候选快照（harness/模型/凭据引用 + 任务说明）。from_task 时取来源
+    任务最近一次 attempt 的候选快照，取不到的字段如实为空（界面显示「未知」）。"""
     status: str = "running"
     """running / completed / failed。"""
     created_at: str
@@ -1069,6 +1085,8 @@ class CaptureMaterialSummary(ApiResponse):
 
     tool_calls: int = 0
     artifacts: int = 0
+    stages: int = 0
+    """任务实际走过的阶段数。大于 1 时材料含「执行路径」分区且按阶段分组。"""
     has_plan: bool = False
     """模型是否在输出里显式写了执行计划。False 时草案的划分几乎全是推断。"""
     chars: int = 0

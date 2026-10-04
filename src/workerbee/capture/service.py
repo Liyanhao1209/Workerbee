@@ -7,10 +7,12 @@
 
 三件事各自独立：
 1. ``create_run``：建单节点临时 Workflow（名称前缀「捕获·」）+ 发射任务；
+   ``create_run_from_task``：从**既有任务**补捕获——不建 Workflow、不发射，
+   run 直接关联那个任务的执行记录（origin='from_task'，迁移 11）；
 2. 材料汇编在 :mod:`.material`（只读）；
 3. 草案合成在 :mod:`.synthesis`（显式触发的一次模型调用）。
 
-「从既有任务补捕获」「多模型协作捕获」明确不做（计划 §9）。
+「多模型协作捕获」明确不做（计划 §9）。
 """
 
 from __future__ import annotations
@@ -119,6 +121,27 @@ _FAILED_TASK_STATES = {TaskState.FAILED, TaskState.CANCELLED, TaskState.BLOCKED}
 
 #: 合成的单次调用超时（秒）。这是一次显式触发的同步调用，不能无限挂住。
 SYNTHESIS_TIMEOUT_S = 120.0
+
+
+def _task_input_text(task: Any) -> str:
+    """任务输入里那段话（补捕获 run 的「任务说明」与缺省名称来源）。"""
+    payload = task.input_payload or {}
+    for key in ("task", "goal"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for value in payload.values():
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _default_run_name(task: Any) -> str:
+    """补捕获 run 的缺省名称：任务输入的前 20 个字；取不到就如实写任务号。"""
+    text = _task_input_text(task)
+    if text:
+        return text[:20]
+    return f"任务 {task.task_id[:8]} 的执行记录"
 
 
 class CaptureService:
@@ -268,6 +291,66 @@ class CaptureService:
         assert run is not None  # 刚创建
         return run
 
+    async def create_run_from_task(
+        self, *, task_id: str, name: str | None = None
+    ) -> dict[str, Any]:
+        """从既有任务补捕获：任务已经跑过，直接把它的执行记录转成捕获 run。
+
+        **不建 Workflow、不发射**——材料汇编与合成对任意任务已可用。run 的
+        workflow_id 只作信息关联（任务所属的真实流程），流程列表不会因此
+        隐藏它（隐藏只认 origin='live'，见迁移 11）。
+
+        任务不存在抛 ``KeyError``（404）；任务没有任何 attempt 抛
+        :class:`CaptureError`（400）——没有执行记录就没有材料可以捕获。
+        """
+        task = await self.store.tasks.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        attempts = await self.store.tasks.list_attempts_for_task(task_id)
+        if not attempts:
+            raise CaptureError(
+                "这个任务没有执行记录，没有材料可以捕获",
+                hint="先让它真实跑一遍；或者改用「新跑一个任务捕获」",
+            )
+
+        # 基础候选快照取最近一次 attempt 的 profile_snapshot（实际执行时用的
+        # harness/模型/凭据，比节点定义更接近事实）。取不到就留空——详情与
+        # 合成提示词里如实显示「未知」，不编造。
+        snapshot = attempts[-1].profile_snapshot or {}
+        run_name = (name or "").strip() or _default_run_name(task)
+        run = await self.store.capture.create_run(
+            run_id=new_id(),
+            name=run_name,
+            workflow_id=task.workflow_id,
+            task_id=task_id,
+            profile={
+                "harness_ref": snapshot.get("harness_ref"),
+                "model_name": snapshot.get("model_name"),
+                "credential_ref": snapshot.get("credential_ref"),
+                "instructions": _task_input_text(task),
+            },
+            origin="from_task",
+        )
+        await self.store.events.append(
+            scope=EventScope.CAPTURE,
+            type=EventType.CAPTURE_RUN_CREATED,
+            actor=EventActor.USER,
+            scope_id=run["run_id"],
+            task_id=task_id,
+            payload={
+                "name": run_name,
+                "origin": "from_task",
+                "source_task_id": task_id,
+                "workflow_id": task.workflow_id,
+                "harness_ref": snapshot.get("harness_ref"),
+                "model_name": snapshot.get("model_name") or None,
+                "credential_ref": snapshot.get("credential_ref"),
+            },
+        )
+        # 既有任务多半已是终态：立刻收敛一次，列表/详情直接看到结论而不是
+        # 一直停在「进行中」。
+        return await self._sync_status(run)
+
     async def list_runs(self) -> list[dict[str, Any]]:
         runs = await self.store.capture.list_runs()
         return [await self._sync_status(r) for r in runs]
@@ -294,6 +377,7 @@ class CaptureService:
             material_summary = {
                 "tool_calls": material.tool_call_count,
                 "artifacts": material.artifact_count,
+                "stages": material.stage_count,
                 "has_plan": material.has_plan,
                 "chars": material.total_chars,
                 "trimmed": material.trimmed,
@@ -357,6 +441,7 @@ class CaptureService:
                 content=build_synthesis_prompt(
                     material,
                     base_profile=run["profile"],
+                    origin=run.get("origin") or "live",
                     harness_ids=[h.harness_id for h in harnesses],
                     credential_ids=[c.credential_id for c in credentials],
                     skill_ids=[s.skill_id for s in skills],

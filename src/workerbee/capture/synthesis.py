@@ -28,17 +28,29 @@ def build_synthesis_prompt(
     material: CaptureMaterial,
     *,
     base_profile: dict[str, Any],
+    origin: str = "live",
     harness_ids: list[str],
     credential_ids: list[str],
     skill_ids: list[str],
     tool_ids: list[str],
 ) -> str:
-    """拼合成的用户消息：材料正文 + 输出协议 + 可引用清单。"""
+    """拼合成的用户消息：材料正文 + 输出协议 + 可引用清单。
+
+    材料有两种形态（``origin``）：
+    - ``live``：专门为捕获跑的一次自由执行（单节点）；
+    - ``from_task``：既有任务（可能多阶段）的执行记录——材料里带「执行路径」
+      分区时，草案的阶段划分应以它为主要依据。
+
+    基础候选快照缺失时如实写「未知」，不编造一个看起来像样的默认值。
+    """
+    harness_ref = base_profile.get("harness_ref") or ""
+    known_base = bool(harness_ref)
     return _USER_TEMPLATE.format(
         material=material.text or "（这次执行没有留下可用材料）",
-        harness_ref=base_profile.get("harness_ref") or "",
-        model_name=base_profile.get("model_name") or "（harness 默认）",
-        credential_ref=base_profile.get("credential_ref") or "（无）",
+        source_note=_SOURCE_NOTES.get(origin, _SOURCE_NOTES["live"]),
+        harness_ref=harness_ref or "未知",
+        model_name=(base_profile.get("model_name") or "（harness 默认）") if known_base else "未知",
+        credential_ref=(base_profile.get("credential_ref") or "（无）") if known_base else "未知",
         harness_ids="、".join(harness_ids) or "（无）",
         credential_ids="、".join(credential_ids) or "（无）",
         skill_ids="、".join(skill_ids) or "（无）",
@@ -46,21 +58,41 @@ def build_synthesis_prompt(
     )
 
 
+#: 两种材料形态在合成提示词里的说明。
+_SOURCE_NOTES = {
+    "live": "这份材料来自一次专门为捕获而跑的自由执行（单节点流程）。",
+    "from_task": (
+        "这份材料来自一个既有任务的真实执行记录（不是专门为捕获跑的一次，可能是多阶段流程）。"
+        "如果材料里有「执行路径」分区，它是这次执行实际走过的阶段序列——草案的阶段划分应"
+        "以它为主要依据，节点命名优先沿用执行路径里的节点名；工具调用与产物也按阶段分组。"
+    ),
+}
+
+
 SYSTEM_PROMPT = """你是 Workerbee 的流程捕获分析器。给你一次任务真实执行的材料
-（任务输入、工具调用序列、模型当时显式写出的执行计划、产物清单、用量），
+（任务输入、工具调用序列、模型当时显式写出的执行计划、产物清单、用量；
+多阶段任务还带「执行路径」分区——实际走过的阶段序列），
 把这次执行整理成一个**可复用的流程草案**。
 
 纪律：
 - 只依据给出的材料。材料里没有的步骤就是「推断的」，不要假装观察到过。
-- 材料里没有显式计划时，阶段划分几乎只能是推断——如实标注，不要编计划。
-- 每个节点默认沿用捕获时的基础候选（harness / 模型 / 凭据），除非材料明确
-  显示某一步需要不同的执行者。
+- 材料里有「执行路径」分区时，它是观察到的结构材料：草案的阶段划分以它为
+  主要依据，节点命名优先沿用里面的节点名。
+- 材料里没有显式计划、也没有执行路径时，阶段划分几乎只能是推断——如实标注，
+  不要编计划。
+- 每个节点默认沿用捕获时的基础候选（harness / 模型 / 凭据）；基础候选标注
+  「未知」时不要编造，对应槽位留空并在 notes 里写「待配置：基础模型未知」，
+  除非材料明确显示某一步需要不同的执行者。
 - 只能引用下面清单里列出的 harness/凭据/Skill/工具 id；清单外的不要编造，
   对应字段留空并在 notes 里写「待配置：缺×××」。"""
 
 _USER_TEMPLATE = """## 本次执行的材料
 
 {material}
+
+## 材料来源
+
+{source_note}
 
 ## 捕获时的基础候选
 

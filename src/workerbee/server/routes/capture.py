@@ -27,6 +27,17 @@ async def create_run(
     return await services.capture.create_run(req)
 
 
+@router.post(
+    "/api/capture/runs/from_task",
+    response_model=S.CaptureRunResponse,
+    summary="从既有任务补捕获（不重新执行；任务没有执行记录返回 400）",
+)
+async def create_run_from_task(
+    services: ServicesDep, req: S.CaptureRunFromTaskRequest
+) -> S.CaptureRunResponse:
+    return await services.capture.create_run_from_task(req)
+
+
 @router.get(
     "/api/capture/runs",
     response_model=S.CaptureRunListResponse,
