@@ -1,5 +1,9 @@
 /**
- * 流程捕获（/captures）：用一个模型真实跑一遍任务，把执行过程整理成可复用的流程草案。
+ * 流程捕获（/captures）：把一次真实执行整理成可复用的流程草案。
+ *
+ * 两种来源：
+ * - 「新跑一个任务捕获」：选基础候选，系统真实执行一次任务说明；
+ * - 「从已跑过的任务生成」：直接把既有任务的执行记录转成捕获记录，不重新执行。
  *
  * 页面纪律：
  * - 捕获任务是一次**真实执行**——表单里如实写明，不让用户以为这只是「分析一下」；
@@ -10,12 +14,12 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { capture as captureApi, registry as registryApi } from '../api/endpoints';
-import type { CaptureRun, CredentialRef, HarnessRegistration } from '../api/types';
+import { capture as captureApi, registry as registryApi, tasks as tasksApi } from '../api/endpoints';
+import type { CaptureRun, CredentialRef, HarnessRegistration, Task } from '../api/types';
 import { Banner, Empty, Field, Loading, Modal, Pill, ShortId, TimeText } from '../components/common';
 import { useAsync, useSubmit } from '../hooks/useAsync';
 import type { Tone } from '../labels';
-import { CREDENTIAL_KIND_LABELS } from '../labels';
+import { CREDENTIAL_KIND_LABELS, taskStateLabel } from '../labels';
 
 /** 捕获任务的状态徽标。status 由后端从任务真实状态收敛（running / completed / failed）。 */
 const RUN_STATUS_LABELS: Record<string, { text: string; tone: Tone }> = {
@@ -54,13 +58,28 @@ function ReadError({ error, what, onRetry }: { error: ApiError; what: string; on
   );
 }
 
+/** 「既有任务」徽标：from_task 的捕获是从已跑过的任务生成的，没有重新执行。 */
+export function OriginBadge({ origin }: { origin: string }): JSX.Element | null {
+  if (origin !== 'from_task') return null;
+  return (
+    <Pill tone="idle" plain title="从已跑过的任务生成，没有重新执行">
+      既有任务
+    </Pill>
+  );
+}
+
 export function CapturesPage(): JSX.Element {
   const navigate = useNavigate();
-  const [createOpen, setCreateOpen] = useState(false);
+  /** 新建入口：先选方式（chooser），再进对应弹窗（live 表单 / 任务选择）。 */
+  const [chooserOpen, setChooserOpen] = useState(false);
+  const [liveOpen, setLiveOpen] = useState(false);
+  const [fromTaskOpen, setFromTaskOpen] = useState(false);
 
   // 轮询跟进：进行中的捕获靠它推进到完成（推送是加速器，轮询是兜底）。
   const runs = useAsync(captureApi.listRuns, [], { pollMs: 5000 });
   const rows: CaptureRun[] = runs.data?.runs ?? [];
+
+  const openCreate = () => setChooserOpen(true);
 
   return (
     <div className="page">
@@ -75,7 +94,7 @@ export function CapturesPage(): JSX.Element {
           <button type="button" className="btn btn--sm" onClick={runs.reload}>
             刷新
           </button>
-          <button type="button" className="btn btn--sm btn--primary" onClick={() => setCreateOpen(true)}>
+          <button type="button" className="btn btn--sm btn--primary" onClick={openCreate}>
             新建捕获任务
           </button>
         </div>
@@ -92,9 +111,9 @@ export function CapturesPage(): JSX.Element {
         ) : rows.length === 0 ? (
           <Empty
             title="还没有捕获任务"
-            hint="用一个模型实际跑一遍任务，系统把执行过程整理成可复用的流程草稿。"
+            hint="用一个模型实际跑一遍任务，或从已跑过的任务生成，系统把执行过程整理成可复用的流程草稿。"
             action={
-              <button type="button" className="btn btn--sm btn--primary" onClick={() => setCreateOpen(true)}>
+              <button type="button" className="btn btn--sm btn--primary" onClick={openCreate}>
                 新建捕获任务
               </button>
             }
@@ -115,7 +134,10 @@ export function CapturesPage(): JSX.Element {
                 {rows.map((run) => (
                   <tr key={run.run_id}>
                     <td>
-                      <Link to={`/captures/${encodeURIComponent(run.run_id)}`}>{run.name}</Link>
+                      <span className="row row--tight">
+                        <OriginBadge origin={run.origin} />
+                        <Link to={`/captures/${encodeURIComponent(run.run_id)}`}>{run.name}</Link>
+                      </span>
                     </td>
                     <td>
                       <RunStatusPill status={run.status} />
@@ -127,7 +149,11 @@ export function CapturesPage(): JSX.Element {
                       {run.task_id ? (
                         <Link to={`/tasks/${encodeURIComponent(run.task_id)}`} title={run.task_id}>
                           <ShortId id={run.task_id} />
-                          {run.status !== 'completed' ? '（看实时进展）' : ''}
+                          {run.origin === 'from_task'
+                            ? '（来源任务）'
+                            : run.status !== 'completed'
+                              ? '（看实时进展）'
+                              : ''}
                         </Link>
                       ) : (
                         <span className="dim">未跑起来</span>
@@ -146,13 +172,196 @@ export function CapturesPage(): JSX.Element {
         )}
       </div>
 
-      {createOpen ? (
+      {chooserOpen ? (
+        <CreateChooserModal
+          onClose={() => setChooserOpen(false)}
+          onPickLive={() => {
+            setChooserOpen(false);
+            setLiveOpen(true);
+          }}
+          onPickFromTask={() => {
+            setChooserOpen(false);
+            setFromTaskOpen(true);
+          }}
+        />
+      ) : null}
+      {liveOpen ? (
         <CreateCaptureModal
-          onClose={() => setCreateOpen(false)}
+          onClose={() => setLiveOpen(false)}
+          onCreated={(run) => navigate(`/captures/${encodeURIComponent(run.run_id)}`)}
+        />
+      ) : null}
+      {fromTaskOpen ? (
+        <FromTaskModal
+          onClose={() => setFromTaskOpen(false)}
           onCreated={(run) => navigate(`/captures/${encodeURIComponent(run.run_id)}`)}
         />
       ) : null}
     </div>
+  );
+}
+
+// ===========================================================================
+// 新建入口：先选方式
+// ===========================================================================
+
+function CreateChooserModal({
+  onClose,
+  onPickLive,
+  onPickFromTask,
+}: {
+  onClose: () => void;
+  onPickLive: () => void;
+  onPickFromTask: () => void;
+}): JSX.Element {
+  return (
+    <Modal title="新建捕获任务" onClose={onClose}>
+      <div className="col">
+        <button type="button" className="btn" style={{ textAlign: 'left' }} onClick={onPickLive}>
+          新跑一个任务捕获
+          <div className="text-xs dim" style={{ marginTop: 2 }}>
+            选一个基础候选，系统真实执行一次你写的任务说明，再整理成流程草案。
+          </div>
+        </button>
+        <button type="button" className="btn" style={{ textAlign: 'left' }} onClick={onPickFromTask}>
+          从已跑过的任务生成
+          <div className="text-xs dim" style={{ marginTop: 2 }}>
+            选一个已经跑过的任务，直接把它的执行记录整理成流程草案——不会重新执行。
+          </div>
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+// ===========================================================================
+// 从已跑过的任务生成
+// ===========================================================================
+
+/** 任务的展示名：输入里那段话的前若干字，取不到就如实显示任务号。 */
+function taskInputPreview(task: Task): string {
+  const payload = task.input_payload ?? {};
+  for (const key of ['task', 'goal']) {
+    const v = payload[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  for (const v of Object.values(payload)) {
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+}
+
+function FromTaskModal({
+  onClose,
+  onCreated,
+}: {
+  onClose: () => void;
+  onCreated: (run: CaptureRun) => void;
+}): JSX.Element {
+  // 只列有执行记录的任务：没有执行记录的任务没有材料可以捕获。
+  const taskList = useAsync(() => tasksApi.list({ has_attempts: true }), []);
+  const submit = useSubmit();
+  const [selected, setSelected] = useState<string | null>(null);
+
+  const rows: Task[] = taskList.data?.tasks ?? [];
+
+  const create = async (): Promise<void> => {
+    if (!selected) return;
+    const run = await submit.run(() => captureApi.createRunFromTask({ task_id: selected }));
+    if (run) onCreated(run);
+  };
+
+  return (
+    <Modal
+      wide
+      title="从已跑过的任务生成"
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn btn--sm" onClick={onClose}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="btn btn--sm btn--primary"
+            disabled={!selected || submit.busy}
+            onClick={() => void create()}
+          >
+            {submit.busy ? '创建中…' : '用这个任务生成捕获'}
+          </button>
+        </>
+      }
+    >
+      <Banner variant="info" title="不会重新执行任务">
+        系统直接读取这个任务已有的执行记录（输入、工具调用、产物、执行路径）来整理流程草案。
+        这里只列出有执行记录的任务。
+      </Banner>
+
+      {submit.error ? (
+        <Banner variant="danger" title="创建捕获任务失败" hint={submit.error.hint ?? undefined}>
+          <span className="mono text-xs">{submit.error.detail}</span>
+        </Banner>
+      ) : null}
+
+      {taskList.error ? (
+        <ReadError error={taskList.error} what="任务列表" onRetry={taskList.reload} />
+      ) : !taskList.loaded ? (
+        <Loading label="加载任务" />
+      ) : rows.length === 0 ? (
+        <Empty title="还没有跑过的任务" hint="先到流程页发射一个任务跑一遍，再回来从这里生成。" />
+      ) : (
+        <div className="table-wrap">
+          <table className="table table--rows-clickable">
+            <thead>
+              <tr>
+                <th style={{ width: 28 }} />
+                <th>任务</th>
+                <th>流程</th>
+                <th>状态</th>
+                <th>提交时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((task) => {
+                const stateLabel = taskStateLabel(task.observed_state);
+                const preview = taskInputPreview(task);
+                return (
+                  <tr
+                    key={task.task_id}
+                    onClick={() => setSelected(task.task_id)}
+                    style={selected === task.task_id ? { outline: '2px solid var(--accent)' } : undefined}
+                  >
+                    <td>
+                      <input
+                        type="radio"
+                        checked={selected === task.task_id}
+                        onChange={() => setSelected(task.task_id)}
+                      />
+                    </td>
+                    <td>
+                      <div className="truncate" style={{ maxWidth: 320 }} title={preview || task.task_id}>
+                        {preview || <ShortId id={task.task_id} />}
+                      </div>
+                    </td>
+                    <td>
+                      <span className="dim text-xs">{task.workflow_name ?? <ShortId id={task.workflow_id} />}</span>
+                    </td>
+                    <td>
+                      <Pill tone={stateLabel.tone} transition={stateLabel.transitioning} title={task.observed_state}>
+                        {stateLabel.text}
+                      </Pill>
+                    </td>
+                    <td>
+                      <TimeText value={task.created_at ?? null} />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Modal>
   );
 }
 

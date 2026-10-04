@@ -182,7 +182,7 @@ export const tasks = {
       body,
     }),
 
-  list: (params: { workflow_id?: string; state?: TaskState } = {}) =>
+  list: (params: { workflow_id?: string; state?: TaskState; has_attempts?: boolean } = {}) =>
     request<{ tasks: Task[]; returned: number; limit: number; offset: number; has_more: boolean }>(
       '/api/tasks',
       { query: params },
@@ -492,6 +492,10 @@ export const capture = {
     model_name?: string | null;
     credential_ref?: string | null;
   }) => request<CaptureRun>('/api/capture/runs', { method: 'POST', body }),
+
+  /** 从既有任务补捕获：任务已经跑过，**不重新执行**；任务不存在 404、没有执行记录 400。 */
+  createRunFromTask: (body: { task_id: string; name?: string | null }) =>
+    request<CaptureRun>('/api/capture/runs/from_task', { method: 'POST', body }),
 
   listRuns: () => request<{ runs: CaptureRun[]; returned: number }>('/api/capture/runs'),
 

@@ -1125,11 +1125,15 @@ export interface AssistantConfigUpdate {
 export interface CaptureRun {
   run_id: string;
   name: string;
-  /** 捕获专用的临时单节点流程。它不进默认流程列表。 */
+  /** live：专门为捕获跑的临时流程；from_task：从既有任务补捕获。 */
+  origin: string;
+  /** live 时是捕获专用的临时单节点流程（不进默认流程列表）；
+   *  from_task 时是来源任务所属的真实流程（仅信息关联，不会被隐藏）。 */
   workflow_id: string;
   /** 真实执行的任务 id；发射失败时为 null。 */
   task_id: string | null;
-  /** 基础候选快照（harness/模型/凭据引用 + 任务说明）。 */
+  /** 基础候选快照（harness/模型/凭据引用 + 任务说明）。
+   *  from_task 时取不到候选的字段如实为空——界面显示「未知」。 */
   profile: Record<string, unknown>;
   status: string;
   created_at: string;
@@ -1140,6 +1144,8 @@ export interface CaptureRun {
 export interface CaptureMaterialSummary {
   tool_calls: number;
   artifacts: number;
+  /** 任务实际走过的阶段数。>1 时材料含「执行路径」分区且按阶段分组。 */
+  stages: number;
   /** 模型是否在输出里显式写了执行计划。false 时草案的划分几乎全是推断。 */
   has_plan: boolean;
   chars: number;

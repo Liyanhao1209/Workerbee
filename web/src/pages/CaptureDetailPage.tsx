@@ -15,10 +15,16 @@ import type { CaptureDraft, CaptureDraftEdge, CaptureDraftNode, CaptureRunDetail
 import { Banner, Empty, KV, Loading, Pill, TimeText } from '../components/common';
 import { useAsync, useSubmit } from '../hooks/useAsync';
 import { taskStateLabel } from '../labels';
-import { RunStatusPill } from './CapturesPage';
+import { OriginBadge, RunStatusPill } from './CapturesPage';
 
 /** 后端允许生成草案的任务终态（与 capture/service.py 的判定一致）。 */
 const DRAFTABLE_TASK_STATES = new Set(['succeeded', 'failed', 'cancelled', 'blocked']);
+
+/** profile 里取字符串字段；取不到就是空串（调用方决定怎么如实呈现「未知」）。 */
+function profileText(run: CaptureRunDetail['run'], key: string): string {
+  const v = run.profile[key];
+  return typeof v === 'string' ? v : '';
+}
 
 function ReadError({ error, what, onRetry }: { error: ApiError; what: string; onRetry: () => void }): JSX.Element {
   return (
@@ -108,6 +114,7 @@ export function CaptureDetailPage(): JSX.Element {
           <div className="page-head__sub">
             {run ? (
               <span className="row row--tight">
+                <OriginBadge origin={run.origin} />
                 <RunStatusPill status={run.status} />
                 {taskLabel ? (
                   <Pill tone={taskLabel.tone} transition={taskLabel.transitioning} title={taskState ?? ''}>
@@ -122,7 +129,7 @@ export function CaptureDetailPage(): JSX.Element {
         <div className="page-head__actions">
           {run?.task_id ? (
             <Link to={`/tasks/${encodeURIComponent(run.task_id)}`} className="btn btn--sm">
-              看任务实时进展
+              {run.origin === 'from_task' ? '看来源任务' : '看任务实时进展'}
             </Link>
           ) : null}
           <button type="button" className="btn btn--sm" onClick={detail.reload}>
@@ -140,14 +147,23 @@ export function CaptureDetailPage(): JSX.Element {
           <div className="panel">
             <div className="panel__head">基础候选与任务说明</div>
             <div className="panel__body">
+              {run.origin === 'from_task' ? (
+                <div className="text-xs dim" style={{ marginBottom: 'var(--sp-2)' }}>
+                  这条捕获来自既有任务的执行记录，没有重新跑任务；基础候选取自当时实际执行的候选快照，取不到的字段如实显示「未知」。
+                </div>
+              ) : null}
               <KV
                 items={[
-                  { k: 'harness', v: <span className="mono">{String(run.profile['harness_ref'] ?? '')}</span> },
+                  {
+                    k: 'harness',
+                    v: <span className="mono">{profileText(run, 'harness_ref') || '未知'}</span>,
+                  },
                   {
                     k: '模型',
                     v: (
                       <span className="mono">
-                        {String(run.profile['model_name'] ?? '') || '（harness / 凭据默认）'}
+                        {profileText(run, 'model_name') ||
+                          (profileText(run, 'harness_ref') ? '（harness / 凭据默认）' : '未知')}
                       </span>
                     ),
                   },
@@ -155,7 +171,8 @@ export function CaptureDetailPage(): JSX.Element {
                     k: '凭据',
                     v: (
                       <span className="mono">
-                        {String(run.profile['credential_ref'] ?? '') || '（harness 本机登录态）'}
+                        {profileText(run, 'credential_ref') ||
+                          (profileText(run, 'harness_ref') ? '（harness 本机登录态）' : '未知')}
                       </span>
                     ),
                   },
@@ -165,7 +182,7 @@ export function CaptureDetailPage(): JSX.Element {
                 任务说明
               </div>
               <div className="text-sm" style={{ whiteSpace: 'pre-wrap' }}>
-                {String(run.profile['instructions'] ?? '')}
+                {profileText(run, 'instructions') || '未知'}
               </div>
             </div>
           </div>
@@ -183,6 +200,18 @@ export function CaptureDetailPage(): JSX.Element {
                     items={[
                       { k: '工具调用', v: <span className="mono">{material.tool_calls} 次</span> },
                       { k: '产物', v: <span className="mono">{material.artifacts} 份</span> },
+                      ...(material.stages > 1
+                        ? [
+                            {
+                              k: '阶段',
+                              v: (
+                                <span className="mono">
+                                  {material.stages} 个（材料含执行路径，按阶段分组）
+                                </span>
+                              ),
+                            },
+                          ]
+                        : []),
                       {
                         k: '显式计划',
                         v: material.has_plan ? (
