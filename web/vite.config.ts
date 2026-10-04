@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
 /**
@@ -27,5 +27,14 @@ export default defineConfig({
     emptyOutDir: true,
     sourcemap: false,
     chunkSizeWarningLimit: 1200,
+  },
+  test: {
+    // jsdom 而不是 node：组件测试与 dompurify 消毒都需要真实 DOM。
+    environment: 'jsdom',
+    // 不污染全局命名空间：测试里显式 import { describe, it, expect } from 'vitest'。
+    globals: false,
+    setupFiles: './src/test/setup.ts',
+    // 就近放置的 *.test.ts(x)；dist 与 node_modules 默认已排除，这里只是显式声明。
+    include: ['src/**/*.test.{ts,tsx}'],
   },
 });
