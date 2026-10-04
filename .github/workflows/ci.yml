@@ -66,6 +66,12 @@ jobs:
         working-directory: web
         run: npm ci
 
+      # 先测后构建：测试挂掉时不必再付一次构建的时间；
+      # 测试本身不依赖 dist，顺序反了也没有信息量。
+      - name: Test
+        working-directory: web
+        run: npm test
+
       # build 脚本本身就是 `tsc --noEmit && vite build`，类型检查和构建一步到位。
       # 拆成两步只是多花一次时间，失败信息并不会更清楚。
       - name: Typecheck and build
