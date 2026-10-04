@@ -9,6 +9,15 @@ event_log 与产物表里把它们取出来，拼成一份有字符预算的材�
 - 产物清单与摘要（``store.artifacts``）；
 - 用量与耗时（attempt 记录）。
 
+任务有多个 stage 时（既有任务常见——补捕获的主要对象），另加两条结构材料：
+
+- **执行路径**分区：按执行先后列出各 stage 的节点名与最终状态（节点名取
+  stage 记录，缺失时回退钉扎快照 ``task.graph_snapshot``）——这是观察到的
+  结构材料，草案的阶段划分应以它为主要依据；
+- 工具调用序列与产物清单**按 stage 分组**（每组带节点名）。分组只影响
+  呈现，不改变「被裁分区不贡献 evidence」的规则（分区内被丢的行连同
+  行内证据一起撤出）。单 stage 任务的材料形态与此前完全一致。
+
 两条硬边界：
 
 1. **明确排除 ``ATTEMPT_REASONING``（思考链）**——「捕获不依赖私有推理链」
@@ -61,6 +70,8 @@ class CaptureMaterial(DomainModel):
     total_chars: int = 0
     tool_call_count: int = 0
     artifact_count: int = 0
+    stage_count: int = 0
+    """任务实际走过的 stage 数。大于 1 时材料里含「执行路径」分区且工具/产物按阶段分组。"""
     has_plan: bool = False
     has_input: bool = False
     usage: dict[str, Any] | None = None
@@ -103,9 +114,19 @@ async def assemble_material(
 
     events = await store.events.for_task(task_id, limit=5000)
     artifacts = [a for a in await store.artifacts.list_by_task(task_id) if not a.tombstoned]
+    stages = await store.tasks.list_stages(task_id)
 
     material = CaptureMaterial(task_id=task_id)
+    material.stage_count = len(stages)
     material.usage = await _extract_usage(store, task_id)
+
+    # 多 stage 任务：工具/产物按阶段分组，另加「执行路径」分区（观察到的结构材料）。
+    grouped = len(stages) > 1
+    stage_names: dict[str, str] = {}
+    stage_order: list[str] = []
+    if grouped:
+        stage_names = await _stage_names(store, task_id, stages)
+        stage_order = [st.stage_id for st in stages]
 
     sections: list[_Section] = []
 
@@ -121,10 +142,14 @@ async def assemble_material(
             _Section("输入", f"# 任务输入\n[E{input_ref}] {text}", {str(input_ref), f"E{input_ref}"})
         )
 
-    # ---- 工具调用序列（时间序） ----
+    # ---- 执行路径（仅多 stage；单行级体量，不参与预算裁剪） ----
+    if grouped:
+        sections.append(_execution_path_section(stages, stage_names))
+
+    # ---- 工具调用序列（时间序；多 stage 时按阶段分组） ----
     tool_calls = _extract_tool_calls(events)
     material.tool_call_count = len(tool_calls)
-    tool_section = _tool_section(tool_calls, red)
+    tool_section = _tool_section(tool_calls, red, stage_order, stage_names)
     if tool_section is not None:
         sections.append(tool_section)
 
@@ -134,9 +159,9 @@ async def assemble_material(
     if plan is not None:
         sections.append(_Section("计划", f"# 模型输出的执行计划\n{red(plan)}"))
 
-    # ---- 产物清单 ----
+    # ---- 产物清单（多 stage 时按产出阶段分组） ----
     material.artifact_count = len(artifacts)
-    artifact_section = _artifact_section(artifacts, red)
+    artifact_section = _artifact_section(artifacts, red, stage_order, stage_names)
     if artifact_section is not None:
         sections.append(artifact_section)
 
@@ -197,8 +222,12 @@ def _trim(sections: list[_Section], budget: int, material: CaptureMaterial) -> l
                 return body
 
             result[i] = _Section(s.name, body_with_note(), s.evidence)
-            while len(kept) > 1 and total(result) > budget:
-                dropped.append(kept.pop(1))  # 第 0 行是标题
+            while _droppable_count(kept) > 1 and total(result) > budget:
+                # 只丢调用行（"N. [E…]"）；组标题（## ）与主标题（# ）永远保留，
+                # 丢完整组后把空组标题一并去掉，免得剩下没有内容的误导性标题。
+                idx = next(j for j, line in enumerate(kept) if _is_call_line(line))
+                dropped.append(kept.pop(idx))
+                kept = _drop_orphan_group_headers(kept)
                 result[i] = _Section(s.name, body_with_note(), s.evidence)
             if dropped:
                 # 被丢的行连同行内的 evidence 一起撤出。
@@ -209,40 +238,160 @@ def _trim(sections: list[_Section], budget: int, material: CaptureMaterial) -> l
     return result
 
 
+#: 工具调用序列里「一次调用」的行（可裁剪）；组标题与主标题不可裁。
+_CALL_LINE = re.compile(r"^\d+\. \[E\d+\]")
+
+
+def _is_call_line(line: str) -> bool:
+    return bool(_CALL_LINE.match(line))
+
+
+def _droppable_count(lines: list[str]) -> int:
+    return sum(1 for line in lines if _is_call_line(line))
+
+
+def _drop_orphan_group_headers(lines: list[str]) -> list[str]:
+    """去掉下面已经没有任何调用行的「## 阶段」组标题。"""
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not _is_call_line(nxt):
+                continue
+        out.append(line)
+    return out
+
+
 def _tool_section(
-    tool_calls: list[dict[str, Any]], red: Callable[[str], str]
+    tool_calls: list[dict[str, Any]],
+    red: Callable[[str], str],
+    stage_order: list[str] | None = None,
+    stage_names: dict[str, str] | None = None,
 ) -> _Section | None:
+    """工具调用序列。给了 ``stage_order``（多 stage 任务）时按阶段分组，
+    每组带节点名；调用序号仍全局连续，保住「按时间先后」的语义。"""
     if not tool_calls:
         return None
-    lines: list[str] = []
     evidence: set[str] = set()
-    for i, call in enumerate(tool_calls, 1):
+    lines: list[str] = []
+    grouped = bool(stage_order)
+
+    def render(call: dict[str, Any], seq: int) -> str:
         result = call.get("is_error")
         outcome = "失败" if result else "成功" if result is False else "结果未记录"
         target = f" → {red(str(call['target']))}" if call.get("target") else ""
         ref = f"E{call['event_id']}"
         evidence.add(ref)
         evidence.add(str(call["event_id"]))
-        lines.append(f"{i}. [{ref}] {call.get('tool_name') or '?'}{target}（{outcome}）")
-    body = f"# 工具调用序列（按时间先后，共 {len(lines)} 次）\n" + "\n".join(lines)
+        return f"{seq}. [{ref}] {call.get('tool_name') or '?'}{target}（{outcome}）"
+
+    if grouped:
+        assert stage_order is not None and stage_names is not None
+        by_stage: dict[str | None, list[dict[str, Any]]] = {}
+        for call in tool_calls:
+            by_stage.setdefault(call.get("stage_id"), []).append(call)
+        # 按执行路径的顺序排组；归不到任何阶段的调用如实单列一组放在最后。
+        grouped_calls: list[tuple[str, list[dict[str, Any]]]] = [
+            (stage_names[sid], by_stage.pop(sid))
+            for sid in stage_order
+            if by_stage.get(sid)
+        ]
+        rest = [c for calls in by_stage.values() for c in calls]
+        if rest:
+            grouped_calls.append(("未能归入任何阶段", rest))
+        seq = 0
+        for label, calls in grouped_calls:
+            lines.append(f"## 阶段「{label}」")
+            for call in calls:
+                seq += 1
+                lines.append(render(call, seq))
+    else:
+        for seq, call in enumerate(tool_calls, 1):
+            lines.append(render(call, seq))
+
+    body = f"# 工具调用序列（按时间先后，共 {len(tool_calls)} 次）\n" + "\n".join(lines)
     return _Section("工具调用序列", body, evidence)
 
 
-def _artifact_section(artifacts: list[Any], red: Callable[[str], str]) -> _Section | None:
+def _artifact_section(
+    artifacts: list[Any],
+    red: Callable[[str], str],
+    stage_order: list[str] | None = None,
+    stage_names: dict[str, str] | None = None,
+) -> _Section | None:
+    """产物清单。多 stage 任务按产出阶段分组（每组带节点名）。"""
     if not artifacts:
         return None
-    lines: list[str] = []
     evidence: set[str] = set()
-    for art in artifacts:
+
+    def render(art: Any) -> str:
         ref = f"A{art.artifact_id}"
         evidence.add(ref)
         evidence.add(art.artifact_id)
         summary = red(art.summary or "（无摘要）")
         if len(summary) > _SUMMARY_CHARS:
             summary = summary[:_SUMMARY_CHARS] + "…"
-        lines.append(f"- [{ref}] kind={art.kind.value}：{summary}")
-    body = f"# 产物（共 {len(lines)} 份）\n" + "\n".join(lines)
+        return f"- [{ref}] kind={art.kind.value}：{summary}"
+
+    if stage_order:
+        assert stage_names is not None
+        by_stage: dict[str | None, list[Any]] = {}
+        for art in artifacts:
+            sid = art.producer.stage_id if art.producer is not None else None
+            by_stage.setdefault(sid, []).append(art)
+        groups: list[tuple[str, list[Any]]] = [
+            (stage_names[sid], by_stage.pop(sid)) for sid in stage_order if by_stage.get(sid)
+        ]
+        rest = [a for arts in by_stage.values() for a in arts]
+        if rest:
+            groups.append(("未能归入任何阶段", rest))
+        lines: list[str] = []
+        for label, arts in groups:
+            lines.append(f"## 阶段「{label}」")
+            lines.extend(render(a) for a in arts)
+    else:
+        lines = [render(a) for a in artifacts]
+    body = f"# 产物（共 {len(artifacts)} 份）\n" + "\n".join(lines)
     return _Section("产物", body, evidence)
+
+
+#: stage 状态的大白话标签（执行路径分区用）。没收录的取不到时如实写原始值。
+_STAGE_STATE_LABELS = {
+    "succeeded": "完成",
+    "failed": "失败",
+    "cancelled": "已取消",
+    "blocked": "受阻",
+    "skipped": "跳过",
+    "lost": "失联",
+    "running": "运行中",
+    "paused": "已暂停",
+}
+
+
+def _execution_path_section(stages: list[Any], stage_names: dict[str, str]) -> _Section:
+    """执行路径：按执行先后列出各阶段的节点名与最终状态（观察到的结构材料）。
+
+    不贡献 evidence——它引用的是 stage 记录而非事件/产物 id；整条分区
+    也不参与预算裁剪（体量是行级，且它是多阶段草案的主要依据）。
+    """
+    lines = [f"# 执行路径（按执行先后，共 {len(stages)} 个阶段）"]
+    for i, st in enumerate(stages, 1):
+        state = _STAGE_STATE_LABELS.get(st.observed_state.value, st.observed_state.value)
+        lines.append(f"{i}. {stage_names.get(st.stage_id) or st.node_id}（{state}）")
+    return _Section("执行路径", "\n".join(lines))
+
+
+async def _stage_names(store: Any, task_id: str, stages: list[Any]) -> dict[str, str]:
+    """stage_id → 节点展示名。优先用 stage 上记的 node_name；缺失时回退
+    钉扎快照里的节点名；再缺就退回 node_id（如实，不编名字）。"""
+    snapshot_names: dict[str, str] = {}
+    task = await store.tasks.get_task(task_id)
+    if task is not None:
+        snapshot_names = {n.node_id: n.name for n in task.graph_snapshot.graph.nodes}
+    return {
+        st.stage_id: st.node_name or snapshot_names.get(st.node_id) or st.node_id
+        for st in stages
+    }
 
 
 def _extract_input(events: list[dict[str, Any]]) -> tuple[str, int | None]:
@@ -266,6 +415,7 @@ def _extract_tool_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if type_ == EventType.ATTEMPT_TOOL_USE.value:
             call = {
                 "event_id": int(row["event_id"]),
+                "stage_id": row["stage_id"],  # 供多 stage 任务按阶段分组
                 "tool_name": payload.get("tool_name"),
                 "target": payload.get("target"),
                 "is_error": None,

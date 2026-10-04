@@ -18,12 +18,15 @@ from workerbee.data.redact import redact_text
 pytestmark = pytest.mark.unit
 
 
-async def _append(store, type_: EventType, payload: dict, *, task_id: str = "t1") -> int:
+async def _append(
+    store, type_: EventType, payload: dict, *, task_id: str = "t1", stage_id: str | None = None
+) -> int:
     return await store.events.append(
         scope=EventScope.ATTEMPT,
         type=type_,
         scope_id="at1",
         task_id=task_id,
+        stage_id=stage_id,
         payload=payload,
     )
 
@@ -167,6 +170,128 @@ async def test_usage_is_summarized_without_zero_fill(store):
     assert material.usage["input_tokens"] == 100
     assert material.usage["attempts"] == 1
     assert material.usage["duration_s"] == 0.0
+
+
+# ===========================================================================
+# 多 stage 任务：分组与执行路径（从既有任务补捕获的主要材料形态）
+# ===========================================================================
+
+
+async def _two_stage_task(store, task_id: str = "t1") -> None:
+    """建一个 A→B 两阶段的任务：扫描（完成）→ 汇总（失败）。"""
+    from datetime import timedelta
+
+    from tests.conftest import make_stage, make_task
+    from workerbee.core.domain import utcnow
+    from workerbee.core.domain.task import StageState
+
+    base = utcnow()
+    await store.tasks.create_task_with_stages(
+        make_task(task_id=task_id),
+        [
+            make_stage(
+                stage_id="s1", task_id=task_id, node_id="A", node_name="扫描",
+                observed_state=StageState.SUCCEEDED, enqueued_at=base,
+            ),
+            make_stage(
+                stage_id="s2", task_id=task_id, node_id="B", node_name="汇总",
+                observed_state=StageState.FAILED, enqueued_at=base + timedelta(seconds=1),
+            ),
+        ],
+    )
+
+
+async def test_multi_stage_material_groups_by_stage_and_lists_execution_path(store):
+    """多 stage 任务：新增「执行路径」分区；工具调用与产物按阶段分组。"""
+    await _two_stage_task(store)
+    await _append(store, EventType.ATTEMPT_INPUT, {"user_input": "扫描并汇总"}, stage_id="s1")
+    await _append(
+        store, EventType.ATTEMPT_TOOL_USE,
+        {"tool_name": "Bash", "tool_use_id": "tu-1", "target": "ls"}, stage_id="s1",
+    )
+    await _append(
+        store, EventType.ATTEMPT_TOOL_USE,
+        {"tool_name": "Write", "tool_use_id": "tu-2", "target": "out.md"}, stage_id="s2",
+    )
+    art = await _put_artifact(store, "## 执行计划\n1. 扫描\n2. 汇总", task_id="t1")
+    # 这份产物是 s2 阶段产出的
+    await store.db.execute(
+        "UPDATE artifact SET producer_stage_id='s2' WHERE artifact_id=?", (art.artifact_id,)
+    )
+
+    material = await assemble_material(store, "t1")
+
+    assert material.stage_count == 2
+    # 执行路径：按执行先后列出节点名与最终状态（观察到的结构材料）
+    assert "# 执行路径" in material.text
+    assert "1. 扫描（完成）" in material.text
+    assert "2. 汇总（失败）" in material.text
+    # 执行路径排在工具调用序列之前
+    assert material.text.index("# 执行路径") < material.text.index("# 工具调用序列")
+    # 工具调用按阶段分组，每组带节点名；全局序号保住时间序语义
+    tool_text = material.text.split("# 工具调用序列")[1]
+    assert '## 阶段「扫描」' in tool_text
+    assert '## 阶段「汇总」' in tool_text
+    assert tool_text.index("扫描") < tool_text.index("汇总")
+    assert "1. [E" in tool_text and "2. [E" in tool_text
+    # 产物也按产出阶段分组
+    artifact_text = material.text.split("# 产物")[1]
+    assert '## 阶段「汇总」' in artifact_text
+    assert material.artifact_count == 1
+    assert material.has_plan is True
+
+
+async def test_single_stage_material_has_no_execution_path(store):
+    """单 stage 任务行为不变：没有执行路径分区，工具/产物不分组。"""
+    from tests.conftest import make_stage, make_task
+
+    await store.tasks.create_task_with_stages(make_task(), [make_stage()])
+    await _append(store, EventType.ATTEMPT_INPUT, {"user_input": "任务"}, stage_id="s1")
+    await _append(
+        store, EventType.ATTEMPT_TOOL_USE,
+        {"tool_name": "Bash", "tool_use_id": "tu-1"}, stage_id="s1",
+    )
+    material = await assemble_material(store, "t1")
+    assert material.stage_count == 1
+    assert "执行路径" not in material.text
+    assert "阶段「" not in material.text
+
+
+async def test_grouped_trimming_still_revokes_evidence_of_dropped_calls(store):
+    """分组后裁剪规则不变：被丢的调用行连同其 evidence 一起撤出，
+    整组丢空时组标题也去掉（不留没有内容的误导性标题）。"""
+    await _two_stage_task(store)
+    await _append(store, EventType.ATTEMPT_INPUT, {"user_input": "任务"}, stage_id="s1")
+    dropped_refs = []
+    for i in range(30):
+        eid = await _append(
+            store, EventType.ATTEMPT_TOOL_USE,
+            # 长 target 让每行都很贵：小预算下整组必然被丢，测试不依赖微妙的长度巧合
+            {"tool_name": f"Old{i}", "tool_use_id": f"tu-old-{i}", "target": f"/old{i}" + "x" * 100},
+            stage_id="s1",
+        )
+        dropped_refs.append(f"E{eid}")
+    kept_refs = []
+    for i in range(3):
+        eid = await _append(
+            store, EventType.ATTEMPT_TOOL_USE,
+            {"tool_name": f"New{i}", "tool_use_id": f"tu-new-{i}", "target": f"/new{i}"},
+            stage_id="s2",
+        )
+        kept_refs.append(f"E{eid}")
+
+    material = await assemble_material(store, "t1", budget_chars=300)
+
+    assert material.total_chars <= 300
+    assert any("工具调用序列" in t for t in material.trimmed)
+    # 最早的一组（扫描）整组被丢：标题不残留，其事件不再是可引用证据
+    assert "阶段「扫描」" not in material.text
+    evidence = material.evidence_set()
+    assert not any(ref in evidence for ref in dropped_refs)
+    # 保住最近的行为：汇总组的调用与证据都在
+    assert "阶段「汇总」" in material.text
+    assert "New2" in material.text
+    assert any(ref in evidence for ref in kept_refs)
 
 
 # ===========================================================================
