@@ -200,6 +200,39 @@ async def test_capture_repository_roundtrip_and_cas(store):
     assert await store.capture.capture_workflow_ids() == {"w1"}
 
 
+async def test_from_task_run_does_not_hide_source_workflow(store):
+    """origin='from_task' 的 run 关联的是用户的真实流程：capture_workflow_ids
+    只认 live 的临时流程，绝不能把真实流程从流程列表里藏起来（迁移 11）。"""
+    live = await store.capture.create_run(
+        run_id="r-live", name="实时", workflow_id="w-temp", task_id=None, profile={}
+    )
+    assert live["origin"] == "live"
+    from_task = await store.capture.create_run(
+        run_id="r-ft", name="补捕获", workflow_id="w-real", task_id="t9",
+        profile={}, origin="from_task",
+    )
+    assert from_task["origin"] == "from_task"
+    assert (await store.capture.get_run("r-ft"))["origin"] == "from_task"
+    assert await store.capture.capture_workflow_ids() == {"w-temp"}
+
+
+async def test_list_tasks_has_attempts_filter(store):
+    """「有执行记录」= 至少一次 attempt；没有任何 attempt 的任务被过滤掉。"""
+    from tests.conftest import make_stage, make_task
+    from workerbee.core.domain.task import Attempt
+
+    await store.tasks.create_task_with_stages(make_task(task_id="t-run"), [make_stage(task_id="t-run")])
+    await store.tasks.create_attempt(
+        Attempt(stage_id="s1", task_id="t-run", node_id="A", attempt_seq=1, profile_id="p1")
+    )
+    await store.tasks.create_task_with_stages(make_task(task_id="t-idle"), [])
+
+    all_ids = {t.task_id for t in await store.tasks.list_tasks()}
+    assert all_ids == {"t-run", "t-idle"}
+    with_attempts = {t.task_id for t in await store.tasks.list_tasks(has_attempts=True)}
+    assert with_attempts == {"t-run"}
+
+
 # ===========================================================================
 # 捕获执行入口（临时 Workflow + 发射走注入的钩子）
 # ===========================================================================

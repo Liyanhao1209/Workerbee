@@ -735,12 +735,14 @@ class TaskService(_Service):
         *,
         workflow_id: str | None = None,
         state: TaskState | None = None,
+        has_attempts: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> S.TaskListResponse:
         tasks = await self.store.tasks.list_tasks(
             workflow_id=workflow_id,
             states=[state] if state else None,
+            has_attempts=has_attempts,
             limit=limit,
             offset=offset,
         )

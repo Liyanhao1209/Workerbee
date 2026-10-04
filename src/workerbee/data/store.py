@@ -715,6 +715,7 @@ class TaskRepository:
         *,
         workflow_id: str | None = None,
         states: Iterable[TaskState] | None = None,
+        has_attempts: bool = False,
         limit: int = 200,
         offset: int = 0,
     ) -> list[Task]:
@@ -728,6 +729,10 @@ class TaskRepository:
             state_list = list(states)
             clauses.append(f"observed_state IN ({','.join('?' * len(state_list))})")
             params.extend(s.value for s in state_list)
+        if has_attempts:
+            # 「有执行记录」= 至少一次 attempt（补捕获选任务用：没有执行记录
+            # 的任务没有材料可以捕获）。
+            clauses.append("EXISTS (SELECT 1 FROM attempt WHERE attempt.task_id = task.task_id)")
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
@@ -1674,13 +1679,17 @@ class CaptureRepository:
         workflow_id: str,
         task_id: str | None,
         profile: dict[str, Any],
+        origin: str = "live",
     ) -> dict[str, Any]:
+        """落一条 run 台账。``origin`` 见迁移 11：live（临时流程跑一遍）/
+        from_task（关联既有任务，workflow_id 是任务所属的真实流程）。"""
+        assert origin in ("live", "from_task")
         now = utcnow().isoformat()
         await self.db.execute(
             """INSERT INTO capture_run(run_id, name, workflow_id, task_id, profile,
-                   status, created_at, updated_at)
-               VALUES (?,?,?,?,?, 'running', ?,?)""",
-            (run_id, name, workflow_id, task_id, dumps(profile), now, now),
+                   status, origin, created_at, updated_at)
+               VALUES (?,?,?,?,?, 'running', ?, ?,?)""",
+            (run_id, name, workflow_id, task_id, dumps(profile), origin, now, now),
         )
         return {
             "run_id": run_id,
@@ -1689,6 +1698,7 @@ class CaptureRepository:
             "task_id": task_id,
             "profile": profile,
             "status": "running",
+            "origin": origin,
             "created_at": now,
             "updated_at": now,
         }
@@ -1718,9 +1728,12 @@ class CaptureRepository:
         )
 
     async def capture_workflow_ids(self) -> set[str]:
-        """全部捕获专用 Workflow 的 id。流程列表默认据此把它们藏起来——
-        它们是为跑捕获任务而建的临时定义，不是用户要管理的流程。"""
-        rows = await self.db.fetch_all("SELECT DISTINCT workflow_id FROM capture_run")
+        """捕获专用（origin='live'）临时 Workflow 的 id。流程列表默认据此把它们
+        藏起来——它们是为跑捕获任务而建的临时定义，不是用户要管理的流程。
+        from_task 的 run 关联的是用户的真实流程，绝不能藏（迁移 11）。"""
+        rows = await self.db.fetch_all(
+            "SELECT DISTINCT workflow_id FROM capture_run WHERE origin='live'"
+        )
         return {r["workflow_id"] for r in rows}
 
     # ---- draft ----
@@ -1806,6 +1819,7 @@ class CaptureRepository:
             "task_id": row["task_id"],
             "profile": loads(row["profile"], {}),
             "status": row["status"],
+            "origin": row["origin"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

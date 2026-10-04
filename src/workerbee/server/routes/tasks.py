@@ -40,11 +40,12 @@ async def list_tasks(
     services: ServicesDep,
     workflow_id: str | None = None,
     state: TaskState | None = None,
+    has_attempts: bool = False,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> S.TaskListResponse:
     return await services.tasks.list_tasks(
-        workflow_id=workflow_id, state=state, limit=limit, offset=offset
+        workflow_id=workflow_id, state=state, has_attempts=has_attempts, limit=limit, offset=offset
     )
 
 

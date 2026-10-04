@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -528,6 +528,19 @@ CREATE TABLE IF NOT EXISTS capture_draft (
     FOREIGN KEY (run_id) REFERENCES capture_run(run_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_capture_draft_run ON capture_draft(run_id, created_at);
+""",
+    ),
+    (
+        11,
+        """
+-- 「从既有任务补捕获」（WF-03 的补捕获入口）：run 不再只由「捕获专用临时
+-- Workflow 的一次实时执行」产生，也可以直接关联一个**已经跑过**的任务。
+-- origin 区分两种来源：
+--   live      —— 建临时 Workflow 真实跑一遍（workflow_id 是临时定义）；
+--   from_task —— 关联既有任务（workflow_id 是任务所属的真实流程，仅作信息
+--                关联）。流程列表的「隐藏捕获专用流程」只认 origin='live'，
+--                否则会把用户的真实流程从列表里误藏起来。
+ALTER TABLE capture_run ADD COLUMN origin TEXT NOT NULL DEFAULT 'live';
 """,
     ),
 ]
