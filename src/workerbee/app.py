@@ -18,6 +18,7 @@ from typing import Any, NamedTuple, Sequence
 from pydantic import Field
 
 from .executables import resolve as resolve_executable
+from .paths import default_data_dir
 from .core.domain.base import DomainModel
 from .core.domain.registry import HarnessRegistration
 from .core.domain.workflow import RevisionSource, WorkflowDefinition, WorkflowStatus
@@ -72,7 +73,10 @@ _BUILTIN_HARNESSES: tuple[_BuiltinHarness, ...] = (
 class EngineConfig(DomainModel):
     """启动参数。全部有合理默认值，`workerbee-core` 开箱即跑。"""
 
-    data_dir: Path = Path(".workerbee")
+    # 默认 ``~/.workerbee``（v0.03 起）：相对路径会随启动目录漂移，
+    # 换个目录启动就凭空另起一套库。default_factory 让它在每次构造时求值，
+    # 而不是钉死在 import 时刻。
+    data_dir: Path = Field(default_factory=default_data_dir)
     workspace_dir: Path | None = None
     """托管目录。资源台账只在这个范围内删除文件（RES-01 的安全底线）。"""
 

@@ -230,6 +230,7 @@ class Supervisor:
         self._write_locks: dict[int, asyncio.Lock] = {}
         self._server: asyncio.AbstractServer | None = None
         self._stopping = False
+        self._stopped = asyncio.Event()
         self._heartbeat_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
@@ -256,7 +257,15 @@ class Supervisor:
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         print(f"[supervisor] 已就绪：{self.socket_path}", file=sys.stderr)
 
+    async def wait_stopped(self) -> None:
+        """等待 stop() 完成。socket 上的 shutdown 命令触发的是 stop() 本身，
+        进程入口靠这个事件得知「该退出了」——否则 RPC 关机后进程会停在原地空转。"""
+        await self._stopped.wait()
+
     async def stop(self) -> None:
+        # 幂等：shutdown 命令与信号可能同时到达，收束只做一次
+        if self._stopping:
+            return
         self._stopping = True
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
@@ -279,6 +288,7 @@ class Supervisor:
         await self.ledger.close()
         with contextlib.suppress(FileNotFoundError):
             self.socket_path.unlink()
+        self._stopped.set()
 
     async def _build_harness(self) -> Any:
         from ..adapters.host.router import HarnessRouter

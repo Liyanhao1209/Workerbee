@@ -91,7 +91,14 @@ Workerbee 的职责范围是编排。它不生成 prompt，不评价模型输出
 
 ## 安装与启动
 
-需要 Python ≥ 3.12、Node ≥ 20（用于构建前端）、Linux。
+需要 Python ≥ 3.12、Linux。从 PyPI 或 wheel 安装时前端产物已内嵌，不需要 Node：
+
+```bash
+pip install workerbee
+workerbee          # 一条命令：拉起 supervisor + 内核 + Web 界面，并打开浏览器
+```
+
+从源码安装：
 
 ```bash
 git clone <repo> workerbee && cd workerbee
@@ -100,19 +107,33 @@ git clone <repo> workerbee && cd workerbee
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 
-# 2) 前端构建产物（web/dist 不入库，需要构建一次）
+# 2) 前端构建产物（源码布局下 web/dist 需要构建一次）
 cd web && npm ci && npm run build && cd ..
 
 # 3) 环境检查，报告 claude / kimi 是否存在、数据目录是否可写
 .venv/bin/workerbee doctor
 
-# 4) 启动内核（未指定令牌时会随机生成并打印一次）
-.venv/bin/workerbee core --data-dir .workerbee
+# 4) 启动
+.venv/bin/workerbee
 ```
 
-浏览器打开 `http://127.0.0.1:8765`，在登录框填入上一步打印的令牌。
+`workerbee`（等价于 `workerbee serve`）会：
 
-跳过第 2 步时，内核会返回一页说明页，指出 `web/dist` 不存在，而不是返回空白页面。
+1. 复用已在运行的实例——数据目录 `~/.workerbee` 下有存活实例时直接打印带令牌的 URL 并打开浏览器，不重复启动；
+2. 否则自动拉起 `workerbee-supervisor`（持有 harness 子进程，内核重启不打断在跑任务），再启动内核与 Web 界面；
+3. 首次启动自动生成访问令牌，写入 `~/.workerbee/token`（权限 0600），此后查询类命令（`status` 等）自动读取，不再需要手动传 token。
+
+停止全部进程：
+
+```bash
+workerbee stop     # 优雅停止内核 + supervisor
+```
+
+跳过第 2 步（前端未构建）时，内核会返回一页说明页，指出 `web/dist` 不存在，而不是返回空白页面。
+
+> 从 v0.03 起数据目录默认为 `~/.workerbee`（此前是启动目录下的 `./.workerbee`）。
+> 如果旧目录存在且新目录不存在，启动时会打印迁移提示；Workerbee 不会自动搬移数据，
+> 按提示 `mv .workerbee ~/.workerbee` 即可，或显式加 `--data-dir .workerbee` 继续用旧目录。
 
 首次启动时数据目录为空，没有任何预置工作流。跑通第一条任务的步骤：
 
@@ -122,9 +143,9 @@ cd web && npm ci && npm run build && cd ..
 4. 校验通过后发布，然后在命令行提交任务：
 
 ```bash
-.venv/bin/workerbee workflow list --token <TOKEN>          # 取得 workflow_id
-.venv/bin/workerbee submit <WORKFLOW_ID> "把 README 里的拼写检查一遍" --token <TOKEN>
-.venv/bin/workerbee task show <TASK_ID> --token <TOKEN>    # 阶段、尝试、产物、审批
+.venv/bin/workerbee workflow list                          # 取得 workflow_id
+.venv/bin/workerbee submit <WORKFLOW_ID> "把 README 里的拼写检查一遍"
+.venv/bin/workerbee task show <TASK_ID>                    # 阶段、尝试、产物、审批
 ```
 
 工作流确认可用后，可以在「模板」页将其保存为模板复用。模板不携带凭据，实例化时需要重新绑定。
@@ -143,15 +164,18 @@ Workerbee 是单机应用，由一个数据目录和三个进程组成，不依�
 
 内核与 supervisor 通过数据目录中的 Unix socket（`<data-dir>/supervisor.sock`）通信，不占用端口。
 
-### 1. 构建前端
+### 1. 构建前端与打包
 
-`web/dist/` 已被 `.gitignore` 排除，因此每次部署都需要构建一次。如果发布流程中会产出制品包，可以将 `web/dist/` 一并打包，目标机器上就不需要安装 Node。
+`web/dist/` 已被 `.gitignore` 排除，但**会被 `force-include` 打进 wheel**——pip 安装的包内嵌前端产物，目标机器不需要安装 Node。
+
+发布制品时的构建顺序（先前端后打包，`web/dist` 不存在时打包直接失败）：
 
 ```bash
 cd web && npm ci && npm run build    # 输出到 web/dist/
+cd .. && python -m build             # wheel 内含 workerbee/web/dist
 ```
 
-内核按 `web/dist` 的位置查找静态资源；生产环境建议将其随包分发到固定路径。
+内核按三级回退查找静态资源：包内 `workerbee/web/dist` → 环境变量 `WORKERBEE_WEB_DIST` → 源码布局 `<repo>/web/dist`（开发态）。产物随包外单独部署时用 `WORKERBEE_WEB_DIST` 指定。
 
 ### 2. 常驻运行：systemd user service
 
@@ -230,13 +254,13 @@ systemctl --user status workerbee-core
 journalctl --user -u workerbee-core -f
 ```
 
-上面直接调用 `workerbee-core` 和 `workerbee-supervisor`，而非 `workerbee core` / `workerbee supervisor`。后两者是便捷包装，转发参数时不接受 `--adapter-commands` 和自定义 socket 路径。
+上面直接调用 `workerbee-core` 和 `workerbee-supervisor`，而非 `workerbee core` / `workerbee supervisor`。后两者是便捷包装，参数会原样转发（含 `--use-supervisor`、`--adapter-commands`、自定义 socket 路径）；常驻部署仍建议直接使用前者，减少一层转写。
 
 ### 3. 令牌与凭据
 
-- **访问令牌**：取值顺序为 `--token`、`$WORKERBEE_TOKEN`、随机生成并打印一次。上面的 unit 通过 `EnvironmentFile` 传入，令牌不会出现在 `ps` 输出中。
+- **访问令牌**：取值顺序为 `--token`、`$WORKERBEE_TOKEN`、`<data-dir>/token` 文件、随机生成并写入该文件（权限 0600）。`workerbee serve` 走完整优先级链并把令牌文件化，此后本机查询命令自动读取；上面的 systemd unit 通过 `EnvironmentFile` 传入，令牌不会出现在 `ps` 输出中。
 - **凭据库口令**：取值顺序为 `--passphrase`、`$WORKERBEE_PASSPHRASE`。口令错误不会报错，只是无法取得凭据，表现为节点报告「凭据不可用」。更换口令前需要先考虑已有内容的迁移。
-- 客户端 CLI 通过 `--token` 或 `$WORKERBEE_TOKEN` 鉴权，API 地址通过 `--api` 或 `$WORKERBEE_API` 指定。
+- 客户端 CLI 的令牌取值顺序同上（`--token`、`$WORKERBEE_TOKEN`、默认数据目录的令牌文件），API 地址通过 `--api` 或 `$WORKERBEE_API` 指定。
 
 ### 4. 数据目录与备份
 
@@ -247,6 +271,8 @@ journalctl --user -u workerbee-core -f
   workerbee.db-shm
   supervisor.db         # supervisor 的会话台账
   supervisor.sock       # 内核与 supervisor 之间的 Unix socket
+  core.lock             # serve 的实例锁（pid + 端口 + 启动时间），重复启动探测用
+  token                 # 访问令牌（权限 0600），CLI 查询命令自动读取
   secrets.vault         # 加密凭据库（密钥由口令派生）
   artifacts/            # 节点产出的产物文件
   workspace/            # 托管工作目录（清理器的操作边界）
@@ -271,7 +297,7 @@ tar czf /backup/workerbee-full-$(date +%F).tgz -C ~/.workerbee .
 存储占用可以随时查看，框架本身不强制清理：
 
 ```bash
-.venv/bin/workerbee storage --token <TOKEN>
+workerbee storage
 ```
 
 ### 5. 升级与回滚
@@ -423,17 +449,20 @@ workerbee-supervisor --data-dir ~/.workerbee \
 ## CLI 参考
 
 ```bash
-workerbee doctor                  # 环境检查（唯一不需要联网的命令）
-workerbee core | supervisor       # 启动（便捷包装，生产环境使用 workerbee-core / -supervisor）
-workerbee status | attention      # 内核状态 / 待处理清单
-workerbee submit <WF> "<输入>"     # 提交任务
+workerbee                           # 等价于 workerbee serve：单命令启动（默认拉起 supervisor）
+workerbee serve [--in-process]      # 同上；--in-process 为降级模式（core 重启会打断在跑任务）
+workerbee stop                      # 停止 core + supervisor
+workerbee doctor                    # 环境检查（唯一不需要联网的命令）
+workerbee core | supervisor         # 单独启动（便捷包装，生产环境使用 workerbee-core / -supervisor）
+workerbee status | attention        # 内核状态 / 待处理清单
+workerbee submit <WF> "<输入>"      # 提交任务
 workerbee task  list|show|pause|resume|delete
 workerbee workflow list|show|validate
-workerbee registry harnesses      # 已登记的 harness 及其能力探测结果
+workerbee registry harnesses        # 已登记的 harness 及其能力探测结果
 workerbee approvals | storage
 ```
 
-除 `doctor` 外都通过 HTTP 访问内核，需要 `--token`（或 `$WORKERBEE_TOKEN`）。加 `--json` 便于脚本处理。
+除 `doctor` 外都通过 HTTP 访问内核。令牌按 `--token` → `$WORKERBEE_TOKEN` → `~/.workerbee/token` 自动解析，一般无需手动传。加 `--json` 便于脚本处理。
 
 ## 开发
 

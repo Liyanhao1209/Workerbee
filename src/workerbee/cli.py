@@ -20,11 +20,11 @@ import typer
 
 from . import __version__
 from .executables import resolve as resolve_executable
+from .paths import default_data_dir, legacy_data_dir_notice, read_token_file
 
 app = typer.Typer(
     name="workerbee",
-    help="Workerbee —— 多 agent harness 协作 workflow 框架",
-    no_args_is_help=True,
+    help="Workerbee —— 多 agent harness 协作 workflow 框架。不带子命令时等价于 workerbee serve",
     add_completion=False,
 )
 registry_app = typer.Typer(help="共享配置注册表")
@@ -64,7 +64,14 @@ def _read_registrations(db: Path) -> list[dict[str, Any]] | None:
 def _client(base_url: str, token: str | None):
     from .client import ApiClient
 
-    return ApiClient(base_url, token=token or os.environ.get("WORKERBEE_TOKEN"))
+    # 令牌优先级：--token > $WORKERBEE_TOKEN > 默认数据目录的令牌文件（serve 落盘的）。
+    # 多数查询场景是「本机默认实例」，读到令牌文件就不再需要手动传 token。
+    resolved = (
+        token
+        or os.environ.get("WORKERBEE_TOKEN")
+        or read_token_file(default_data_dir())
+    )
+    return ApiClient(base_url, token=resolved)
 
 
 def _print(value: Any, *, as_json: bool = False) -> None:
@@ -75,6 +82,33 @@ def _print(value: Any, *, as_json: bool = False) -> None:
             typer.echo(f"{k}: {json.dumps(v, ensure_ascii=False, default=str)}")
     else:
         typer.echo(str(value))
+
+
+# ===========================================================================
+# 默认行为：裸 `workerbee` 等价于 `workerbee serve`
+# ===========================================================================
+
+
+@app.callback(invoke_without_command=True)
+def _default_command(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    from .serve import run_serve
+
+    raise typer.Exit(
+        code=run_serve(
+            data_dir=None,
+            host="127.0.0.1",
+            port=DEFAULT_PORT,
+            token=None,
+            passphrase=os.environ.get("WORKERBEE_PASSPHRASE"),
+            in_process=False,
+            open_browser=True,
+            stop_supervisor_on_exit=False,
+            no_reconcile=False,
+            adapter_commands=None,
+        )
+    )
 
 
 # ===========================================================================
@@ -90,13 +124,14 @@ def version() -> None:
 
 @app.command()
 def doctor(
-    data_dir: Path = typer.Option(Path(".workerbee"), "--data-dir"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
     api: str = typer.Option(DEFAULT_API, "--api"),
 ) -> None:
     """检查本机环境是否具备跑通 Workerbee 的条件。
 
     每一项都给出**可执行的结论**，而不是「未检测到」这种没用的输出。
     """
+    data_dir = data_dir or default_data_dir()
     ok = True
     typer.echo(f"workerbee {__version__}")
     typer.echo("")
@@ -205,8 +240,66 @@ def doctor(
 
 
 @app.command()
+def serve(
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(DEFAULT_PORT, "--port"),
+    token: Optional[str] = typer.Option(None, "--token"),
+    passphrase: Optional[str] = typer.Option(
+        None, "--passphrase", envvar="WORKERBEE_PASSPHRASE", help="凭据库口令"
+    ),
+    in_process: bool = typer.Option(
+        False, "--in-process",
+        help="不拉起 supervisor，由 core 自行托管会话（core 重启会打断在跑的任务）",
+    ),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="启动后自动打开浏览器"),
+    stop_supervisor_on_exit: bool = typer.Option(
+        False, "--stop-supervisor-on-exit",
+        help="core 退出时一并停止 supervisor（默认 supervisor 存活，供下次启动复用）",
+    ),
+    no_reconcile: bool = typer.Option(False, "--no-reconcile"),
+    adapter_commands: Optional[str] = typer.Option(
+        None, "--adapter-commands", help="传给 supervisor 的 adapter_id → 命令 JSON"
+    ),
+    supervisor_timeout: float = typer.Option(15.0, "--supervisor-timeout"),
+) -> None:
+    """单命令启动：已有实例直接复用；否则拉起 supervisor + core + Web 界面。
+
+    裸 ``workerbee``（不带子命令）等价于本命令。
+    """
+    from .serve import run_serve
+
+    raise typer.Exit(
+        code=run_serve(
+            data_dir=data_dir,
+            host=host,
+            port=port,
+            token=token,
+            passphrase=passphrase,
+            in_process=in_process,
+            open_browser=open_browser,
+            stop_supervisor_on_exit=stop_supervisor_on_exit,
+            no_reconcile=no_reconcile,
+            adapter_commands=adapter_commands,
+            supervisor_timeout=supervisor_timeout,
+        )
+    )
+
+
+@app.command()
+def stop(
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+    timeout: float = typer.Option(20.0, "--timeout", help="等待进程退出的秒数"),
+) -> None:
+    """停止 core（经实例锁发信号，优雅收束）并停止 supervisor。"""
+    from .serve import run_stop
+
+    raise typer.Exit(code=run_stop(data_dir=data_dir, timeout=timeout))
+
+
+@app.command()
 def core(
-    data_dir: Path = typer.Option(Path(".workerbee"), "--data-dir"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(DEFAULT_PORT, "--port"),
     token: Optional[str] = typer.Option(None, "--token", envvar="WORKERBEE_TOKEN"),
@@ -223,8 +316,14 @@ def core(
 
     直接转发给 `workerbee-core`；这里只做参数转写，避免两套参数解析漂移。
     """
+    explicit_data_dir = data_dir is not None
+    data_dir = data_dir or default_data_dir()
+    if not explicit_data_dir:
+        notice = legacy_data_dir_notice()
+        if notice:
+            typer.echo(f"[升级提示] {notice}", err=True)
+
     argv = [
-        "workerbee-core",
         "--data-dir", str(data_dir),
         "--host", host,
         "--port", str(port),
@@ -235,6 +334,8 @@ def core(
         argv += ["--passphrase", passphrase]
     if allow_remote:
         argv.append("--allow-remote")
+    if use_supervisor:
+        argv.append("--use-supervisor")
     if no_reconcile:
         argv.append("--no-reconcile")
 
@@ -245,12 +346,31 @@ def core(
 
 @app.command()
 def supervisor(
-    data_dir: Path = typer.Option(Path(".workerbee"), "--data-dir"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+    socket: Optional[Path] = typer.Option(
+        None, "--socket", help="Unix socket 路径，默认 <data-dir>/supervisor.sock"
+    ),
+    adapter_commands: Optional[str] = typer.Option(
+        None, "--adapter-commands",
+        help='adapter_id → 命令的 JSON，例如 \'{"mock":["python","-m","workerbee.adapters.mock.main"]}\'',
+    ),
 ) -> None:
     """启动 Session 托管进程（独立于内核，持有 harness 子进程）。"""
     from .supervisor.main import main as supervisor_main
 
-    sys.argv = ["workerbee-supervisor", "--data-dir", str(data_dir)]
+    explicit_data_dir = data_dir is not None
+    data_dir = data_dir or default_data_dir()
+    if not explicit_data_dir:
+        notice = legacy_data_dir_notice()
+        if notice:
+            typer.echo(f"[升级提示] {notice}", err=True)
+
+    argv = ["workerbee-supervisor", "--data-dir", str(data_dir)]
+    if socket:
+        argv += ["--socket", str(socket)]
+    if adapter_commands:
+        argv += ["--adapter-commands", adapter_commands]
+    sys.argv = argv
     supervisor_main()
 
 

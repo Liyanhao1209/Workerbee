@@ -33,7 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
     p.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
-    p.add_argument("--data-dir", default=".workerbee", help="数据目录")
+    p.add_argument(
+        "--data-dir", default=None, help="数据目录（默认 ~/.workerbee）"
+    )
     p.add_argument("--workspace-dir", default=None, help="托管目录（资源清理的边界）")
     p.add_argument(
         "--allow-remote",
@@ -191,6 +193,14 @@ async def run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.data_dir is None:
+        from ..paths import default_data_dir, legacy_data_dir_notice
+
+        notice = legacy_data_dir_notice()
+        if notice:
+            print(f"[升级提示] {notice}", file=sys.stderr)
+        args.data_dir = str(default_data_dir())
 
     if args.host not in _LOOPBACK_HOSTS and not args.allow_remote:
         # 不静默放宽：要么显式表态，要么改回 loopback

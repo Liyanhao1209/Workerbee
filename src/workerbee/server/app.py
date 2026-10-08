@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -28,13 +30,31 @@ from .ws import router as ws_router
 
 __all__ = ["create_app", "static_dir", "explanation_page"]
 
-#: 前端构建产物的默认位置：仓库根下的 ``web/dist``。
+#: 前端构建产物的位置按三级回退解析（见 ``static_dir``）。
 #: 网关只做托管，不参与构建——产物不存在时返回解释页而不是 404（UI-04）。
-_DIST = Path(__file__).resolve().parents[3] / "web" / "dist"
 
 
 def static_dir() -> Path:
-    return _DIST
+    """前端构建产物的查找路径，三级回退：
+
+    1. 包内 ``workerbee/web/dist``——wheel 打包时随包分发，pip 安装即得；
+    2. 环境变量 ``WORKERBEE_WEB_DIST``——产物随包外单独部署的场景。
+       显式设置了但指向不存在的目录时如实警告并继续回退，不静默忽略；
+    3. 源码布局 ``<repo>/web/dist``——开发态。
+    """
+    packaged = Path(__file__).resolve().parents[1] / "web" / "dist"
+    if packaged.is_dir():
+        return packaged
+    env = os.environ.get("WORKERBEE_WEB_DIST")
+    if env:
+        candidate = Path(env).expanduser()
+        if candidate.is_dir():
+            return candidate
+        print(
+            f"[web] WORKERBEE_WEB_DIST 指向的目录不存在：{candidate}，继续按默认位置查找",
+            file=sys.stderr,
+        )
+    return Path(__file__).resolve().parents[3] / "web" / "dist"
 
 
 def create_app(engine: Any, *, token: str, allow_remote: bool = False) -> FastAPI:
@@ -163,8 +183,10 @@ def explanation_page(*, dist: Path) -> HTMLResponse:
 <body>
 <h1>Workerbee 内核正在运行</h1>
 <p>这里本该是前端界面，但构建产物不存在：<code>{dist}</code></p>
-<p>网关不参与前端构建。要看到界面，请在仓库根目录执行：</p>
-<pre>cd web &amp;&amp; npm install &amp;&amp; npm run build</pre>
+<p>网关不参与前端构建。源码部署时，请在仓库根目录执行：</p>
+<pre>cd web &amp;&amp; npm ci &amp;&amp; npm run build</pre>
+<p>若通过 pip 安装，请使用内嵌前端产物的 wheel，或用环境变量
+<code>WORKERBEE_WEB_DIST</code> 指向产物目录。</p>
 <p>构建完成后刷新本页即可。</p>
 <p>接口契约（OpenAPI）：<a href="/api/docs">/api/docs</a>；
 健康探针：<a href="/api/health">/api/health</a>。
