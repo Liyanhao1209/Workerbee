@@ -19,6 +19,7 @@ import type { TaskState, WorkflowDefinition, WorkflowDeleteResponse } from '../a
 import { tasks as taskApi, workflows as workflowApi } from '../api/endpoints';
 import { asArray, asString, asTaskState, isRecord } from '../api/guards';
 import { useAsync, useSubmit } from '../hooks/useAsync';
+import { useWorkspace } from '../store/workspace';
 import {
   Banner,
   Chip,
@@ -75,12 +76,21 @@ type FormTarget = { mode: 'create' } | { mode: 'edit'; workflow: WorkflowDefinit
 
 export function WorkflowListPage(): JSX.Element {
   const navigate = useNavigate();
+  // 顶栏的工作区筛选：'' 表示全部（不往后端发这个参数）。
+  const currentWs = useWorkspace((s) => s.currentId);
+  const wsParam = currentWs === '' ? undefined : currentWs;
 
-  const fetchWorkflows = useCallback((_signal: AbortSignal) => workflowApi.list(), []);
-  const { data, loading, error, loaded, reload } = useAsync(fetchWorkflows, []);
+  const fetchWorkflows = useCallback(
+    (_signal: AbortSignal) => workflowApi.list({ workspace_id: wsParam }),
+    [wsParam],
+  );
+  const { data, loading, error, loaded, reload } = useAsync(fetchWorkflows, [wsParam]);
 
-  const fetchTasks = useCallback((_signal: AbortSignal) => taskApi.list(), []);
-  const { data: taskPage, error: taskError, reload: reloadTasks } = useAsync(fetchTasks, []);
+  const fetchTasks = useCallback(
+    (_signal: AbortSignal) => taskApi.list({ workspace_id: wsParam }),
+    [wsParam],
+  );
+  const { data: taskPage, error: taskError, reload: reloadTasks } = useAsync(fetchTasks, [wsParam]);
 
   const [form, setForm] = useState<FormTarget | null>(null);
   const [deleting, setDeleting] = useState<WorkflowDefinition | null>(null);
@@ -362,6 +372,7 @@ export function WorkflowListPage(): JSX.Element {
         <WorkflowFormModal
           mode={form.mode}
           workflow={form.mode === 'edit' ? form.workflow : null}
+          createWorkspaceId={wsParam}
           onClose={() => setForm(null)}
           onSaved={handleSaved}
         />
@@ -488,11 +499,14 @@ function DeleteResultBody({ result }: { result: WorkflowDeleteResponse }): JSX.E
 function WorkflowFormModal({
   mode,
   workflow,
+  createWorkspaceId,
   onClose,
   onSaved,
 }: {
   mode: 'create' | 'edit';
   workflow: WorkflowDefinition | null;
+  /** 新建时归入的工作区（顶栏筛选的当前值）；undefined = 默认工作区。 */
+  createWorkspaceId?: string;
   onClose: () => void;
   onSaved: (saved: WorkflowDefinition) => void;
 }): JSX.Element {
@@ -525,11 +539,17 @@ function WorkflowFormModal({
     }
     setFormError(null);
 
-    const body: { name: string; description: string | null; max_concurrent_tasks?: number } = {
+    const body: {
+      name: string;
+      description: string | null;
+      max_concurrent_tasks?: number;
+      workspace_id?: string;
+    } = {
       name: trimmedName,
       description: description.trim() === '' ? null : description.trim(),
     };
     if (parsedMax !== null) body.max_concurrent_tasks = parsedMax;
+    if (workflowId === null && createWorkspaceId) body.workspace_id = createWorkspaceId;
 
     const saved = await submit.run(() =>
       workflowId === null ? workflowApi.create(body) : workflowApi.patch(workflowId, body),

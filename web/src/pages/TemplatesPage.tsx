@@ -395,7 +395,7 @@ function CreateTemplateModal({
   onClose: () => void;
   onSaved: () => void;
 }): JSX.Element {
-  const workflows = useAsync(workflowApi.list, []);
+  const workflows = useAsync((_signal: AbortSignal) => workflowApi.list(), []);
   const [fromWorkflowId, setFromWorkflowId] = useState('');
   const [fromRevision, setFromRevision] = useState('');
   const [name, setName] = useState('');

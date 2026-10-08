@@ -15,6 +15,7 @@ import { useConnection } from '../store/connection';
 import { attentionCount, useAttention, wireAttention } from '../store/attention';
 import { wireAssistant } from '../store/assistant';
 import { hostingDescription, useSystem, wireSystem } from '../store/system';
+import { useWorkspace, wireWorkspace } from '../store/workspace';
 import { AssistantPanel } from './AssistantPanel';
 import { AttentionDrawer } from './AttentionDrawer';
 import { Banner } from './common';
@@ -50,6 +51,7 @@ export function AppShell(): JSX.Element {
     wireAttention();
     wireAssistant();
     wireSystem();
+    wireWorkspace();
     void check();
     const timer = window.setInterval(() => {
       if (useConnection.getState().kernel !== 'ok') void check();
@@ -97,6 +99,7 @@ export function AppShell(): JSX.Element {
           ))}
         </nav>
         <div className="topbar__right">
+          <WorkspaceSwitcher />
           {systemStatus ? (
             <span
               className={hosting.variant === 'ok' ? 'pill pill--success' : 'pill pill--warn'}
@@ -216,6 +219,47 @@ export function AppShell(): JSX.Element {
         </button>
       )}
     </div>
+  );
+}
+
+function WorkspaceSwitcher(): JSX.Element | null {
+  const workspaces = useWorkspace((s) => s.workspaces);
+  const currentId = useWorkspace((s) => s.currentId);
+  const loaded = useWorkspace((s) => s.loaded);
+  const error = useWorkspace((s) => s.error);
+  const setCurrent = useWorkspace((s) => s.setCurrent);
+
+  // 读取失败不能静默消失成「没有工作区这个概念」——如实挂一枚警示徽标。
+  if (error) {
+    return (
+      <span className="pill pill--warn" title={error.detail}>
+        工作区读取失败
+      </span>
+    );
+  }
+  if (!loaded) return null;
+
+  const current = workspaces.find((w) => w.workspace_id === currentId);
+  return (
+    <select
+      className="select select--sm"
+      value={currentId}
+      onChange={(e) => setCurrent(e.target.value)}
+      title={
+        current
+          ? `当前工作区：${current.name}（${current.root_dir}）`
+          : '工作区筛选：列表页只显示所选工作区的流程与任务'
+      }
+      aria-label="工作区筛选"
+    >
+      <option value="">全部工作区</option>
+      {workspaces.map((w) => (
+        <option key={w.workspace_id} value={w.workspace_id}>
+          {w.name}
+          {w.archived ? '（已归档）' : ''}
+        </option>
+      ))}
+    </select>
   );
 }
 

@@ -84,6 +84,7 @@ class FakeHarness:
                 "initial_input": initial_input,
                 "permission_mode": permission_mode,
                 "credential_ref": credential_ref,
+                "cwd": cwd,
                 "extra": extra,
                 "stage_id": stage.stage_id,
                 "node_id": stage.node_id,

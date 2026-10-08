@@ -20,10 +20,14 @@ async def list_workflows(
     services: ServicesDep,
     include_deleted: bool = False,
     include_capture: bool = False,
+    workspace_id: str | None = None,
 ) -> S.WorkflowListResponse:
-    """捕获专用的临时 Workflow 默认不出现在列表里；``include_capture=true`` 可见。"""
+    """捕获专用的临时 Workflow 默认不出现在列表里；``include_capture=true`` 可见。
+    ``workspace_id`` 按工作区过滤（v0.03 §3）。"""
     return await services.workflows.list_workflows(
-        include_deleted=include_deleted, include_capture=include_capture
+        include_deleted=include_deleted,
+        include_capture=include_capture,
+        workspace_id=workspace_id,
     )
 
 
@@ -57,6 +61,18 @@ async def patch_workflow(
 )
 async def delete_workflow(services: ServicesDep, workflow_id: str) -> S.WorkflowDeleteResponse:
     return await services.workflows.delete_workflow(workflow_id)
+
+
+@router.post(
+    "/api/workflows/{workflow_id}/move",
+    response_model=S.WorkflowResponse,
+    responses={409: {"model": S.ErrorResponse, "description": "目标工作区已归档"}},
+    summary="迁移流程到另一个工作区（D-B）",
+)
+async def move_workflow(
+    services: ServicesDep, workflow_id: str, req: S.WorkflowMoveRequest
+) -> S.WorkflowResponse:
+    return await services.workspaces.move_workflow(workflow_id, req)
 
 
 # ---- 修订 ----

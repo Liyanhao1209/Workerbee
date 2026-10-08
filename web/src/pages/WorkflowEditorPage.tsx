@@ -25,6 +25,7 @@ import { registry as registryApi, workflows as workflowApi } from '../api/endpoi
 import { ApiError } from '../api/client';
 import { emptyGraph, emptyGraphSpec, newLocalId } from '../api/guards';
 import { useAsync, useSubmit } from '../hooks/useAsync';
+import { useWorkspace } from '../store/workspace';
 import { CanvasFocus, WorkflowCanvas } from '../graph/WorkflowCanvas';
 import { NodeInspector } from '../components/NodeInspector';
 import { DiagnosticsGrouped, type DiagnosticTarget } from '../components/Diagnostics';
@@ -61,6 +62,14 @@ export function WorkflowEditorPage(): JSX.Element {
   const skills = useAsync(fetchSkills, []);
   const tools = useAsync(fetchTools, []);
   const save = useSubmit();
+
+  // 所属工作区（v0.03 §3）。工作区列表还没读到时按 id 前 8 位如实显示，不猜名字。
+  const workspaceList = useWorkspace((s) => s.workspaces);
+  const workspaceName = useMemo(() => {
+    const id = workflow.data?.workspace_id;
+    if (!id) return null;
+    return workspaceList.find((w) => w.workspace_id === id)?.name ?? `工作区 ${id.slice(0, 8)}`;
+  }, [workspaceList, workflow.data?.workspace_id]);
 
   // ------------------------------ 本地草稿 ------------------------------
   const [draft, setDraft] = useState<GraphSpec | null>(null);
@@ -313,6 +322,7 @@ export function WorkflowEditorPage(): JSX.Element {
               {dirty ? <span className="chip chip--warn">有未保存的改动</span> : null}
             </h1>
             <div className="page-head__sub">
+              {workspaceName ? <>{workspaceName}{' · '}</> : null}
               修订 #{baseSeq ?? '—'}
               {baseRevision ? (
                 <>

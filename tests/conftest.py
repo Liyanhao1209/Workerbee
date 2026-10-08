@@ -101,6 +101,9 @@ def make_approval(**overrides: Any) -> Approval:
 async def store(tmp_path: Path) -> Any:
     s = await Store.open(str(tmp_path / "workerbee.db"))
     s.artifacts.root = tmp_path / "artifacts"
+    # 默认工作区必须在场：发射路径会校验 workflow 的归属（迁移 12 之后
+    # workflow.workspace_id 一律指向某个工作区，缺行是显式失败而不是放行）。
+    await s.workspaces.ensure_default(root_dir=str((tmp_path / "workspace").resolve()))
     yield s
     await s.close()
 

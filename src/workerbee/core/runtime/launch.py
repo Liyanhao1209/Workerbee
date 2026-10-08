@@ -26,7 +26,15 @@ from ..graph.derive import derive
 from ..graph.validate import ValidationMode, ValidationReport, validate
 from ...data.event_log import EventActor, EventScope, EventType
 
-__all__ = ["LaunchResult", "LaunchRejected", "launch_task", "to_actor"]
+__all__ = ["LaunchResult", "LaunchRejected", "WorkspaceArchived", "launch_task", "to_actor"]
+
+
+class WorkspaceArchived(ValueError):
+    """流程所属的工作区已归档：不可发射新任务（v0.03 §3）。
+
+    继承 ``ValueError`` 让既有「内核拒绝 → 400」的兜底仍然成立；
+    服务层单独识别它返回 409——请求合法，是资源的当前状态拒绝这次发射。
+    """
 
 
 def to_actor(name: str) -> EventActor:  # noqa: D401
@@ -81,6 +89,19 @@ async def launch_task(
     if not allow_unpublished and workflow.status.value != "published":
         raise ValueError(
             f"Workflow「{workflow.name}」尚未发布；草稿不能发射任务（WF-01）"
+        )
+
+    # 归档工作区的流程冻结：在途任务跑完即止，新任务一律拒绝（显式失败）。
+    # 工作区行不存在（坏引用）同样拒绝——去一个说不清的目录跑 agent 不是可接受的降级。
+    workspace = await store.workspaces.get(workflow.workspace_id)
+    if workspace is None:
+        raise ValueError(
+            f"Workflow「{workflow.name}」引用的工作区不存在: {workflow.workspace_id}"
+        )
+    if workspace["archived"]:
+        raise WorkspaceArchived(
+            f"Workflow「{workflow.name}」所属的工作区「{workspace['name']}」已归档，"
+            f"不接受新任务"
         )
 
     revision = await store.workflows.get_current_revision(workflow_id)

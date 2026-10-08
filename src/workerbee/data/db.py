@@ -231,6 +231,7 @@ class Database:
             "message",
             "event_log",
             "approval",
+            "workspace",
         ]
         counts: dict[str, int] = {}
         for t in tables:

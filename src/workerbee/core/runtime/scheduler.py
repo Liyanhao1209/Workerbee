@@ -171,6 +171,7 @@ class Scheduler:
         notifier: Any | None = None,
         config: SchedulerConfig | None = None,
         node_cwd: str | None = None,
+        cwd_resolver: Any | None = None,
     ) -> None:
         self.store = store
         self.sm = sm
@@ -181,6 +182,10 @@ class Scheduler:
         self.notifier = notifier
         self.config = config or SchedulerConfig()
         self.node_cwd = node_cwd
+        #: 按 workflow 解析节点工作目录（v0.03 §3：workflow → workspace.root_dir）。
+        #: None 表示沿用全局 ``node_cwd``（旧行为）。解析失败必须显式失败，
+        #: 不能悄悄在进程当前目录里跑。
+        self.cwd_resolver = cwd_resolver
 
         self._runtimes: dict[str, AttemptRuntime] = {}
         self._stop = asyncio.Event()
@@ -511,6 +516,22 @@ class Scheduler:
         )
 
         session = None
+        # 工作目录按 workflow → workspace.root_dir 解析（v0.03 §3）。
+        # 解析失败（例如流程引用的工作区行不存在）必须显式失败：在错误的目录里
+        # 跑 agent 比不跑更糟——它会在那里读写文件。
+        cwd = self.node_cwd
+        if self.cwd_resolver is not None:
+            try:
+                cwd = await self.cwd_resolver(fresh_task.workflow_id) or self.node_cwd
+            except Exception as exc:  # noqa: BLE001 - 任何解析失败都要变成阶段失败
+                await self._fail_stage(
+                    fresh_task,
+                    fresh_stage,
+                    f"工作目录解析失败：{type(exc).__name__}: {exc}",
+                    retryable=False,
+                    error_kind="workspace",
+                )
+                return True
         try:
             session = await asyncio.wait_for(
                 self.harness.create_session(
@@ -528,7 +549,7 @@ class Scheduler:
                     # 节点候选上的凭据引用，优先于 harness 登记时的 auth_binding。
                     # 不传的话候选上的选择会被静默忽略——用户以为换了身份，实际没有。
                     credential_ref=profile.credential_ref,
-                    cwd=self.node_cwd,
+                    cwd=cwd,
                     extra=extra,
                 ),
                 timeout=self.config.dispatch_timeout,
@@ -678,6 +699,7 @@ class Scheduler:
                 "model": profile.model_name,
                 "harness": profile.harness_ref,
                 "session_ref": session.session_ref,
+                "cwd": cwd,
                 "resumed": session.used_resume,
                 "context_degraded": context.degraded,
                 "context_tokens": context.token_estimate,

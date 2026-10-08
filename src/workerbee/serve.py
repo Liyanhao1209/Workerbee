@@ -7,6 +7,7 @@ core 的启动链路不变，本模块只负责「按正确顺序调用现有入
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import os
@@ -26,6 +27,7 @@ from .paths import default_data_dir, legacy_data_dir_notice, read_token_file, re
 __all__ = [
     "LOCK_NAME",
     "SUPERVISOR_SOCK_NAME",
+    "WORKSPACE_CURRENT_KEY",
     "lock_path",
     "read_lock",
     "write_lock",
@@ -38,6 +40,9 @@ __all__ = [
     "socket_live",
     "spawn_supervisor",
     "wait_for_supervisor",
+    "match_workspace",
+    "unique_workspace_name",
+    "resolve_serve_workspace",
     "run_serve",
     "run_stop",
 ]
@@ -51,6 +56,79 @@ SUPERVISOR_READY_TIMEOUT = 15.0
 
 #: 停 core / 等 supervisor 退出的上限。
 STOP_TIMEOUT = 20.0
+
+#: meta_kv 里记录「最近一次 serve 匹配/注册的工作区」的键。前端首次打开、
+#: 本地尚无记忆时以它为默认选择（见 WorkspaceListResponse.current_workspace_id）。
+WORKSPACE_CURRENT_KEY = "serve.current_workspace"
+
+
+# ---------------------------------------------------------------------------
+# 工作区匹配与注册（v0.03 §3、D-B）
+# ---------------------------------------------------------------------------
+
+
+def match_workspace(rows: list[dict[str, Any]], path: str) -> dict[str, Any] | None:
+    """cwd → 工作区：根目录的最长前缀匹配。
+
+    ``rows`` 的 root_dir 与 ``path`` 都必须是已规范化的绝对路径（resolve 后）。
+    根为文件系统根（``/``）时匹配一切——它本来就包含所有路径。
+    """
+    best: dict[str, Any] | None = None
+    for row in rows:
+        root = row["root_dir"]
+        if root == os.sep:
+            matched = path.startswith(root)
+        else:
+            matched = path == root or path.startswith(root + os.sep)
+        if matched and (best is None or len(root) > len(best["root_dir"])):
+            best = row
+    return best
+
+
+def unique_workspace_name(existing_names: set[str], base: str) -> str:
+    """目录名撞车时追加序号：``proj`` → ``proj 2`` → ``proj 3``…"""
+    if base not in existing_names:
+        return base
+    n = 2
+    while f"{base} {n}" in existing_names:
+        n += 1
+    return f"{base} {n}"
+
+
+async def resolve_serve_workspace(data_dir: Path, cwd: Path) -> dict[str, Any]:
+    """serve 启动时的工作区归位：把 cwd 匹配到工作区，匹配不到就注册一个。
+
+    返回 ``{"workspace": <行>, "created": <bool>}``，并把结果写进 meta_kv
+    （``WORKSPACE_CURRENT_KEY``）供 API 层读——前端据此做首次定位。
+
+    匹配不到时的自动注册是**显式**的：banner 会如实说出「已注册新工作区」，
+    不会静默把任务落到进程目录（红线：cwd 解析失败显式失败，但这里不是失败——
+    是显式注册）。
+    """
+    from .data.store import Store
+
+    store = await Store.open(str(data_dir / "workerbee.db"))
+    try:
+        await store.workspaces.ensure_default(
+            root_dir=str((data_dir / "workspace").resolve())
+        )
+        resolved = str(Path(cwd).expanduser().resolve())
+        rows = await store.workspaces.list(include_archived=True)
+        hit = match_workspace(rows, resolved)
+        created = False
+        if hit is None:
+            base = Path(resolved).name or "workspace"
+            name = unique_workspace_name({r["name"] for r in rows}, base)
+            hit = await store.workspaces.create(name=name, root_dir=resolved)
+            created = True
+        await store.db.execute(
+            "INSERT INTO meta_kv(k, v, updated_at) VALUES (?,?,?)"
+            " ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
+            (WORKSPACE_CURRENT_KEY, hit["workspace_id"], _now_iso()),
+        )
+        return {"workspace": hit, "created": created}
+    finally:
+        await store.close()
 
 
 def _now_iso() -> str:
@@ -266,6 +344,7 @@ def run_serve(
     no_reconcile: bool,
     adapter_commands: str | None,
     supervisor_timeout: float = SUPERVISOR_READY_TIMEOUT,
+    cwd: Path | None = None,
 ) -> int:
     explicit_data_dir = data_dir is not None
     data_dir = Path(data_dir) if data_dir else default_data_dir()
@@ -274,6 +353,22 @@ def run_serve(
         if notice:
             print(f"[升级提示] {notice}", file=sys.stderr)
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 0. 工作区归位（v0.03 §3）：cwd 匹配到工作区，匹配不到就显式注册一个。
+    #    失败只降级为警告，不阻断启动——core 起来后仍会确保默认工作区存在。
+    try:
+        info = asyncio.run(resolve_serve_workspace(data_dir, cwd or Path.cwd()))
+        ws = info["workspace"]
+        note = "（已注册新工作区）" if info["created"] else ""
+        if ws["archived"]:
+            note += "（已归档：其下流程冻结，不可发射新任务）"
+        print(f"[workspace] 当前工作区：{ws['name']}（{ws['root_dir']}）{note}")
+    except Exception as exc:  # noqa: BLE001 - 工作区归位失败不阻断启动，但必须可见
+        print(
+            f"[workspace] 工作区匹配/注册失败（{type(exc).__name__}: {exc}），"
+            f"本次启动不记录当前工作区；core 仍会使用默认工作区",
+            file=sys.stderr,
+        )
 
     # 1. 实例探测
     status, lock = probe_instance(data_dir, host)

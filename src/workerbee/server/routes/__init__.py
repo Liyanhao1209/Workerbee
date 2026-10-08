@@ -6,16 +6,28 @@
 
 from __future__ import annotations
 
-from . import approvals, assistant, capture, nodes, registry, system, tasks, templates, workflows
+from . import (
+    approvals,
+    assistant,
+    capture,
+    nodes,
+    registry,
+    system,
+    tasks,
+    templates,
+    workflows,
+    workspaces,
+)
 
 __all__ = [
     "ROUTERS", "approvals", "assistant", "capture", "nodes", "registry", "system",
-    "tasks", "templates", "workflows",
+    "tasks", "templates", "workflows", "workspaces",
 ]
 
 #: 注册顺序即匹配顺序：更具体的路径在前。
 ROUTERS = [
     system.router,
+    workspaces.router,
     workflows.router,
     nodes.router,
     tasks.router,

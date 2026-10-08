@@ -202,6 +202,9 @@ class WorkflowDefinition(Entity):
     max_concurrent_tasks: int = 8
     """该 Workflow 并发任务上限（容量不足时的背压入口，D-03）。"""
 
+    workspace_id: str = "default"
+    """所属工作区（v0.03 §3）。任务执行的工作目录由它解析到 workspace.root_dir。"""
+
     def is_usable(self) -> bool:
         """可用 = 已发布且未被逻辑删除。AI-02 判定助手引用的 Workflow 是否可用。"""
         return self.status == WorkflowStatus.PUBLISHED

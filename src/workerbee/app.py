@@ -193,6 +193,9 @@ class Engine:
             store.artifacts.root = cfg.artifact_root()
 
         engine = cls(cfg, store)
+        # 默认工作区与删除边界必须在台账投入使用之前就位（RES-01）。
+        await engine._ensure_default_workspace()
+        await engine.refresh_managed_roots()
         engine.harness = harness if harness is not None else await engine._build_harness()
         # 台账只负责「何时调、失败了怎么办」，真正的关闭动作在适配层（RES-01）。
         # 这条装配漏掉不会有任何报错：每一次会话清理都失败，资源停在
@@ -550,6 +553,45 @@ class Engine:
 
         self.store.artifacts.put = guarded_put  # type: ignore[assignment]
 
+    # ---- 工作区（v0.03 §3） ----
+
+    async def _ensure_default_workspace(self) -> None:
+        """幂等补齐默认工作区：存量库升级后全部旧 workflow 已归到 ``default``
+        （迁移 12 的列默认值），这一行必须存在，否则它们的 cwd 无处可解析。
+
+        初值来源：``node_cwd``（若显式配置），否则托管目录 ``resolved_workspace()``
+        ——与迁移前「节点在 node_cwd/进程目录里跑」的语义对齐（D-B）。
+        """
+        base = Path(self.config.node_cwd) if self.config.node_cwd else self.config.resolved_workspace()
+        await self.store.workspaces.ensure_default(root_dir=str(base.resolve()))
+
+    async def refresh_managed_roots(self) -> None:
+        """把台账的删除边界刷成「托管目录 + 全部未归档工作区的根」（RES-01）。
+
+        工作区的增删/归档都改变这个集合，所以它不是启动时的一次性常量，
+        而是每次工作区变更后由服务层显式刷新。
+        """
+        roots = {self.config.resolved_workspace().resolve()}
+        for root in await self.store.workspaces.list_active_roots():
+            roots.add(Path(root).resolve())
+        self.ledger.managed_roots = sorted(roots)
+
+    async def _resolve_node_cwd(self, workflow_id: str) -> str | None:
+        """派发时按 workflow → workspace.root_dir 解析节点工作目录。
+
+        工作区行缺失是显式失败（调度器会把阶段判为失败并写明原因），
+        不是悄悄退回进程当前目录——agent 会在那里读写文件。
+        归档不拦截：归档冻结的是**新任务**（发射路径拦），在途任务仍在
+        原目录跑完，不留半截工作。
+        """
+        wf = await self.store.workflows.get(workflow_id)
+        if wf is None:
+            return str(self.config.node_cwd) if self.config.node_cwd else None
+        ws = await self.store.workspaces.get(wf.workspace_id)
+        if ws is None:
+            raise LookupError(f"Workflow 引用的工作区不存在: {wf.workspace_id}")
+        return ws["root_dir"]
+
     async def _build_pipeline(self) -> None:
         """装配上下文组装器与摘要器。"""
         llm = None
@@ -585,6 +627,7 @@ class Engine:
             notifier=self.notifier,
             config=SchedulerConfig(poll_interval=self.config.poll_interval),
             node_cwd=str(self.config.node_cwd) if self.config.node_cwd else None,
+            cwd_resolver=self._resolve_node_cwd,
         )
         self.reaper = Reaper(
             store=self.store,

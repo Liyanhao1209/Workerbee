@@ -79,6 +79,12 @@ __all__ = [
     "WorkflowListResponse",
     "WorkflowCreateRequest",
     "WorkflowPatchRequest",
+    "WorkspaceResponse",
+    "WorkspaceListResponse",
+    "WorkspaceCreateRequest",
+    "WorkspacePatchRequest",
+    "WorkspaceDeleteResponse",
+    "WorkflowMoveRequest",
     "RevisionResponse",
     "RevisionListResponse",
     "RevisionSaveRequest",
@@ -559,8 +565,58 @@ class WorkflowResponse(ApiResponse):
     current_revision_seq: int = 0
     status: WorkflowStatus
     max_concurrent_tasks: int = 8
+    workspace_id: str = "default"
     created_at: str | None = None
     updated_at: str | None = None
+
+
+# ===========================================================================
+# 工作区（v0.03 §3）
+# ===========================================================================
+
+
+class WorkspaceResponse(ApiResponse):
+    """一个工作区。root_dir 是 resolve 后的绝对路径，全系统唯一。"""
+
+    workspace_id: str
+    name: str
+    root_dir: str
+    archived: bool = False
+    """已归档：其下的流程冻结（不可发射新任务），目录移出资源清理边界。"""
+    created_at: str
+
+
+class WorkspaceListResponse(ApiResponse):
+    workspaces: list[WorkspaceResponse] = Field(default_factory=list)
+    returned: int = 0
+    current_workspace_id: str | None = None
+    """最近一次 ``workerbee serve`` 匹配/注册的工作区。前端首次打开、
+    本地尚无记忆时以它为默认选择；之后以本地选择为准。"""
+
+
+class WorkspaceCreateRequest(ApiRequest):
+    name: str
+    root_dir: str
+    """工作区根目录。resolve 后必须是一个已存在的目录，且全局唯一。"""
+
+
+class WorkspacePatchRequest(ApiRequest):
+    """局部更新：改名 / 归档 / 取消归档。root_dir 不可改——改根等于换一个工作区。"""
+
+    name: str | None = None
+    archived: bool | None = None
+
+
+class WorkspaceDeleteResponse(ApiResponse):
+    workspace_id: str
+    deleted: bool
+    note: str | None = None
+
+
+class WorkflowMoveRequest(ApiRequest):
+    """改归属（D-B）。目标工作区必须存在且未归档。"""
+
+    workspace_id: str
 
 
 class WorkflowListResponse(ApiResponse):
@@ -572,6 +628,8 @@ class WorkflowCreateRequest(ApiRequest):
     name: str
     description: str | None = None
     max_concurrent_tasks: int = Field(default=8, ge=1)
+    workspace_id: str | None = None
+    """所属工作区。省略时归默认工作区；指定时目标必须存在且未归档。"""
 
 
 class WorkflowPatchRequest(ApiRequest):

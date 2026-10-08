@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 from typing import Any
 
 from ..app import Engine
@@ -43,17 +44,20 @@ from ..core.domain import (
 from ..core.domain.task import StageState
 from ..core.domain.template import MissingBinding, Template, TemplateKind
 from ..core.graph.validate import ValidationMode, ValidationReport, validate
+from ..core.runtime.launch import WorkspaceArchived
 from ..assistant import AssistantConfig, AssistantError
 from ..assistant.draft import DraftInvalid, DraftProposal, proposal_graph
 from ..capture import CaptureError
 from ..data.db import ConflictError
 from ..data.event_log import EventActor, EventScope, EventType
+from ..data.store import DEFAULT_WORKSPACE_ID
 from . import schemas as S
 
 __all__ = [
     "ServiceError",
     "NotFound",
     "BadRequest",
+    "Conflict",
     "RevisionConflict",
     "SubmissionRejected",
     "Services",
@@ -87,6 +91,16 @@ class NotFound(ServiceError):
 
 class BadRequest(ServiceError):
     status_code = 400
+
+
+class Conflict(ServiceError):
+    """资源状态冲突（409）：目标工作区已归档、目录被占用、删除时仍有流程等。
+
+    与 ``RevisionConflict`` 的区别：后者专指修订 CAS，响应携带最新版本；
+    本类是通用的「当前状态下该操作不成立」，响应只带 detail + hint。
+    """
+
+    status_code = 409
 
 
 class SubmissionRejected(ServiceError):
@@ -498,9 +512,15 @@ class WorkflowService(_Service):
     """定义层用例。发明确不在内核，故在此实现；修订的不可变性由仓储保证。"""
 
     async def list_workflows(
-        self, *, include_deleted: bool = False, include_capture: bool = False
+        self,
+        *,
+        include_deleted: bool = False,
+        include_capture: bool = False,
+        workspace_id: str | None = None,
     ) -> S.WorkflowListResponse:
-        items = await self.store.workflows.list(include_deleted=include_deleted)
+        items = await self.store.workflows.list(
+            include_deleted=include_deleted, workspace_id=workspace_id
+        )
         if not include_capture:
             # 捕获专用 Workflow 是为跑捕获任务建的临时定义，不进默认列表；
             # 关联关系在 capture_run 表，不给 workflow 加列。
@@ -511,18 +531,35 @@ class WorkflowService(_Service):
         )
 
     async def create_workflow(self, req: S.WorkflowCreateRequest) -> S.WorkflowResponse:
+        workspace_id = req.workspace_id or DEFAULT_WORKSPACE_ID
+        workspace = await self.store.workspaces.get(workspace_id)
+        if workspace is None:
+            raise NotFound(
+                f"工作区不存在: {workspace_id}",
+                hint="先到工作区列表确认 id；省略 workspace_id 时归入默认工作区",
+            )
+        if workspace["archived"]:
+            raise Conflict(
+                f"工作区「{workspace['name']}」已归档，不能在其中新建流程",
+                hint="取消归档，或把流程建到未归档的工作区",
+            )
         wf = WorkflowDefinition(
             name=req.name,
             description=req.description,
             max_concurrent_tasks=req.max_concurrent_tasks,
             status=WorkflowStatus.DRAFT,
+            workspace_id=workspace_id,
         )
         await self.store.workflows.create(wf)
         await self._event(
             EventType.WORKFLOW_CREATED,
             scope=EventScope.WORKFLOW,
             scope_id=wf.workflow_id,
-            payload={"name": wf.name, "max_concurrent_tasks": wf.max_concurrent_tasks},
+            payload={
+                "name": wf.name,
+                "max_concurrent_tasks": wf.max_concurrent_tasks,
+                "workspace_id": workspace_id,
+            },
         )
         return _workflow_out(wf)
 
@@ -716,6 +753,11 @@ class TaskService(_Service):
                 idempotency_key=req.idempotency_key,
                 priority=req.priority,
             )
+        except WorkspaceArchived as exc:
+            # 归档冻结发射（D-B）：409 而不是 400——流程本身没问题，是工作区当前状态不允许
+            raise Conflict(
+                str(exc), hint="把工作区取消归档，或把流程迁移到未归档的工作区"
+            ) from exc
         except ValueError as exc:  # noqa: BLE001 - 未发布／已删除等显式拒绝
             raise BadRequest(str(exc)) from exc
 
@@ -734,6 +776,7 @@ class TaskService(_Service):
         self,
         *,
         workflow_id: str | None = None,
+        workspace_id: str | None = None,
         state: TaskState | None = None,
         has_attempts: bool = False,
         limit: int = 50,
@@ -741,6 +784,7 @@ class TaskService(_Service):
     ) -> S.TaskListResponse:
         tasks = await self.store.tasks.list_tasks(
             workflow_id=workflow_id,
+            workspace_id=workspace_id,
             states=[state] if state else None,
             has_attempts=has_attempts,
             limit=limit,
@@ -1886,6 +1930,143 @@ class CaptureService(_Service):
 
 
 # ===========================================================================
+# 工作区（v0.03 §3）
+# ===========================================================================
+
+
+class WorkspaceService(_Service):
+    """工作区的组织与删除安全边界（D-B）。
+
+    - 归档不硬删任何数据：流程保留、任务保留，只是冻结新发射并移出资源清理边界。
+    - 删除前先迁移流程：仍有流程归属的工作区返回 409，引导先 move。
+    - root_dir 全局唯一（resolve 后）：冲突返回 409 而不是另指一个目录。
+    """
+
+    async def list_workspaces(self) -> S.WorkspaceListResponse:
+        rows = await self.store.workspaces.list(include_archived=True)
+        current = await self.store.db.fetch_value(
+            "SELECT v FROM meta_kv WHERE k=?", ("serve.current_workspace",), default=None
+        )
+        return S.WorkspaceListResponse(
+            workspaces=[S.WorkspaceResponse.model_validate(r) for r in rows],
+            returned=len(rows),
+            current_workspace_id=str(current) if current else None,
+        )
+
+    async def get_workspace(self, workspace_id: str) -> S.WorkspaceResponse:
+        return S.WorkspaceResponse.model_validate(await self._require_workspace(workspace_id))
+
+    async def create_workspace(self, req: S.WorkspaceCreateRequest) -> S.WorkspaceResponse:
+        name = req.name.strip()
+        if not name:
+            raise BadRequest("工作区名不能为空。")
+        root = Path(req.root_dir).expanduser().resolve()
+        if not root.is_dir():
+            raise BadRequest(
+                f"根目录不存在或不是目录: {root}",
+                hint="先在磁盘上建好目录，再注册为工作区",
+            )
+        try:
+            row = await self.store.workspaces.create(name=name, root_dir=str(root))
+        except ConflictError as exc:
+            raise Conflict(str(exc), hint="同一目录只允许注册一个工作区") from exc
+        await self.engine.refresh_managed_roots()
+        await self._event(
+            EventType.WORKSPACE_CREATED,
+            scope=EventScope.WORKSPACE,
+            scope_id=row["workspace_id"],
+            payload={"name": row["name"], "root_dir": row["root_dir"]},
+        )
+        return S.WorkspaceResponse.model_validate(row)
+
+    async def patch_workspace(
+        self, workspace_id: str, req: S.WorkspacePatchRequest
+    ) -> S.WorkspaceResponse:
+        await self._require_workspace(workspace_id)
+        fields = req.model_dump(exclude_unset=True, exclude_none=True)
+        if not fields:
+            raise BadRequest("没有需要更新的字段")
+        if "name" in fields:
+            fields["name"] = str(fields["name"]).strip()
+            if not fields["name"]:
+                raise BadRequest("工作区名不能为空。")
+        ok = await self.store.workspaces.update(workspace_id, **fields)
+        if not ok:
+            raise NotFound(f"工作区不存在: {workspace_id}")
+        if "archived" in fields:
+            # 归档边界变化会改变资源清理边界（RES-01）：立即刷新 managed_roots
+            await self.engine.refresh_managed_roots()
+        await self._event(
+            EventType.WORKSPACE_UPDATED,
+            scope=EventScope.WORKSPACE,
+            scope_id=workspace_id,
+            payload={"fields": sorted(fields)},
+        )
+        return S.WorkspaceResponse.model_validate(await self._require_workspace(workspace_id))
+
+    async def archive_workspace(self, workspace_id: str) -> S.WorkspaceResponse:
+        return await self.patch_workspace(workspace_id, S.WorkspacePatchRequest(archived=True))
+
+    async def delete_workspace(self, workspace_id: str) -> S.WorkspaceDeleteResponse:
+        await self._require_workspace(workspace_id)
+        if workspace_id == DEFAULT_WORKSPACE_ID:
+            raise BadRequest(
+                "默认工作区不可删除",
+                hint="它是存量流程的归属兜底；不想用的话可以改名或归档",
+            )
+        count = await self.store.workspaces.count_workflows(workspace_id)
+        if count > 0:
+            raise Conflict(
+                f"工作区下仍有 {count} 个流程，不能删除",
+                hint="先把这些流程迁移到其他工作区（POST /api/workflows/{id}/move），再删除",
+            )
+        await self.store.workspaces.delete(workspace_id)
+        await self.engine.refresh_managed_roots()
+        await self._event(
+            EventType.WORKSPACE_DELETED,
+            scope=EventScope.WORKSPACE,
+            scope_id=workspace_id,
+            payload={"workspace_id": workspace_id},
+        )
+        return S.WorkspaceDeleteResponse(
+            workspace_id=workspace_id,
+            deleted=True,
+            note="工作区记录已删除；其目录与历史任务数据均未触碰",
+        )
+
+    async def move_workflow(
+        self, workflow_id: str, req: S.WorkflowMoveRequest
+    ) -> S.WorkflowResponse:
+        """改归属（D-B）。目标工作区必须存在且未归档。"""
+        wf = await self._require_workflow(workflow_id)
+        target = await self.store.workspaces.get(req.workspace_id)
+        if target is None:
+            raise NotFound(f"工作区不存在: {req.workspace_id}")
+        if target["archived"]:
+            raise Conflict(
+                f"目标工作区「{target['name']}」已归档，不能迁入流程",
+                hint="取消归档后再迁移，或换一个未归档的工作区",
+            )
+        await self.store.workflows.move_to_workspace(workflow_id, req.workspace_id)
+        await self._event(
+            EventType.WORKFLOW_MOVED,
+            scope=EventScope.WORKFLOW,
+            scope_id=workflow_id,
+            payload={
+                "from_workspace_id": wf.workspace_id,
+                "to_workspace_id": req.workspace_id,
+            },
+        )
+        return _workflow_out(await self._require_workflow(workflow_id))
+
+    async def _require_workspace(self, workspace_id: str) -> dict[str, Any]:
+        row = await self.store.workspaces.get(workspace_id)
+        if row is None:
+            raise NotFound(f"工作区不存在: {workspace_id}")
+        return row
+
+
+# ===========================================================================
 # 容器
 # ===========================================================================
 
@@ -1904,6 +2085,7 @@ class Services:
         self.approvals = ApprovalService(engine)
         self.assistant = AssistantService(engine)
         self.capture = CaptureService(engine)
+        self.workspaces = WorkspaceService(engine)
 
 
 # ===========================================================================
@@ -1999,6 +2181,7 @@ def _workflow_out(wf: WorkflowDefinition) -> S.WorkflowResponse:
         current_revision_seq=wf.current_revision_seq,
         status=wf.status,
         max_concurrent_tasks=wf.max_concurrent_tasks,
+        workspace_id=wf.workspace_id,
         created_at=_iso(wf.created_at),
         updated_at=_iso(wf.updated_at),
     )

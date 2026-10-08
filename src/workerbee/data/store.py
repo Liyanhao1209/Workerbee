@@ -58,7 +58,14 @@ __all__ = [
     "ApprovalRepository",
     "AssistantRepository",
     "CaptureRepository",
+    "WorkspaceRepository",
+    "DEFAULT_WORKSPACE_ID",
+    "DEFAULT_WORKSPACE_NAME",
 ]
+
+#: 默认工作区的固定 id 与初始名。存量库升级时全部旧 workflow 归到它名下（D-B）。
+DEFAULT_WORKSPACE_ID = "default"
+DEFAULT_WORKSPACE_NAME = "默认工作区"
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -87,8 +94,8 @@ class WorkflowRepository:
     async def create(self, wf: WorkflowDefinition) -> WorkflowDefinition:
         await self.db.execute(
             """INSERT INTO workflow(workflow_id, name, description, current_revision_seq,
-                   status, max_concurrent_tasks, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                   status, max_concurrent_tasks, workspace_id, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (
                 wf.workflow_id,
                 wf.name,
@@ -96,6 +103,7 @@ class WorkflowRepository:
                 wf.current_revision_seq,
                 wf.status.value,
                 wf.max_concurrent_tasks,
+                wf.workspace_id,
                 wf.created_at.isoformat(),
                 wf.updated_at.isoformat(),
             ),
@@ -108,13 +116,21 @@ class WorkflowRepository:
         )
         return self._to_workflow(row) if row else None
 
-    async def list(self, *, include_deleted: bool = False) -> list[WorkflowDefinition]:
-        if include_deleted:
-            rows = await self.db.fetch_all("SELECT * FROM workflow ORDER BY created_at")
-        else:
-            rows = await self.db.fetch_all(
-                "SELECT * FROM workflow WHERE status != 'deleted' ORDER BY created_at"
-            )
+    async def list(
+        self, *, include_deleted: bool = False, workspace_id: str | None = None
+    ) -> list[WorkflowDefinition]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if not include_deleted:
+            clauses.append("status != 'deleted'")
+        if workspace_id:
+            clauses.append("workspace_id=?")
+            params.append(workspace_id)
+        sql = "SELECT * FROM workflow"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at"
+        rows = await self.db.fetch_all(sql, params)
         return [self._to_workflow(r) for r in rows]
 
     async def update(
@@ -143,6 +159,16 @@ class WorkflowRepository:
     async def get_name(self, workflow_id: str) -> str | None:
         return await self.db.fetch_value(
             "SELECT name FROM workflow WHERE workflow_id=?", (workflow_id,)
+        )
+
+    async def move_to_workspace(self, workflow_id: str, workspace_id: str) -> bool:
+        """改归属（D-B 的改归属操作）。目标存在性与未归档校验在服务层。"""
+        return (
+            await self.db.execute_rowcount(
+                "UPDATE workflow SET workspace_id=?, updated_at=? WHERE workflow_id=?",
+                (workspace_id, datetime.now().astimezone().isoformat(), workflow_id),
+            )
+            > 0
         )
 
     # ---- revision ----
@@ -249,6 +275,7 @@ class WorkflowRepository:
             current_revision_seq=row["current_revision_seq"],
             status=WorkflowStatus(row["status"]),
             max_concurrent_tasks=row["max_concurrent_tasks"],
+            workspace_id=row["workspace_id"],
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),
         )
@@ -716,6 +743,7 @@ class TaskRepository:
         workflow_id: str | None = None,
         states: Iterable[TaskState] | None = None,
         has_attempts: bool = False,
+        workspace_id: str | None = None,
         limit: int = 200,
         offset: int = 0,
     ) -> list[Task]:
@@ -725,6 +753,12 @@ class TaskRepository:
         if workflow_id:
             clauses.append("workflow_id=?")
             params.append(workflow_id)
+        if workspace_id:
+            # 任务经 workflow 间接归属工作区（迁移 12：运行时表不加 workspace 列）
+            clauses.append(
+                "workflow_id IN (SELECT workflow_id FROM workflow WHERE workspace_id=?)"
+            )
+            params.append(workspace_id)
         if states:
             state_list = list(states)
             clauses.append(f"observed_state IN ({','.join('?' * len(state_list))})")
@@ -1156,6 +1190,147 @@ class TaskRepository:
 
 
 # ===========================================================================
+# 工作区（迁移 12，v0.03 §3）
+# ===========================================================================
+
+
+class WorkspaceRepository:
+    """工作区注册表。返回普通字典——字段集就是表结构本身（同 AssistantRepository 惯例）。
+
+    ``root_dir`` 一律存 resolve 后的绝对路径，全表唯一：匹配与 cwd 解析都依赖
+    「同一目录只注册一次」这个不变量。
+    """
+
+    _UPDATABLE = {"name", "archived"}
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def create(
+        self,
+        *,
+        name: str,
+        root_dir: str,
+        workspace_id: str | None = None,
+        archived: bool = False,
+    ) -> dict[str, Any]:
+        from ..core.domain.base import new_id
+
+        wid = workspace_id or new_id()
+        now = datetime.now().astimezone().isoformat()
+        try:
+            await self.db.execute(
+                """INSERT INTO workspace(workspace_id, name, root_dir, created_at, archived)
+                   VALUES (?,?,?,?,?)""",
+                (wid, name, root_dir, now, 1 if archived else 0),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError(f"工作区根目录已被注册: {root_dir}") from exc
+        return {
+            "workspace_id": wid,
+            "name": name,
+            "root_dir": root_dir,
+            "archived": archived,
+            "created_at": now,
+        }
+
+    async def ensure_default(self, *, root_dir: str) -> dict[str, Any]:
+        """幂等补齐默认工作区（D-B）。存量库升级后所有旧 workflow 已指向
+        ``default``，这一行必须存在，否则它们的 cwd 无处可解析。
+
+        根目录被另一个工作区占用时是显式失败而不是另指一个根——那会让
+        「default 工作区是哪个目录」变成一笔糊涂账。
+        """
+        existing = await self.get(DEFAULT_WORKSPACE_ID)
+        if existing is not None:
+            return existing
+        owner = await self.get_by_root(root_dir)
+        if owner is not None:
+            raise ConflictError(
+                f"默认工作区的根目录 {root_dir} 已被工作区「{owner['name']}」占用，"
+                f"无法创建默认工作区；请先处理该工作区"
+            )
+        return await self.create(
+            workspace_id=DEFAULT_WORKSPACE_ID, name=DEFAULT_WORKSPACE_NAME, root_dir=root_dir
+        )
+
+    async def get(self, workspace_id: str) -> dict[str, Any] | None:
+        row = await self.db.fetch_one(
+            "SELECT * FROM workspace WHERE workspace_id=?", (workspace_id,)
+        )
+        return self._to_row(row) if row else None
+
+    async def get_by_root(self, root_dir: str) -> dict[str, Any] | None:
+        row = await self.db.fetch_one(
+            "SELECT * FROM workspace WHERE root_dir=?", (root_dir,)
+        )
+        return self._to_row(row) if row else None
+
+    async def list(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
+        if include_archived:
+            rows = await self.db.fetch_all("SELECT * FROM workspace ORDER BY created_at")
+        else:
+            rows = await self.db.fetch_all(
+                "SELECT * FROM workspace WHERE archived=0 ORDER BY created_at"
+            )
+        return [self._to_row(r) for r in rows]
+
+    async def update(self, workspace_id: str, **fields: Any) -> bool:
+        """白名单更新（name / archived）。root_dir 不可改：改根等于换一个工作区。"""
+        sets: list[str] = []
+        params: list[Any] = []
+        for k, v in fields.items():
+            if k not in self._UPDATABLE:
+                raise ValueError(f"不可更新的工作区字段: {k}")
+            sets.append(f"{k}=?")
+            params.append(int(v) if isinstance(v, bool) else v)
+        if not sets:
+            return True
+        params.append(workspace_id)
+        return (
+            await self.db.execute_rowcount(
+                f"UPDATE workspace SET {', '.join(sets)} WHERE workspace_id=?", params
+            )
+            > 0
+        )
+
+    async def delete(self, workspace_id: str) -> bool:
+        return (
+            await self.db.execute_rowcount(
+                "DELETE FROM workspace WHERE workspace_id=?", (workspace_id,)
+            )
+            > 0
+        )
+
+    async def count_workflows(self, workspace_id: str) -> int:
+        """归属该工作区的流程数（不含已删除定义）——删除工作区前的占用检查。"""
+        return int(
+            await self.db.fetch_value(
+                "SELECT COUNT(*) FROM workflow WHERE workspace_id=? AND status != 'deleted'",
+                (workspace_id,),
+                default=0,
+            )
+        )
+
+    async def list_active_roots(self) -> list[str]:
+        """所有未归档工作区的根目录——managed_roots 的来源（RES-01 的删除边界）。"""
+        rows = await self.db.fetch_all(
+            "SELECT root_dir FROM workspace WHERE archived=0 ORDER BY created_at"
+        )
+        return [r["root_dir"] for r in rows]
+
+    @staticmethod
+    def _to_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "workspace_id": row["workspace_id"],
+            "name": row["name"],
+            "root_dir": row["root_dir"],
+            "archived": bool(row["archived"]),
+            "created_at": row["created_at"],
+        }
+
+
+# ===========================================================================
 # 资源台账与审批
 # ===========================================================================
 
@@ -1432,7 +1607,7 @@ class AssistantRepository:
             if k not in self._THREAD_UPDATABLE:
                 raise ValueError(f"不可更新的助手线程字段: {k}")
             sets.append(f"{k}=?")
-            params.append(1 if isinstance(v, bool) else v)
+            params.append(int(v) if isinstance(v, bool) else v)
         if not sets:
             return True
         sets.append("updated_at=?")
@@ -1520,7 +1695,7 @@ class AssistantRepository:
             if k not in self._MESSAGE_UPDATABLE:
                 raise ValueError(f"不可更新的助手消息字段: {k}")
             sets.append(f"{k}=?")
-            params.append(1 if isinstance(v, bool) else v)
+            params.append(int(v) if isinstance(v, bool) else v)
         if not sets:
             return True
         params.append(message_id)
@@ -1927,6 +2102,7 @@ class Store:
 
         self.db = db
         self.workflows = WorkflowRepository(db)
+        self.workspaces = WorkspaceRepository(db)
         self.registry = RegistryRepository(db)
         self.tasks = TaskRepository(db)
         self.resources = ResourceRepository(db)

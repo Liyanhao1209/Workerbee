@@ -427,6 +427,12 @@ kbd,
   font-size: var(--fs-sm);
   padding: 1px 5px;
 }
+.select--sm {
+  height: 22px;
+  font-size: var(--fs-sm);
+  padding: 1px 5px;
+  width: auto;
+}
 .input--num {
   width: 96px;
 }

@@ -168,8 +168,28 @@ export interface WorkflowDefinition {
   current_revision_seq: number;
   status: WorkflowStatus;
   max_concurrent_tasks: number;
+  /** 所属工作区（v0.03 §3）。旧流程升级后一律归 'default'。 */
+  workspace_id: string;
   created_at: string | null;
   updated_at: string | null;
+}
+
+/** 工作区（v0.03 §3）：流程的组织与删除安全边界。 */
+export interface Workspace {
+  workspace_id: string;
+  name: string;
+  /** resolve 后的绝对路径，全系统唯一。 */
+  root_dir: string;
+  /** 已归档：其下流程冻结（不可发射新任务），目录移出资源清理边界。 */
+  archived: boolean;
+  created_at: string;
+}
+
+export interface WorkspaceListResponse {
+  workspaces: Workspace[];
+  returned: number;
+  /** 最近一次 serve 启动匹配/注册的工作区；serve 没跑过（纯 core）时为 null。 */
+  current_workspace_id: string | null;
 }
 
 export interface WorkflowRevision {

@@ -18,6 +18,7 @@ import type { Task, TaskState, WorkflowDefinition } from '../api/types';
 import { tasks as taskApi, workflows as workflowApi } from '../api/endpoints';
 import { asArray } from '../api/guards';
 import { useAsync } from '../hooks/useAsync';
+import { useWorkspace } from '../store/workspace';
 import { Banner, Chip, Empty, Field, Loading, RelTime, ShortId, TaskStatePill } from '../components/common';
 import { TASK_STATE_OPTIONS, taskStateLabel } from '../labels';
 
@@ -47,6 +48,9 @@ export function TaskListPage(): JSX.Element {
   const navigate = useNavigate();
   const [stateFilter, setStateFilter] = useState<StateFilter>('');
   const [workflowFilter, setWorkflowFilter] = useState('');
+  // 顶栏的工作区筛选：'' 表示全部（不往后端发这个参数）。
+  const currentWs = useWorkspace((s) => s.currentId);
+  const wsParam = currentWs === '' ? undefined : currentWs;
 
   // 未设置的筛选一律传 undefined：client 的 buildUrl 会跳过 undefined/null 的键，
   // 于是 query 里只有真正生效的筛选条件。
@@ -54,18 +58,22 @@ export function TaskListPage(): JSX.Element {
     (_signal: AbortSignal) =>
       taskApi.list({
         workflow_id: workflowFilter === '' ? undefined : workflowFilter,
+        workspace_id: wsParam,
         state: stateFilter === '' ? undefined : stateFilter,
       }),
-    [workflowFilter, stateFilter],
+    [workflowFilter, stateFilter, wsParam],
   );
 
   // 轮询兜底：推送（WS）只是加速器，不是事实源。它断了以后这张表仍要往前走。
-  const { data, loading, error, loaded, reload } = useAsync(fetchTasks, [workflowFilter, stateFilter], {
+  const { data, loading, error, loaded, reload } = useAsync(fetchTasks, [workflowFilter, stateFilter, wsParam], {
     pollMs: 5000,
   });
 
-  const fetchWorkflows = useCallback((_signal: AbortSignal) => workflowApi.list(), []);
-  const workflowList = useAsync(fetchWorkflows, []);
+  const fetchWorkflows = useCallback(
+    (_signal: AbortSignal) => workflowApi.list({ workspace_id: wsParam }),
+    [wsParam],
+  );
+  const workflowList = useAsync(fetchWorkflows, [wsParam]);
 
   const tasks = useMemo(() => asArray<Task>(data?.tasks), [data]);
   const workflows = useMemo(() => asArray<WorkflowDefinition>(workflowList.data?.workflows), [workflowList.data]);

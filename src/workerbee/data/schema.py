@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -541,6 +541,34 @@ CREATE INDEX IF NOT EXISTS idx_capture_draft_run ON capture_draft(run_id, create
 --                关联）。流程列表的「隐藏捕获专用流程」只认 origin='live'，
 --                否则会把用户的真实流程从列表里误藏起来。
 ALTER TABLE capture_run ADD COLUMN origin TEXT NOT NULL DEFAULT 'live';
+""",
+    ),
+    (
+        12,
+        """
+-- Workspace 划分（v0.03 §3）：工作区成为一等概念，流程按工作区归属。
+--
+-- workspace 表的 root_dir 存 resolve 后的绝对路径且全表唯一——同一目录注册两次
+-- 是配置错误，必须在写入时就失败，而不是等两个工作区的任务在同一目录里互相踩。
+--
+-- default 行不在本迁移里插入：它的 root_dir 取决于运行时配置（原 node_cwd，
+-- 否则 <data-dir>/workspace），纯 SQL 迁移拿不到。由引擎装配时
+-- （WorkspaceRepository.ensure_default）幂等补齐；存量 workflow 行由下面的
+-- DEFAULT 'default' 自动归属。
+--
+-- workflow.workspace_id 故意不带 REFERENCES 子句：SQLite 在 foreign_keys=ON 时
+-- 不允许 ADD COLUMN 的 REFERENCES 带非 NULL 默认值，而存量行必须落到 'default'。
+-- 归属完整性由服务层保证（创建工作区外键校验、删除前检查引用）。
+CREATE TABLE IF NOT EXISTS workspace (
+    workspace_id   TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    root_dir       TEXT NOT NULL UNIQUE,
+    created_at     TEXT NOT NULL,
+    archived       INTEGER NOT NULL DEFAULT 0
+);
+
+ALTER TABLE workflow ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default';
+CREATE INDEX IF NOT EXISTS idx_workflow_workspace ON workflow(workspace_id);
 """,
     ),
 ]

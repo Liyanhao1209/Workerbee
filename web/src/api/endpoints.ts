@@ -63,7 +63,41 @@ import type {
   WorkflowDeleteResponse,
   WorkflowRevision,
   WorkflowStatus,
+  Workspace,
+  WorkspaceListResponse,
 } from './types';
+
+// ---------------------------------------------------------------------------
+// 工作区（v0.03 §3）
+// ---------------------------------------------------------------------------
+
+export const workspaces = {
+  list: () => request<WorkspaceListResponse>('/api/workspaces'),
+
+  create: (body: { name: string; root_dir: string }) =>
+    request<Workspace>('/api/workspaces', { method: 'POST', body }),
+
+  patch: (id: string, body: { name?: string; archived?: boolean }) =>
+    request<Workspace>(`/api/workspaces/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+
+  /** 归档：冻结新发射，不删任何数据。取消归档走 patch({ archived: false })。 */
+  archive: (id: string) =>
+    request<Workspace>(`/api/workspaces/${encodeURIComponent(id)}/archive`, { method: 'POST' }),
+
+  /** 删除前必须先迁走流程；仍被占用时返回 409（kind='conflict'）。 */
+  remove: (id: string) =>
+    request<{ workspace_id: string; deleted: boolean; note: string | null }>(
+      `/api/workspaces/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
+
+  /** 改归属（D-B）。目标已归档时 409。 */
+  moveWorkflow: (workflowId: string, workspaceId: string) =>
+    request<WorkflowDefinition>(`/api/workflows/${encodeURIComponent(workflowId)}/move`, {
+      method: 'POST',
+      body: { workspace_id: workspaceId },
+    }),
+};
 
 // ---------------------------------------------------------------------------
 // 系统
@@ -93,10 +127,17 @@ export const system = {
 // ---------------------------------------------------------------------------
 
 export const workflows = {
-  list: () => request<{ workflows: WorkflowDefinition[]; returned: number }>('/api/workflows'),
+  list: (params: { workspace_id?: string } = {}) =>
+    request<{ workflows: WorkflowDefinition[]; returned: number }>('/api/workflows', {
+      query: params,
+    }),
 
-  create: (body: { name: string; description?: string | null; max_concurrent_tasks?: number }) =>
-    request<WorkflowDefinition>('/api/workflows', { method: 'POST', body }),
+  create: (body: {
+    name: string;
+    description?: string | null;
+    max_concurrent_tasks?: number;
+    workspace_id?: string;
+  }) => request<WorkflowDefinition>('/api/workflows', { method: 'POST', body }),
 
   get: (id: string) => request<WorkflowDefinition>(`/api/workflows/${encodeURIComponent(id)}`),
 
@@ -182,7 +223,9 @@ export const tasks = {
       body,
     }),
 
-  list: (params: { workflow_id?: string; state?: TaskState; has_attempts?: boolean } = {}) =>
+  list: (
+    params: { workflow_id?: string; workspace_id?: string; state?: TaskState; has_attempts?: boolean } = {},
+  ) =>
     request<{ tasks: Task[]; returned: number; limit: number; offset: number; has_more: boolean }>(
       '/api/tasks',
       { query: params },

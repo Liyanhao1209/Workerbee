@@ -33,6 +33,7 @@ class EventScope(StrEnum):
     SYSTEM = "system"
     ASSISTANT = "assistant"
     CAPTURE = "capture"
+    WORKSPACE = "workspace"
 
 
 class EventActor(StrEnum):
@@ -128,6 +129,12 @@ class EventType(StrEnum):
     CAPTURE_DRAFT_GENERATED = "capture.draft_generated"
     CAPTURE_DRAFT_ADOPTED = "capture.draft_adopted"
     CAPTURE_DRAFT_REJECTED = "capture.draft_rejected"
+
+    # 工作区（v0.03 §3）。归档/取消归档走 WORKSPACE_UPDATED，payload 带 archived。
+    WORKSPACE_CREATED = "workspace.created"
+    WORKSPACE_UPDATED = "workspace.updated"
+    WORKSPACE_DELETED = "workspace.deleted"
+    WORKFLOW_MOVED = "workflow.moved"
 
 
 RedactorFn = Callable[[Any], Any]
