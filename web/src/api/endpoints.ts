@@ -20,11 +20,17 @@ import type {
   CaptureDraft,
   CaptureRun,
   CaptureRunDetail,
+  ChatNode,
+  ChatSendResult,
+  ChatSession,
   CredentialKind,
   CredentialRef,
   DeleteTaskResponse,
   DeliveryResult,
   EventPage,
+  FsListResult,
+  FsOpResult,
+  FsReadResult,
   GraphSpec,
   HarnessRegistration,
   HealthResponse,
@@ -520,6 +526,80 @@ export const assistant = {
     request<AssistantDraft>(`/api/assistant/drafts/${encodeURIComponent(draftId)}/reject`, {
       method: 'POST',
     }),
+};
+
+// ---------------------------------------------------------------------------
+// Web Chat（v0.03 §5）：对话会话 + 消息
+// ---------------------------------------------------------------------------
+
+export const chat = {
+  createSession: (body: {
+    title?: string;
+    workspace_id?: string;
+    credential_ref?: string;
+    model_override?: string;
+  }) => request<ChatSession>('/api/chat/sessions', { method: 'POST', body }),
+
+  sessions: (workspaceId?: string) =>
+    request<{ sessions: ChatSession[]; returned: number }>('/api/chat/sessions', {
+      query: workspaceId ? { workspace_id: workspaceId } : {},
+    }),
+
+  renameSession: (sessionId: string, title: string) =>
+    request<ChatSession>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'PATCH',
+      body: { title },
+    }),
+
+  deleteSession: (sessionId: string) =>
+    request<{ session_id: string; deleted: boolean; note: string | null }>(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}`,
+      { method: 'DELETE' },
+    ),
+
+  messages: (sessionId: string) =>
+    request<{ messages: ChatNode[]; leaf_id: string | null; returned: number }>(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`,
+    ),
+
+  /** 发消息，同步返回最终回复（含本轮全部新节点）。生成期间的增量经 WS 推 chat_chunk。 */
+  send: (sessionId: string, body: { content: string; parent_id?: string; refs?: string[] }) =>
+    request<ChatSendResult>(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`,
+      { method: 'POST', body },
+    ),
+};
+
+// ---------------------------------------------------------------------------
+// 工作区文件系统（v0.03 §5.4）：与 chat 工具循环同一份边界实现
+// ---------------------------------------------------------------------------
+
+export const fs = {
+  list: (path: string, workspaceId?: string) =>
+    request<FsListResult>('/api/fs/list', {
+      query: { path, ...(workspaceId ? { workspace_id: workspaceId } : {}) },
+    }),
+
+  read: (path: string, workspaceId?: string) =>
+    request<FsReadResult>('/api/fs/read', {
+      query: { path, ...(workspaceId ? { workspace_id: workspaceId } : {}) },
+    }),
+
+  /** 覆盖已存在文件必须带 expected_mtime（读时拿到的），否则 409。 */
+  write: (body: { path: string; content: string; expected_mtime?: string; workspace_id?: string }) =>
+    request<{ path: string; size: number; mtime: string | null }>('/api/fs/write', {
+      method: 'PUT',
+      body,
+    }),
+
+  mkdir: (body: { path: string; workspace_id?: string }) =>
+    request<FsOpResult>('/api/fs/mkdir', { method: 'POST', body }),
+
+  move: (body: { src: string; dst: string; workspace_id?: string }) =>
+    request<FsOpResult>('/api/fs/move', { method: 'POST', body }),
+
+  delete: (body: { path: string; workspace_id?: string }) =>
+    request<FsOpResult>('/api/fs/delete', { method: 'DELETE', body }),
 };
 
 // ---------------------------------------------------------------------------

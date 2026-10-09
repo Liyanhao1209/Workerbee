@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -569,6 +569,54 @@ CREATE TABLE IF NOT EXISTS workspace (
 
 ALTER TABLE workflow ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default';
 CREATE INDEX IF NOT EXISTS idx_workflow_workspace ON workflow(workspace_id);
+""",
+    ),
+    (
+        13,
+        """
+-- Web Chat（v0.03 §5、§6.2，D-E 分域并存）：与只读助手分开的新对话域。
+--
+-- chat_node 原生是树（parent_id，NULL=树根，森林多根），为 Phase 4 的 fork
+-- 一次到位；本阶段 UI 只暴露线性视图。deleted_at 是软删除标记（D-F），
+-- 视图默认过滤，「清空」才是不可恢复的硬删。
+--
+-- 与 §5.2 的字段表相比，chat_node 多出 tool_calls / tool_name / tool_call_id
+-- 三列：没有它们就无法按 OpenAI/Anthropic 的工具协议忠实重放历史
+-- （assistant 节点的工具调用清单、tool 节点与调用的关联），重启后的上下文
+-- 重建会丢工具往返。
+CREATE TABLE IF NOT EXISTS chat_session (
+    session_id     TEXT PRIMARY KEY,
+    workspace_id   TEXT NOT NULL REFERENCES workspace(workspace_id),
+    title          TEXT NOT NULL DEFAULT '',
+    credential_ref TEXT,
+    model_override TEXT,
+    closed         INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_session_workspace
+    ON chat_session(workspace_id, updated_at DESC);
+
+-- role：user / assistant / system(预留) / tool。
+-- tool_calls：assistant 节点发起的工具调用清单（JSON，[{id,name,arguments}]）。
+-- tool_name / tool_call_id：tool 节点回关联到触发它的那次调用。
+CREATE TABLE IF NOT EXISTS chat_node (
+    node_id        TEXT PRIMARY KEY,
+    session_id     TEXT NOT NULL REFERENCES chat_session(session_id) ON DELETE CASCADE,
+    parent_id      TEXT REFERENCES chat_node(node_id),
+    role           TEXT NOT NULL,
+    content        TEXT NOT NULL,
+    reasoning      TEXT,
+    backend        TEXT,
+    tokens_in      INTEGER,
+    tokens_out     INTEGER,
+    tool_calls     TEXT,
+    tool_name      TEXT,
+    tool_call_id   TEXT,
+    deleted_at     TEXT,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_node_session ON chat_node(session_id, parent_id);
 """,
     ),
 ]

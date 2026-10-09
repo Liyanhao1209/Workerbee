@@ -1236,11 +1236,99 @@ export interface CaptureRunDetail {
 }
 
 // ===========================================================================
+// Web Chat（v0.03 §5）—— 字段与 schemas.py 的 Chat*/Fs* 模型逐字对齐
+// ===========================================================================
+
+export interface ChatSession {
+  session_id: string;
+  workspace_id: string;
+  title: string;
+  credential_ref: string | null;
+  model_override: string | null;
+  closed: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 对话树上的一个节点。tool_calls/tool_name/tool_call_id 仅工具往返节点携带。 */
+export interface ChatNode {
+  node_id: string;
+  session_id: string;
+  parent_id: string | null;
+  /** user / assistant / tool / system */
+  role: string;
+  content: string;
+  reasoning: string | null;
+  backend: string | null;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  tool_calls: { id: string; name: string; arguments: Record<string, unknown> }[] | null;
+  tool_name: string | null;
+  tool_call_id: string | null;
+  created_at: string;
+}
+
+/** 一轮问答的结果：最终回复 + 本轮新生的全部节点（含工具往返）。 */
+export interface ChatSendResult {
+  reply: ChatNode;
+  user_node: ChatNode;
+  nodes: ChatNode[];
+  /** 因窗口限制未随本次发送的更早节点数。 */
+  dropped: number;
+  degraded: boolean;
+  degraded_reasons: string[];
+  /** false = 当前后端不支持工具，本轮退化为纯对话（如实告知）。 */
+  supports_tools: boolean;
+}
+
+export interface FsEntry {
+  name: string;
+  /** 相对工作区根的路径。 */
+  path: string;
+  /** file / dir / link / other */
+  type: string;
+  size: number | null;
+  mtime: string | null;
+  hidden: boolean;
+  /** 命中敏感名（.env、私钥等）：列表可见但读写被拒。 */
+  sensitive: boolean;
+}
+
+export interface FsListResult {
+  path: string;
+  entries: FsEntry[];
+  returned: number;
+}
+
+export interface FsReadResult {
+  path: string;
+  content: string;
+  truncated: boolean;
+  size: number;
+  /** 写回时用作 expected_mtime 的乐观并发凭证。 */
+  mtime: string | null;
+}
+
+/** mkdir / move / delete 共用的结果形状。 */
+export interface FsOpResult {
+  ok: boolean;
+  path: string;
+  detail: string | null;
+}
+
+// ===========================================================================
 // WebSocket 推送
 // ===========================================================================
 
 export interface WsPush {
-  kind: 'state_changed' | 'attention' | 'assistant_message' | 'assistant_chunk';
+  kind:
+    | 'state_changed'
+    | 'attention'
+    | 'assistant_message'
+    | 'assistant_chunk'
+    | 'chat_chunk'
+    | 'chat_message'
+    | 'chat_status';
   task_id: string | null;
   stage_id: string | null;
   payload: Record<string, unknown>;

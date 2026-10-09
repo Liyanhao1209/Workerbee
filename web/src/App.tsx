@@ -9,6 +9,7 @@ import { ExecutionGraphPage } from './pages/ExecutionGraphPage';
 import { RegistryPage } from './pages/RegistryPage';
 import { CapturesPage } from './pages/CapturesPage';
 import { CaptureDetailPage } from './pages/CaptureDetailPage';
+import { ChatPage } from './pages/ChatPage';
 import { SessionsPage } from './pages/SessionsPage';
 import { TemplatesPage } from './pages/TemplatesPage';
 import { TemplateGraphEditorPage } from './pages/TemplateGraphEditorPage';
@@ -26,6 +27,8 @@ export function App(): JSX.Element {
           {/* 流程捕获：用一个模型真实跑一遍任务，把执行过程整理成流程草案。 */}
           <Route path="/captures" element={<CapturesPage />} />
           <Route path="/captures/:runId" element={<CaptureDetailPage />} />
+          {/* Web Chat：对话 + 文件系统工具（写操作逐次过审批）。 */}
+          <Route path="/chat" element={<ChatPage />} />
           <Route path="/tasks" element={<TaskListPage />} />
           <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
           {/* 执行图是运维时最常看的视图，单独给它一级入口。 */}

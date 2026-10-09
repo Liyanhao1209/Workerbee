@@ -48,6 +48,8 @@ from ..core.runtime.launch import WorkspaceArchived
 from ..assistant import AssistantConfig, AssistantError
 from ..assistant.draft import DraftInvalid, DraftProposal, proposal_graph
 from ..capture import CaptureError
+from ..chat import fs as chat_fs
+from ..chat.service import ChatError
 from ..data.db import ConflictError
 from ..data.event_log import EventActor, EventScope, EventType
 from ..data.store import DEFAULT_WORKSPACE_ID
@@ -57,6 +59,7 @@ __all__ = [
     "ServiceError",
     "NotFound",
     "BadRequest",
+    "Forbidden",
     "Conflict",
     "RevisionConflict",
     "SubmissionRejected",
@@ -91,6 +94,12 @@ class NotFound(ServiceError):
 
 class BadRequest(ServiceError):
     status_code = 400
+
+
+class Forbidden(ServiceError):
+    """越界 / 触碰敏感文件（403）：请求本身合法，但目标在允许边界之外。"""
+
+    status_code = 403
 
 
 class Conflict(ServiceError):
@@ -2067,6 +2076,252 @@ class WorkspaceService(_Service):
 
 
 # ===========================================================================
+# Web Chat（Phase 3a：对话 + 文件系统工具）
+# ===========================================================================
+
+
+class FsService(_Service):
+    """工作区文件系统的网关门面（v0.03 §5.4）。
+
+    边界实现全部在 ``workerbee.chat.fs``（与 chat 工具循环共用同一份，
+    行为不可能分叉）；本层只做：解析工作区根目录、把 FS 异常族翻译成
+    HTTP 语义、写操作成功后留痕（用户在界面上点按钮本身就是批准，
+    不再过 ApprovalGateway——审批只约束模型发起的写）。
+    """
+
+    async def _resolve_root(self, workspace_id: str | None) -> tuple[str, str]:
+        """workspace_id 缺省时取当前工作区，再落默认工作区。返回 (id, root_dir)。"""
+        if workspace_id is None:
+            current = await self.store.db.fetch_value(
+                "SELECT v FROM meta_kv WHERE k=?",
+                ("serve.current_workspace",),
+                default=None,
+            )
+            workspace_id = str(current) if current else DEFAULT_WORKSPACE_ID
+        row = await self.store.workspaces.get(workspace_id)
+        if row is None:
+            raise NotFound(f"工作区不存在: {workspace_id}")
+        return workspace_id, str(row["root_dir"])
+
+    @staticmethod
+    def _translate(exc: chat_fs.FSError) -> ServiceError:
+        if isinstance(exc, chat_fs.FSForbidden):
+            return Forbidden(exc.detail, hint=exc.hint)
+        if isinstance(exc, chat_fs.FSNotFound):
+            return NotFound(exc.detail, hint=exc.hint)
+        if isinstance(exc, chat_fs.FSConflict):
+            detail = exc.detail
+            if exc.current_mtime:
+                detail = f"{detail}（当前 mtime: {exc.current_mtime}）"
+            return Conflict(detail, hint=exc.hint)
+        return BadRequest(exc.detail, hint=exc.hint)
+
+    async def list_dir(
+        self, path: str, workspace_id: str | None
+    ) -> S.FsListResponse:
+        _, root = await self._resolve_root(workspace_id)
+        try:
+            result = chat_fs.list_dir(root, path)
+        except chat_fs.FSError as exc:
+            raise self._translate(exc) from exc
+        return S.FsListResponse(
+            path=result["path"],
+            entries=[S.FsEntry.model_validate(e) for e in result["entries"]],
+            returned=len(result["entries"]),
+        )
+
+    async def read_file(
+        self, path: str, workspace_id: str | None, max_bytes: int | None
+    ) -> S.FsReadResponse:
+        _, root = await self._resolve_root(workspace_id)
+        kwargs: dict[str, Any] = {}
+        if max_bytes is not None:
+            if max_bytes <= 0 or max_bytes > chat_fs.DEFAULT_READ_MAX_BYTES:
+                raise BadRequest(
+                    f"max_bytes 需在 1 到 {chat_fs.DEFAULT_READ_MAX_BYTES} 之间"
+                )
+            kwargs["max_bytes"] = max_bytes
+        try:
+            result = chat_fs.read_file(root, path, **kwargs)
+        except chat_fs.FSError as exc:
+            raise self._translate(exc) from exc
+        return S.FsReadResponse.model_validate(result)
+
+    async def write_file(self, req: S.FsWriteRequest) -> S.FsWriteResponse:
+        ws_id, root = await self._resolve_root(req.workspace_id)
+        try:
+            result = chat_fs.write_file(
+                root, req.path, req.content, expected_mtime=req.expected_mtime
+            )
+        except chat_fs.FSError as exc:
+            raise self._translate(exc) from exc
+        await self._event(
+            EventType.FS_WRITE,
+            scope=EventScope.CHAT,
+            scope_id=ws_id,
+            payload={"path": result["path"], "size": result["size"]},
+        )
+        return S.FsWriteResponse.model_validate(result)
+
+    async def make_dir(self, req: S.FsMkdirRequest) -> S.FsOpResponse:
+        ws_id, root = await self._resolve_root(req.workspace_id)
+        try:
+            result = chat_fs.make_dir(root, req.path)
+        except chat_fs.FSError as exc:
+            raise self._translate(exc) from exc
+        await self._event(
+            EventType.FS_MKDIR,
+            scope=EventScope.CHAT,
+            scope_id=ws_id,
+            payload={"path": result["path"], "existed": result["existed"]},
+        )
+        return S.FsOpResponse(
+            ok=True,
+            path=result["path"],
+            detail="目录已存在，未重复创建" if result["existed"] else None,
+        )
+
+    async def move_entry(self, req: S.FsMoveRequest) -> S.FsOpResponse:
+        ws_id, root = await self._resolve_root(req.workspace_id)
+        try:
+            result = chat_fs.move_entry(root, req.src, req.dst)
+        except chat_fs.FSError as exc:
+            raise self._translate(exc) from exc
+        await self._event(
+            EventType.FS_MOVE,
+            scope=EventScope.CHAT,
+            scope_id=ws_id,
+            payload={"src": result["src"], "dst": result["dst"]},
+        )
+        return S.FsOpResponse(ok=True, path=result["dst"], detail=f"自 {result['src']} 移入")
+
+    async def delete_entry(self, req: S.FsDeleteRequest) -> S.FsOpResponse:
+        ws_id, root = await self._resolve_root(req.workspace_id)
+        try:
+            result = chat_fs.delete_entry(root, req.path)
+        except chat_fs.FSError as exc:
+            raise self._translate(exc) from exc
+        await self._event(
+            EventType.FS_DELETE,
+            scope=EventScope.CHAT,
+            scope_id=ws_id,
+            payload={"path": result["path"], "kind": result["kind"]},
+        )
+        return S.FsOpResponse(ok=True, path=result["path"], detail=f"已删除{result['kind']}")
+
+
+class ChatService(_Service):
+    """Web Chat 的网关门面。核心编排在 ``engine.chat``（chat/service.py），
+    本层只做参数校验与错误翻译——与 AssistantService 同一分工。"""
+
+    def _core(self) -> Any:
+        svc = getattr(self.engine, "chat", None)
+        if svc is None:
+            raise BadRequest("对话服务未装配，本轮内核不支持 Web Chat 功能")
+        return svc
+
+    async def create_session(
+        self, req: S.ChatSessionCreateRequest
+    ) -> S.ChatSessionResponse:
+        workspace_id = req.workspace_id
+        if workspace_id is None:
+            current = await self.store.db.fetch_value(
+                "SELECT v FROM meta_kv WHERE k=?",
+                ("serve.current_workspace",),
+                default=None,
+            )
+            workspace_id = str(current) if current else DEFAULT_WORKSPACE_ID
+        if req.credential_ref:
+            cred = await self.store.registry.get_credential(req.credential_ref)
+            if cred is None:
+                raise BadRequest(
+                    "这条凭据不存在", hint="到 注册表 → 凭据 先建好凭据，再开对话"
+                )
+        try:
+            session = await self._core().create_session(
+                title=(req.title or "").strip(),
+                workspace_id=workspace_id,
+                credential_ref=req.credential_ref or None,
+                model_override=req.model_override or None,
+            )
+        except ChatError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.ChatSessionResponse.model_validate(session)
+
+    async def list_sessions(self, workspace_id: str | None) -> S.ChatSessionListResponse:
+        sessions = await self._core().list_sessions(workspace_id=workspace_id or None)
+        return S.ChatSessionListResponse(
+            sessions=[S.ChatSessionResponse.model_validate(s) for s in sessions],
+            returned=len(sessions),
+        )
+
+    async def get_session(self, session_id: str) -> S.ChatSessionResponse:
+        try:
+            session = await self._core().get_session(session_id)
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        return S.ChatSessionResponse.model_validate(session)
+
+    async def rename_session(
+        self, session_id: str, req: S.ChatSessionRenameRequest
+    ) -> S.ChatSessionResponse:
+        try:
+            session = await self._core().rename_session(session_id, req.title)
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        except ChatError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.ChatSessionResponse.model_validate(session)
+
+    async def delete_session(self, session_id: str) -> S.ChatSessionDeleteResponse:
+        try:
+            await self._core().delete_session(session_id)
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        return S.ChatSessionDeleteResponse(
+            session_id=session_id, note="对话及其全部消息节点已删除"
+        )
+
+    async def list_messages(
+        self, session_id: str, leaf_id: str | None
+    ) -> S.ChatMessageListResponse:
+        try:
+            result = await self._core().list_messages(session_id, leaf_id=leaf_id)
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        except ChatError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        messages = [S.ChatNodeResponse.model_validate(m) for m in result["messages"]]
+        return S.ChatMessageListResponse(
+            messages=messages, leaf_id=result["leaf_id"], returned=len(messages)
+        )
+
+    async def send_message(
+        self, session_id: str, req: S.ChatSendRequest
+    ) -> S.ChatSendResponse:
+        text = req.content.strip()
+        if not text:
+            raise BadRequest("消息内容不能为空。")
+        try:
+            result = await self._core().send_message(
+                session_id, text, parent_id=req.parent_id, refs=req.refs
+            )
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        except ChatError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.ChatSendResponse(
+            reply=S.ChatNodeResponse.model_validate(result["reply"]),
+            user_node=S.ChatNodeResponse.model_validate(result["user_node"]),
+            nodes=[S.ChatNodeResponse.model_validate(n) for n in result["nodes"]],
+            dropped=result["dropped"],
+            degraded=result["degraded"],
+            degraded_reasons=result["degraded_reasons"],
+            supports_tools=result["supports_tools"],
+        )
+
+
+# ===========================================================================
 # 容器
 # ===========================================================================
 
@@ -2086,6 +2341,8 @@ class Services:
         self.assistant = AssistantService(engine)
         self.capture = CaptureService(engine)
         self.workspaces = WorkspaceService(engine)
+        self.chat = ChatService(engine)
+        self.fs = FsService(engine)
 
 
 # ===========================================================================

@@ -34,6 +34,7 @@ class EventScope(StrEnum):
     ASSISTANT = "assistant"
     CAPTURE = "capture"
     WORKSPACE = "workspace"
+    CHAT = "chat"
 
 
 class EventActor(StrEnum):
@@ -135,6 +136,15 @@ class EventType(StrEnum):
     WORKSPACE_UPDATED = "workspace.updated"
     WORKSPACE_DELETED = "workspace.deleted"
     WORKFLOW_MOVED = "workflow.moved"
+
+    # Web Chat（v0.03 §5）。payload 只放后端名、用量、路径等元信息；
+    # 对话正文不落事件日志（正文在 chat_node 表里，已脱敏）。
+    CHAT_MESSAGE = "chat.message"
+    CHAT_BACKEND_DEGRADED = "chat.backend_degraded"
+    FS_WRITE = "fs.write"
+    FS_MKDIR = "fs.mkdir"
+    FS_MOVE = "fs.move"
+    FS_DELETE = "fs.delete"
 
 
 RedactorFn = Callable[[Any], Any]

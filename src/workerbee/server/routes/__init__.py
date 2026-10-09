@@ -10,6 +10,8 @@ from . import (
     approvals,
     assistant,
     capture,
+    chat,
+    fs,
     nodes,
     registry,
     system,
@@ -20,8 +22,8 @@ from . import (
 )
 
 __all__ = [
-    "ROUTERS", "approvals", "assistant", "capture", "nodes", "registry", "system",
-    "tasks", "templates", "workflows", "workspaces",
+    "ROUTERS", "approvals", "assistant", "capture", "chat", "fs", "nodes",
+    "registry", "system", "tasks", "templates", "workflows", "workspaces",
 ]
 
 #: 注册顺序即匹配顺序：更具体的路径在前。
@@ -36,4 +38,6 @@ ROUTERS = [
     approvals.router,
     assistant.router,
     capture.router,
+    chat.router,
+    fs.router,
 ]

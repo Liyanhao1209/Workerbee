@@ -161,6 +161,7 @@ class Engine:
         self.harness: Any | None = None
         self.assistant: Any | None = None
         self.capture: Any | None = None
+        self.chat: Any | None = None
 
         self._secret_store: Any = None
         self._redactor: Any = None
@@ -308,8 +309,14 @@ class Engine:
 
         找不到会话就如实返回 False，由网关标成 ``undeliverable`` 并保持可见——
         「决定已产生但没送到」是必须让用户看到的事实，不能悄悄吞掉。
+
+        chat 域的审批（``task_id`` 以 ``chat:`` 开头）是例外：它没有 harness
+        会话可回注——发起审批的工具循环直接轮询审批表读决定，这里直通成功。
         """
         from .core.domain.approval import ApprovalStatus
+
+        if str(approval.bound_to.task_id or "").startswith("chat:"):
+            return True
 
         attempt = await self.store.tasks.get_attempt(approval.bound_to.attempt_id)
         session_ref = attempt.session_ref if attempt is not None else None
@@ -662,6 +669,18 @@ class Engine:
             redactor=self._redactor,
         )
 
+        # Web Chat（v0.03 §5）。审批网关直接注入：写类工具经它登记并等待决定
+        # （合成绑定 chat:<session_id>，决定由工具循环轮询读取，不回注会话）。
+        from .chat import ChatService
+
+        self.chat = ChatService(
+            store=self.store,
+            notifier=self.notifier,
+            secret_resolver=lambda: self._secret_store,
+            redactor=self._redactor,
+            approval_gateway=self.approvals,
+        )
+
     async def _build_llm(self) -> Any | None:
         from .data.llm import LLMRouter
 
@@ -881,6 +900,9 @@ class Engine:
         if self.capture is not None:
             with contextlib.suppress(Exception):
                 await self.capture.aclose()
+        if self.chat is not None:
+            with contextlib.suppress(Exception):
+                await self.chat.aclose()
         with contextlib.suppress(Exception):
             await self.store.events.append(
                 scope=_scope("system"),

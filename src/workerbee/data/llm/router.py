@@ -33,6 +33,7 @@ from .backend import (
     LLMResponse,
     LLMMessage,
     LLMResponseError,
+    LLMToolSpec,
     SecretResolver,
 )
 from .harness_cli import HarnessCLIBackend
@@ -157,6 +158,11 @@ class LLMRouter:
     def backend_names(self) -> list[str]:
         return [b.name for b in self._backends]
 
+    def supports_tools(self) -> bool:
+        """主后端（链上第一个）是否支持工具调用。降级到不支持的备用后端时，
+        工具调用会如实落空——调用方据此做显式降级提示。"""
+        return bool(getattr(self._backends[0], "supports_tools", False))
+
     def describe(self) -> dict[str, Any]:
         out: list[dict[str, Any]] = []
         for i, b in enumerate(self._backends):
@@ -183,11 +189,15 @@ class LLMRouter:
         timeout: float | None = None,
         prefer: str | None = None,
         allow_fallback: bool = True,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> LLMResponse:
         """依次尝试后端。返回的 ``backend`` 一定是实际执行者。
 
         ``allow_fallback=False`` 时只尝试首选后端（用户显式要求「就用这个」时，
         失败要直接报出，而不是悄悄换一个）。
+
+        ``tools`` 只在非 None 时才透传给后端：不带工具的既有调用方与
+        不感知 tools 的后端实现（如测试替身）都零改动。
         """
         order = self._order(prefer)
         if not allow_fallback:
@@ -198,12 +208,14 @@ class LLMRouter:
 
         for index, backend in enumerate(order):
             try:
-                resp = await backend.complete(
-                    messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    timeout=timeout,
-                )
+                kwargs: dict[str, Any] = {
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "timeout": timeout,
+                }
+                if tools is not None:
+                    kwargs["tools"] = tools
+                resp = await backend.complete(messages, **kwargs)
             except LLMError as exc:
                 attempts.append(exc.as_reason())
                 last_error = exc
@@ -252,6 +264,7 @@ class LLMRouter:
         timeout: float | None = None,
         prefer: str | None = None,
         allow_fallback: bool = True,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> AsyncIterator[LLMChunk]:
         """流式版本的有序降级。语义与 :meth:`complete` 一致，除了一条流式特有的
         硬约束：
@@ -259,6 +272,8 @@ class LLMRouter:
         **只有第一个 chunk 到达之前的失败才允许换后端。** 第一个 chunk 一旦产出，
         内容可能已经推给了用户界面——此刻再失败绝不能换后端把回答重发一遍
         （用户会看到两份开头），只能把错误原样抛出。
+
+        ``tools`` 只在非 None 时才透传给后端（与 :meth:`complete` 同一口径）。
         """
         order = self._order(prefer)
         if not allow_fallback:
@@ -268,12 +283,14 @@ class LLMRouter:
         last_error: LLMError | None = None
 
         for backend in order:
-            agen = backend.stream(
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                timeout=timeout,
-            )
+            kwargs: dict[str, Any] = {
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "timeout": timeout,
+            }
+            if tools is not None:
+                kwargs["tools"] = tools
+            agen = backend.stream(messages, **kwargs)
             try:
                 first = await agen.__anext__()
             except StopAsyncIteration:

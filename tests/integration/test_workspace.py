@@ -68,7 +68,7 @@ class TestMigration:
             version = await store.db.fetch_value(
                 "SELECT MAX(version) FROM schema_version", default=0
             )
-            assert int(version) == SCHEMA_VERSION == 12
+            assert int(version) == SCHEMA_VERSION == 13
 
             # 旧数据自动归 default（列默认值），不需要任何数据搬运
             wf = await store.workflows.get("w-legacy")
@@ -95,7 +95,7 @@ class TestMigration:
             version = await store.db.fetch_value(
                 "SELECT MAX(version) FROM schema_version", default=0
             )
-            assert int(version) == 12
+            assert int(version) == 13
         finally:
             await store.close()
 
@@ -108,6 +108,51 @@ class TestMigration:
         await store.workspaces.create(name="占用者", root_dir=default["root_dir"])
         with pytest.raises(ConflictError):
             await store.workspaces.ensure_default(root_dir=default["root_dir"])
+
+
+class TestMigration13:
+    """迁移 13（v0.03 §5.2）：chat_session / chat_node 原生树。"""
+
+    async def test_新库建好chat两表(self, store: Store) -> None:
+        version = await store.db.fetch_value(
+            "SELECT MAX(version) FROM schema_version", default=0
+        )
+        assert int(version) == SCHEMA_VERSION == 13
+        tables = {
+            r[0]
+            for r in await store.db.fetch_all(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"chat_session", "chat_node"} <= tables
+        node_cols = {
+            r[1] for r in await store.db.fetch_all("PRAGMA table_info(chat_node)")
+        }
+        # 树结构与软删除是 §5.2 的硬要求；tool_* 三列是工具往返忠实重放的前提
+        assert {"parent_id", "deleted_at", "tool_calls", "tool_name", "tool_call_id"} <= node_cols
+        session_cols = {
+            r[1] for r in await store.db.fetch_all("PRAGMA table_info(chat_session)")
+        }
+        assert {"workspace_id", "credential_ref", "model_override", "closed"} <= session_cols
+
+    async def test_旧库升级后chat表可用(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "legacy.db"
+        _build_v11_db(db_path)
+        store = await Store.open(str(db_path))
+        try:
+            version = await store.db.fetch_value(
+                "SELECT MAX(version) FROM schema_version", default=0
+            )
+            assert int(version) == 13
+            await store.workspaces.ensure_default(
+                root_dir=str((tmp_path / "workspace").resolve())
+            )
+            session = await store.chat.create_session(
+                "cs1", workspace_id=DEFAULT_WORKSPACE_ID, title="升级后的对话"
+            )
+            assert session["session_id"] == "cs1"
+        finally:
+            await store.close()
 
 
 # ===========================================================================

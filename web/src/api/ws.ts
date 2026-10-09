@@ -160,7 +160,10 @@ export class KernelSocket {
         kind !== 'state_changed' &&
         kind !== 'attention' &&
         kind !== 'assistant_message' &&
-        kind !== 'assistant_chunk'
+        kind !== 'assistant_chunk' &&
+        kind !== 'chat_chunk' &&
+        kind !== 'chat_message' &&
+        kind !== 'chat_status'
       )
         return;
       this.handlers.onPush({

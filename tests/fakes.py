@@ -279,6 +279,10 @@ class FakeLLMBackend:
     与 ``responses`` 按下标对齐）在前、正文在后（正文拆成两段，便于断言
     累积顺序），恰以一个终帧结束。脚本是异常时在**第一个 chunk 之前**抛出，
     与真实后端「建连即失败」的形态一致。
+
+    工具调用：``supports_tools=True`` 时脚本条目可以是 ``{"tool_calls": [...],
+    "text": "可选正文"}``——stream 产出 ``tool_call`` chunk 后收尾。complete
+    则在 ``LLMResponse.tool_calls`` 里带回。
     """
 
     def __init__(
@@ -287,12 +291,16 @@ class FakeLLMBackend:
         name: str = "fake-llm",
         model: str = "fake-model",
         reasonings: tuple[str, ...] = (),
+        supports_tools: bool = False,
     ) -> None:
         self._responses = list(responses) or ["（空回复）"]
         self._reasonings = list(reasonings)
         self.name = name
         self.model = model
+        self.supports_tools = supports_tools
         self.calls: list[list[LLMMessage]] = []
+        #: 每次调用实际收到的 tools 参数（None 表示调用方没传）。
+        self.tools_seen: list[Any] = []
         self.closed = False
 
     def _payload(self) -> Any:
@@ -311,11 +319,21 @@ class FakeLLMBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Any = None,
     ) -> LLMResponse:
         self.calls.append(list(messages))
+        self.tools_seen.append(tools)
         payload = self._payload()
         if isinstance(payload, Exception):
             raise payload
+        if isinstance(payload, dict):
+            return LLMResponse(
+                text=str(payload.get("text") or ""),
+                model=self.model,
+                backend=self.name,
+                usage=None,
+                tool_calls=list(payload.get("tool_calls") or []),
+            )
         return LLMResponse(
             text=str(payload),
             model=self.model,
@@ -330,20 +348,29 @@ class FakeLLMBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Any = None,
     ):
         self.calls.append(list(messages))
+        self.tools_seen.append(tools)
         payload = self._payload()
         if isinstance(payload, Exception):
             raise payload
         reasoning = self._reasoning()
         if reasoning:
             yield LLMChunk(kind="reasoning", text=reasoning)
-        text = str(payload)
-        mid = len(text) // 2
-        if text[:mid]:
-            yield LLMChunk(kind="text", text=text[:mid])
-        if text[mid:]:
-            yield LLMChunk(kind="text", text=text[mid:])
+        if isinstance(payload, dict):
+            text = str(payload.get("text") or "")
+            if text:
+                yield LLMChunk(kind="text", text=text)
+            for call in payload.get("tool_calls") or []:
+                yield LLMChunk(kind="tool_call", tool_call=call)
+        else:
+            text = str(payload)
+            mid = len(text) // 2
+            if text[:mid]:
+                yield LLMChunk(kind="text", text=text[:mid])
+            if text[mid:]:
+                yield LLMChunk(kind="text", text=text[mid:])
         yield LLMChunk(
             kind="text", final=True, usage=None, model=self.model, backend=self.name
         )

@@ -33,6 +33,8 @@ from .backend import (
     LLMResponseError,
     LLMMessage,
     LLMTimeoutError,
+    LLMToolCall,
+    LLMToolSpec,
     SecretResolver,
     extract_credentials,
     non_system_messages,
@@ -55,8 +57,55 @@ DEFAULT_MAX_TOKENS = 4096
 _ERROR_SNIPPET_CHARS = 400
 
 
+def _anthropic_messages(messages: Sequence[LLMMessage]) -> list[dict[str, Any]]:
+    """协议层消息 → Anthropic 线格式。
+
+    - assistant 的 ``tool_calls`` 展开成 ``tool_use`` 内容块（正文非空时保留
+      一个 text 块在前）；
+    - ``role="tool"`` 的结果并入一条 user 消息的 ``tool_result`` 内容块
+      （Anthropic 没有 tool 角色，连续的工具结果要合进同一条 user 消息）；
+    - 不带工具字段的消息保持 ``{"role", "content"}`` 原样——既有链路形状不变。
+    """
+    out: list[dict[str, Any]] = []
+    pending_results: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        nonlocal pending_results
+        if pending_results:
+            out.append({"role": "user", "content": pending_results})
+            pending_results = []
+
+    for m in non_system_messages(messages):
+        if m.role == "tool":
+            pending_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id or "",
+                    "content": m.content,
+                }
+            )
+            continue
+        flush()
+        if m.role == "assistant" and m.tool_calls:
+            blocks: list[dict[str, Any]] = []
+            if m.content:
+                blocks.append({"type": "text", "text": m.content})
+            blocks.extend(
+                {"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments}
+                for tc in m.tool_calls
+            )
+            out.append({"role": "assistant", "content": blocks})
+        else:
+            out.append({"role": m.role, "content": m.content})
+    flush()
+    return out
+
+
 class AnthropicBackend:
     """``/v1/messages`` 形态的后端。"""
+
+    #: 本后端支持 tools + tool_use/tool_result content blocks。
+    supports_tools = True
 
     def __init__(
         self,
@@ -157,6 +206,7 @@ class AnthropicBackend:
         max_tokens: int | None,
         temperature: float | None,
         stream: bool = False,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> dict[str, Any]:
         """构造请求体。system 与 user/assistant 在此完成分流。
 
@@ -167,15 +217,18 @@ class AnthropicBackend:
         body: dict[str, Any] = {
             "model": self.model,
             "max_tokens": int(max_tokens) if max_tokens is not None else self.default_max_tokens,
-            "messages": [
-                {"role": m.role, "content": m.content} for m in non_system_messages(messages)
-            ],
+            "messages": _anthropic_messages(messages),
         }
         system = system_text(messages)
         if system:
             body["system"] = system
         if temperature is not None:
             body["temperature"] = float(temperature)
+        if tools:
+            body["tools"] = [
+                {"name": t.name, "description": t.description, "input_schema": t.parameters}
+                for t in tools
+            ]
         if stream:
             body["stream"] = True
         body.update(self.extra_body)
@@ -199,10 +252,13 @@ class AnthropicBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> LLMResponse:
         base_url, key = await self._credentials()
         url = f"{base_url}/v1/messages"
-        body = self.build_request(messages, max_tokens=max_tokens, temperature=temperature)
+        body = self.build_request(
+            messages, max_tokens=max_tokens, temperature=temperature, tools=tools
+        )
 
         client = self._ensure_client()
         try:
@@ -225,7 +281,7 @@ class AnthropicBackend:
 
         self._raise_for_status(resp, target=url)
         payload = self._decode_json(resp, target=url)
-        return self._to_response(payload)
+        return self._to_response(payload, tools_offered=bool(tools))
 
     # ---- 流式补全（SSE） ----
 
@@ -236,6 +292,7 @@ class AnthropicBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> AsyncIterator[LLMChunk]:
         """SSE 流式补全。逐事件 yield，恰以一个 ``final=True`` 的终帧结束。
 
@@ -244,6 +301,9 @@ class AnthropicBackend:
         - ``content_block_delta`` 的 ``text_delta`` → text chunk，
           ``thinking_delta`` → reasoning chunk（**透传**服务端自然发出的
           thinking；本后端不主动开启 extended thinking，见 build_request）；
+        - ``content_block_start`` 的 ``tool_use`` 块开始一次工具调用，
+          ``input_json_delta`` 片段累积进它，``content_block_stop`` 时产出
+          一个 ``kind="tool_call"`` 的完整调用 chunk；
         - usage：``message_start`` 带 ``input_tokens``，``message_delta``
           带 ``output_tokens``，合并进终帧；缺哪边哪边就是 ``None``（未知）；
         - ``message_delta`` 的 ``stop_reason == "max_tokens"`` 与 complete
@@ -255,7 +315,8 @@ class AnthropicBackend:
         base_url, key = await self._credentials()
         url = f"{base_url}/v1/messages"
         body = self.build_request(
-            messages, max_tokens=max_tokens, temperature=temperature, stream=True
+            messages, max_tokens=max_tokens, temperature=temperature, stream=True,
+            tools=tools,
         )
 
         client = self._ensure_client()
@@ -285,6 +346,8 @@ class AnthropicBackend:
         output_tokens: int | None = None
         model: str | None = None
         truncated = False
+        # 内容块 index → 工具调用的累积状态（id、name、input JSON 片段）。
+        tool_blocks: dict[int, list[Any]] = {}
         async for line in resp.aiter_lines():
             if not line or line.startswith(":"):
                 continue
@@ -315,6 +378,19 @@ class AnthropicBackend:
                 v = usage_raw.get("input_tokens")
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     input_tokens = int(v)
+            elif event == "content_block_start":
+                block = payload.get("content_block")
+                index = payload.get("index")
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and isinstance(index, int)
+                ):
+                    tool_blocks[index] = [
+                        block.get("id") if isinstance(block.get("id"), str) else "",
+                        block.get("name") if isinstance(block.get("name"), str) else "",
+                        [],
+                    ]
             elif event == "content_block_delta":
                 delta = payload.get("delta")
                 if not isinstance(delta, dict):
@@ -327,6 +403,40 @@ class AnthropicBackend:
                 ):
                     if delta["thinking"]:
                         yield LLMChunk(kind="reasoning", text=delta["thinking"])
+                elif delta.get("type") == "input_json_delta":
+                    index = payload.get("index")
+                    fragment = delta.get("partial_json")
+                    if (
+                        isinstance(index, int)
+                        and index in tool_blocks
+                        and isinstance(fragment, str)
+                    ):
+                        tool_blocks[index][2].append(fragment)
+            elif event == "content_block_stop":
+                index = payload.get("index")
+                if isinstance(index, int) and index in tool_blocks:
+                    call_id, name, fragments = tool_blocks.pop(index)
+                    raw = "".join(fragments)
+                    try:
+                        arguments = json.loads(raw) if raw.strip() else {}
+                    except json.JSONDecodeError as exc:
+                        raise LLMResponseError(
+                            f"工具调用 {name or '?'} 的 input 不是合法 JSON"
+                            f"（backend={self.name}）",
+                            backend=self.name,
+                            kind="bad_payload",
+                        ) from exc
+                    if not isinstance(arguments, dict):
+                        raise LLMResponseError(
+                            f"工具调用 {name or '?'} 的 input 不是 JSON 对象"
+                            f"（backend={self.name}）",
+                            backend=self.name,
+                            kind="bad_payload",
+                        )
+                    yield LLMChunk(
+                        kind="tool_call",
+                        tool_call=LLMToolCall(id=call_id, name=name, arguments=arguments),
+                    )
             elif event == "message_delta":
                 delta = payload.get("delta")
                 if isinstance(delta, dict) and delta.get("stop_reason") == "max_tokens":
@@ -339,7 +449,7 @@ class AnthropicBackend:
                     output_tokens = int(v)
             elif event == "message_stop":
                 break
-            # ping / content_block_start / content_block_stop 等事件不含增量，跳过。
+            # ping 等事件不含增量，跳过。
 
         if truncated:
             raise LLMResponseError(
@@ -401,7 +511,7 @@ class AnthropicBackend:
             )
         return payload
 
-    def _to_response(self, payload: dict[str, Any]) -> LLMResponse:
+    def _to_response(self, payload: dict[str, Any], *, tools_offered: bool = False) -> LLMResponse:
         blocks = payload.get("content")
         if not isinstance(blocks, list):
             raise LLMResponseError(
@@ -414,7 +524,30 @@ class AnthropicBackend:
             for b in blocks
             if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
         ]
-        if not texts:
+        tool_calls: list[LLMToolCall] = []
+        if tools_offered:
+            # 没给工具时收到的 tool_use 块按旧口径忽略（不解析、不校验），
+            # 保持「未请求工具的响应只认 text 块」的既有行为。
+            for b in blocks:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                call_id, name = b.get("id"), b.get("name")
+                if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+                    raise LLMResponseError(
+                        f"tool_use 内容块缺少 id 或 name（backend={self.name}）",
+                        backend=self.name,
+                        kind="bad_payload",
+                    )
+                raw_input = b.get("input")
+                tool_calls.append(
+                    LLMToolCall(
+                        id=call_id, name=name,
+                        arguments=raw_input if isinstance(raw_input, dict) else {},
+                    )
+                )
+        if not texts and not tool_calls:
+            # 没给工具时 tool_use 块不解析（上面已跳过），这里只剩
+            # 「既没文本也没（已请求的）工具调用」一种情况：坏响应。
             types = [b.get("type") for b in blocks if isinstance(b, dict)]
             raise LLMResponseError(
                 f"响应中没有 text 内容块（块类型：{types}，backend={self.name}）",
@@ -440,7 +573,10 @@ class AnthropicBackend:
 
         usage = usage_from_counts(_int("input_tokens"), _int("output_tokens"))
         model = payload.get("model") if isinstance(payload.get("model"), str) else self.model
-        return LLMResponse(text=text, usage=usage, model=model or self.model, backend=self.name)
+        return LLMResponse(
+            text=text, usage=usage, model=model or self.model, backend=self.name,
+            tool_calls=tool_calls,
+        )
 
     # ---- 健康检查 ----
 

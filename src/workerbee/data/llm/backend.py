@@ -33,6 +33,8 @@ __all__ = [
     "LLMMessage",
     "LLMResponse",
     "LLMChunk",
+    "LLMToolCall",
+    "LLMToolSpec",
     "LLMBackend",
     "SecretResolver",
     "LLMError",
@@ -64,11 +66,42 @@ BASE_URL_ALIASES: tuple[str, ...] = ("base_url", "baseurl", "endpoint", "url")
 # ---------------------------------------------------------------------------
 
 
-class LLMMessage(DomainModel):
-    """一次补全消息。角色集合与主流 API 一致，不引入额外的角色语义。"""
+class LLMToolCall(DomainModel):
+    """一次工具调用（function calling 的协议层形态）。
 
-    role: Literal["system", "user", "assistant"]
+    ``id`` 是协议分配的调用标识（OpenAI 的 ``call_…``、Anthropic 的 ``toolu_…``），
+    工具结果靠它回关联；``arguments`` 是已解析的参数对象。
+    """
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMToolSpec(DomainModel):
+    """一份工具声明。``parameters`` 是 JSON Schema 对象（各后端各自映射到
+    自己的协议字段：OpenAI 的 ``function.parameters``、Anthropic 的
+    ``input_schema``）。"""
+
+    name: str
+    description: str = ""
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMMessage(DomainModel):
+    """一次补全消息。角色集合与主流 API 一致，不引入额外的角色语义。
+
+    工具扩展（v0.03 D-D，全部可选，不加它们的调用方零改动）：
+    - assistant 消息可携带 ``tool_calls``（本轮模型发起的工具调用清单）；
+    - ``role="tool"`` 的消息是工具结果，``tool_call_id`` 回关联到那次调用，
+      ``content`` 是结果文本。
+    """
+
+    role: Literal["system", "user", "assistant", "tool"]
     content: str
+    tool_calls: list[LLMToolCall] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class LLMResponse(DomainModel):
@@ -93,6 +126,9 @@ class LLMResponse(DomainModel):
     degraded_reasons: list[str] = Field(default_factory=list)
     """降级原因链，形如 ``["openai-compat:rate_limit", ...]``。已过脱敏。"""
 
+    tool_calls: list[LLMToolCall] = Field(default_factory=list)
+    """本轮模型发起的工具调用（空列表 = 没有）。只在 tools 参与的调用里有意义。"""
+
     def degraded(self) -> bool:
         return self.fallback_from is not None
 
@@ -104,6 +140,8 @@ class LLMChunk(DomainModel):
     - 内容 chunk：``final=False``，``kind`` 区分正文增量（``"text"``）与推理过程
       增量（``"reasoning"``，DeepSeek 的 ``reasoning_content``、Anthropic 的
       ``thinking_delta`` 都归一到这里）；``text`` 是**增量**，不是累计值。
+    - 工具调用 chunk：``kind="tool_call"``，``tool_call`` 携带一次**完整**的
+      工具调用（协议层的增量片段由后端自己累积，调用方只看到组装好的结果）。
     - 终帧：``final=True``，携带本次调用的 ``usage`` / ``model`` / ``backend``。
       每个后端的流**恰好以一个终帧结束**——调用方据此取用量与实际后端名。
       真流式后端的终帧 ``text`` 为空；伪流式后端（``streamed=False``）会把
@@ -114,9 +152,12 @@ class LLMChunk(DomainModel):
       （如 harness CLI 的兜底实现）——调用方据此如实标注，不假装是逐字流式。
     """
 
-    kind: Literal["text", "reasoning"]
+    kind: Literal["text", "reasoning", "tool_call"]
     text: str = ""
     final: bool = False
+
+    tool_call: LLMToolCall | None = None
+    """``kind="tool_call"`` 时携带的完整工具调用；其它 chunk 上为 None。"""
 
     # ---- 以下字段只在终帧（final=True）上有意义 ----
 
@@ -355,9 +396,13 @@ class LLMBackend(Protocol):
     - ``stream`` 以恰好一个 ``final=True`` 的 :class:`LLMChunk` 终帧结束；
       第一个 chunk（含终帧）**到达之前**的失败，router 允许换后端重试，
       之后的失败必须原样抛出（内容已发出，不能换后端重发一遍）。
+    - ``supports_tools`` 如实声明是否接受 ``tools`` 参数。不支持的后端
+      收到 ``tools`` 时如实忽略（调用方负责显式降级提示，而不是让后端
+      假装工具可用）。
     """
 
     name: str
+    supports_tools: bool = False
 
     async def complete(
         self,
@@ -366,6 +411,7 @@ class LLMBackend(Protocol):
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> LLMResponse: ...
 
     def stream(
@@ -375,6 +421,7 @@ class LLMBackend(Protocol):
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> AsyncIterator[LLMChunk]: ...
 
     async def health(self) -> tuple[bool, str | None]:

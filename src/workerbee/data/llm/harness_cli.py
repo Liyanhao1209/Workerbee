@@ -48,6 +48,7 @@ from .backend import (
     LLMResponse,
     LLMMessage,
     LLMTimeoutError,
+    LLMToolSpec,
     LLMUnavailableError,
     system_text,
     transcript,
@@ -115,6 +116,10 @@ _RESULT_TYPE = "result"
 
 class HarnessCLIBackend:
     """通过子进程调用本机 harness CLI 的后端。"""
+
+    #: CLI 单次调用形态没有工具协议：如实声明不支持。调用方（chat 的
+    #: tool loop）据此显式降级为纯对话，而不是让工具请求静默消失（红线 4）。
+    supports_tools = False
 
     def __init__(
         self,
@@ -363,6 +368,7 @@ class HarnessCLIBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> LLMResponse:
         """跑一次 CLI 补全。
 
@@ -371,6 +377,9 @@ class HarnessCLIBackend:
         忽略并在返回值里不含任何「已生效」的暗示——CFG-02 的「不可用参数必须提示，
         不能静默忽略」在框架自身调用上同样适用：调用方若强依赖它们，应改用
         openai_compat / anthropic 后端。
+
+        ``tools`` 同样无法表达（本后端 ``supports_tools=False``）：收到时忽略，
+        是否降级由调用方决定并如实标注。
         """
         argv = self.build_argv(messages, output_format=self.output_format)
         effective_timeout = float(timeout or self.timeout)
@@ -401,15 +410,18 @@ class HarnessCLIBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> AsyncIterator[LLMChunk]:
         """**伪流式**：harness CLI 的单次调用形态拿不到增量，这里就是调
         :meth:`complete` 等全文返回后一次性 yield。
 
         终帧如实标 ``streamed=False``——调用方（助手服务）据此在结果上标注
-        「非流式」，而不是让界面假装逐字生成。
+        「非流式」，而不是让界面假装逐字生成。``tools`` 无法表达，忽略
+        （``supports_tools=False``，降级提示是调用方的责任）。
         """
         resp = await self.complete(
-            messages, max_tokens=max_tokens, temperature=temperature, timeout=timeout
+            messages, max_tokens=max_tokens, temperature=temperature, timeout=timeout,
+            tools=tools,
         )
         yield LLMChunk(
             kind="text",

@@ -31,6 +31,8 @@ from .backend import (
     LLMResponseError,
     LLMMessage,
     LLMTimeoutError,
+    LLMToolCall,
+    LLMToolSpec,
     SecretResolver,
     extract_credentials,
     resolve_credentials,
@@ -45,8 +47,74 @@ DEFAULT_TIMEOUT_S = 60.0
 _ERROR_SNIPPET_CHARS = 400
 
 
+def _message_wire(m: LLMMessage) -> dict[str, Any]:
+    """协议层消息 → OpenAI 线格式。None 字段一律不落，无工具的历史消息形状不变。"""
+    out: dict[str, Any] = {"role": m.role, "content": m.content}
+    if m.tool_calls:
+        out["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                },
+            }
+            for tc in m.tool_calls
+        ]
+    if m.role == "tool":
+        out["tool_call_id"] = m.tool_call_id
+        if m.name:
+            out["name"] = m.name
+    return out
+
+
+def _parse_tool_calls(raw: Any, *, backend: str) -> list[LLMToolCall]:
+    """把线格式 tool_calls 解析成协议层对象。arguments 不是合法 JSON 即坏响应。"""
+    if not isinstance(raw, list):
+        return []
+    calls: list[LLMToolCall] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function") if isinstance(item.get("function"), dict) else {}
+        name = fn.get("name")
+        call_id = item.get("id")
+        if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+            raise LLMResponseError(
+                f"工具调用缺少 id 或 name（backend={backend}）",
+                backend=backend,
+                kind="bad_payload",
+            )
+        args_raw = fn.get("arguments")
+        if isinstance(args_raw, dict):
+            arguments = args_raw
+        elif isinstance(args_raw, str):
+            try:
+                arguments = json.loads(args_raw) if args_raw.strip() else {}
+            except json.JSONDecodeError as exc:
+                raise LLMResponseError(
+                    f"工具调用 {name} 的参数不是合法 JSON（backend={backend}）",
+                    backend=backend,
+                    kind="bad_payload",
+                ) from exc
+            if not isinstance(arguments, dict):
+                raise LLMResponseError(
+                    f"工具调用 {name} 的参数不是 JSON 对象（backend={backend}）",
+                    backend=backend,
+                    kind="bad_payload",
+                )
+        else:
+            arguments = {}
+        calls.append(LLMToolCall(id=call_id, name=name, arguments=arguments))
+    return calls
+
+
 class OpenAICompatBackend:
     """``/chat/completions`` 形态的后端。"""
+
+    #: 本后端支持 OpenAI tools/function-calling 协议。
+    supports_tools = True
 
     def __init__(
         self,
@@ -147,16 +215,29 @@ class OpenAICompatBackend:
         max_tokens: int | None,
         temperature: float | None,
         stream: bool = False,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.model,
-            "messages": [m.model_dump() for m in messages],
+            "messages": [_message_wire(m) for m in messages],
         }
         effective_max = max_tokens if max_tokens is not None else self.default_max_tokens
         if effective_max is not None:
             body["max_tokens"] = int(effective_max)
         if temperature is not None:
             body["temperature"] = float(temperature)
+        if tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    },
+                }
+                for t in tools
+            ]
         if stream:
             body["stream"] = True
             # 流式下 usage 默认不回传：显式要求带，否则终帧只能记「未知」。
@@ -171,12 +252,13 @@ class OpenAICompatBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> LLMResponse:
         base_url, key = await self._credentials()
         url = f"{base_url}/chat/completions"
 
         body = self._build_body(
-            messages, max_tokens=max_tokens, temperature=temperature
+            messages, max_tokens=max_tokens, temperature=temperature, tools=tools
         )
 
         headers = {
@@ -214,11 +296,14 @@ class OpenAICompatBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        tools: Sequence[LLMToolSpec] | None = None,
     ) -> AsyncIterator[LLMChunk]:
         """SSE 流式补全。逐 delta yield，恰以一个 ``final=True`` 的终帧结束。
 
         增量映射：``delta.content`` → text chunk；``delta.reasoning_content``
-        → reasoning chunk（DeepSeek 等兼容服务用这个字段名回传思维链）。
+        → reasoning chunk（DeepSeek 等兼容服务用这个字段名回传思维链）；
+        ``delta.tool_calls`` 按 ``index`` 累积 id/name/arguments 片段，
+        在收尾时按序产出 ``kind="tool_call"`` 的完整调用 chunk。
         usage 只在 ``stream_options.include_usage`` 换来的最后一个空 choices
         数据帧里出现，由终帧携带；对端不给时终帧 ``usage=None``（未知 ≠ 0）。
 
@@ -228,7 +313,8 @@ class OpenAICompatBackend:
         base_url, key = await self._credentials()
         url = f"{base_url}/chat/completions"
         body = self._build_body(
-            messages, max_tokens=max_tokens, temperature=temperature, stream=True
+            messages, max_tokens=max_tokens, temperature=temperature, stream=True,
+            tools=tools,
         )
         headers = {
             "Authorization": f"Bearer {key.reveal()}",
@@ -264,6 +350,8 @@ class OpenAICompatBackend:
         model: str | None = None
         usage = None
         truncated = False
+        # index → [id, name, arguments 片段]：工具调用的增量按 index 累积。
+        pending_calls: dict[int, list[Any]] = {}
         async for line in resp.aiter_lines():
             if not line or line.startswith(":"):
                 continue  # 空行与 SSE 注释（keep-alive）
@@ -305,6 +393,22 @@ class OpenAICompatBackend:
             content = delta.get("content")
             if isinstance(content, str) and content:
                 yield LLMChunk(kind="text", text=content)
+            tool_deltas = delta.get("tool_calls")
+            if isinstance(tool_deltas, list):
+                for item in tool_deltas:
+                    if not isinstance(item, dict):
+                        continue
+                    index = item.get("index")
+                    if not isinstance(index, int):
+                        index = len(pending_calls)
+                    slot = pending_calls.setdefault(index, ["", "", []])
+                    if isinstance(item.get("id"), str):
+                        slot[0] = item["id"]
+                    fn = item.get("function") if isinstance(item.get("function"), dict) else {}
+                    if isinstance(fn.get("name"), str):
+                        slot[1] = fn["name"]
+                    if isinstance(fn.get("arguments"), str):
+                        slot[2].append(fn["arguments"])
             if first.get("finish_reason") == "length":
                 # 与 complete 同一口径：截断即失败，不把半截文本当完整回复。
                 truncated = True
@@ -315,6 +419,13 @@ class OpenAICompatBackend:
                 backend=self.name,
                 kind="output_truncated",
             )
+        for index in sorted(pending_calls):
+            call_id, name, fragments = pending_calls[index]
+            for call in _parse_tool_calls(
+                [{"id": call_id, "function": {"name": name, "arguments": "".join(fragments)}}],
+                backend=self.name,
+            ):
+                yield LLMChunk(kind="tool_call", tool_call=call)
         yield LLMChunk(
             kind="text", final=True, usage=usage, model=model or self.model,
             backend=self.name,
@@ -361,16 +472,21 @@ class OpenAICompatBackend:
             )
         first = choices[0] if isinstance(choices[0], dict) else {}
         message = first.get("message") if isinstance(first.get("message"), dict) else {}
+        tool_calls = _parse_tool_calls(message.get("tool_calls"), backend=self.name)
         text = message.get("content")
         if not isinstance(text, str):
             # 兼容少数网关把正文放在 text 字段的形态；都不满足即失败。
             text = first.get("text") if isinstance(first.get("text"), str) else None
         if not isinstance(text, str):
-            raise LLMResponseError(
-                f"响应中取不到文本内容（backend={self.name}）",
-                backend=self.name,
-                kind="bad_payload",
-            )
+            if tool_calls:
+                # 纯工具调用轮：content 为 null 是协议的正常形态，不是缺内容。
+                text = ""
+            else:
+                raise LLMResponseError(
+                    f"响应中取不到文本内容（backend={self.name}）",
+                    backend=self.name,
+                    kind="bad_payload",
+                )
 
         finish_reason = first.get("finish_reason")
         if finish_reason == "length":
@@ -389,7 +505,10 @@ class OpenAICompatBackend:
 
         usage = usage_from_counts(_int("prompt_tokens"), _int("completion_tokens"))
         model = payload.get("model") if isinstance(payload.get("model"), str) else self.model
-        return LLMResponse(text=text, usage=usage, model=model or self.model, backend=self.name)
+        return LLMResponse(
+            text=text, usage=usage, model=model or self.model, backend=self.name,
+            tool_calls=tool_calls,
+        )
 
     # ---- 健康检查 ----
 

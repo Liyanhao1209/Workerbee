@@ -58,6 +58,7 @@ __all__ = [
     "ApprovalRepository",
     "AssistantRepository",
     "CaptureRepository",
+    "ChatRepository",
     "WorkspaceRepository",
     "DEFAULT_WORKSPACE_ID",
     "DEFAULT_WORKSPACE_NAME",
@@ -2014,6 +2015,255 @@ class CaptureRepository:
 
 
 # ===========================================================================
+# Web Chat（v0.03 §5、§6.2，迁移 13）
+# ===========================================================================
+
+
+class ChatRepository:
+    """chat 会话与节点树。与 AssistantRepository 一样返回普通字典——
+    字段集就是表结构本身（迁移 13）。
+
+    树语义（§6.2）：``parent_id`` NULL 表示树根（森林多根）；``deleted_at``
+    是软删除标记（D-F），读路径默认过滤。本阶段不提供改写正文的路径——
+    对话历史只增不改，与助手域同一纪律。
+    """
+
+    _SESSION_UPDATABLE = {"title", "closed", "credential_ref", "model_override"}
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    # ---- session ----
+
+    async def create_session(
+        self,
+        session_id: str,
+        *,
+        workspace_id: str,
+        title: str = "",
+        credential_ref: str | None = None,
+        model_override: str | None = None,
+    ) -> dict[str, Any]:
+        now = utcnow().isoformat()
+        await self.db.execute(
+            """INSERT INTO chat_session(session_id, workspace_id, title,
+                   credential_ref, model_override, closed, created_at, updated_at)
+               VALUES (?,?,?,?,?,0,?,?)""",
+            (session_id, workspace_id, title, credential_ref, model_override, now, now),
+        )
+        return {
+            "session_id": session_id,
+            "workspace_id": workspace_id,
+            "title": title,
+            "credential_ref": credential_ref,
+            "model_override": model_override,
+            "closed": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    async def get_session(self, session_id: str) -> dict[str, Any] | None:
+        row = await self.db.fetch_one(
+            "SELECT * FROM chat_session WHERE session_id=?", (session_id,)
+        )
+        return self._to_session(row) if row else None
+
+    async def list_sessions(
+        self, *, workspace_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        if workspace_id is None:
+            rows = await self.db.fetch_all(
+                "SELECT * FROM chat_session ORDER BY updated_at DESC LIMIT ?", (limit,)
+            )
+        else:
+            rows = await self.db.fetch_all(
+                """SELECT * FROM chat_session WHERE workspace_id=?
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (workspace_id, limit),
+            )
+        return [self._to_session(r) for r in rows]
+
+    async def update_session(self, session_id: str, **fields: Any) -> bool:
+        """白名单元信息更新（title/closed/credential_ref/model_override）。"""
+        sets: list[str] = []
+        params: list[Any] = []
+        for k, v in fields.items():
+            if k not in self._SESSION_UPDATABLE:
+                raise ValueError(f"不可更新的 chat 会话字段: {k}")
+            sets.append(f"{k}=?")
+            params.append(int(v) if isinstance(v, bool) else v)
+        if not sets:
+            return True
+        sets.append("updated_at=?")
+        params.append(utcnow().isoformat())
+        params.append(session_id)
+        return (
+            await self.db.execute_rowcount(
+                f"UPDATE chat_session SET {', '.join(sets)} WHERE session_id=?",
+                params,
+            )
+            > 0
+        )
+
+    async def delete_session(self, session_id: str) -> bool:
+        """硬删会话；chat_node 经 ON DELETE CASCADE 一并删除。"""
+        return (
+            await self.db.execute_rowcount(
+                "DELETE FROM chat_session WHERE session_id=?", (session_id,)
+            )
+            > 0
+        )
+
+    # ---- node ----
+
+    async def append_node(
+        self,
+        *,
+        node_id: str,
+        session_id: str,
+        parent_id: str | None,
+        role: str,
+        content: str,
+        reasoning: str | None = None,
+        backend: str | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
+        """追加一个节点，并把会话的 updated_at 顶到最新（列表按它排序）。"""
+        now = utcnow().isoformat()
+        async with self.db.transaction():
+            await self.db.execute(
+                """INSERT INTO chat_node(node_id, session_id, parent_id, role, content,
+                       reasoning, backend, tokens_in, tokens_out,
+                       tool_calls, tool_name, tool_call_id, deleted_at, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)""",
+                (
+                    node_id,
+                    session_id,
+                    parent_id,
+                    role,
+                    content,
+                    reasoning,
+                    backend,
+                    tokens_in,
+                    tokens_out,
+                    dumps(tool_calls) if tool_calls is not None else None,
+                    tool_name,
+                    tool_call_id,
+                    now,
+                ),
+            )
+            await self.db.execute(
+                "UPDATE chat_session SET updated_at=? WHERE session_id=?",
+                (now, session_id),
+            )
+        return {
+            "node_id": node_id,
+            "session_id": session_id,
+            "parent_id": parent_id,
+            "role": role,
+            "content": content,
+            "reasoning": reasoning,
+            "backend": backend,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "tool_calls": tool_calls,
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "deleted_at": None,
+            "created_at": now,
+        }
+
+    async def get_node(self, node_id: str) -> dict[str, Any] | None:
+        row = await self.db.fetch_one(
+            "SELECT * FROM chat_node WHERE node_id=?", (node_id,)
+        )
+        return self._to_node(row) if row else None
+
+    async def list_nodes(
+        self, session_id: str, *, include_deleted: bool = False, limit: int = 5000
+    ) -> list[dict[str, Any]]:
+        """按插入顺序取回一个会话的节点（同刻以 rowid 定序）。默认过滤软删除。"""
+        where = "session_id=?" if include_deleted else "session_id=? AND deleted_at IS NULL"
+        rows = await self.db.fetch_all(
+            f"SELECT * FROM chat_node WHERE {where} ORDER BY created_at, rowid LIMIT ?",
+            (session_id, limit),
+        )
+        return [self._to_node(r) for r in rows]
+
+    async def children(
+        self, session_id: str, parent_id: str | None
+    ) -> list[dict[str, Any]]:
+        """取某节点的未删除子节点（分支判定用），插入顺序。"""
+        if parent_id is None:
+            rows = await self.db.fetch_all(
+                """SELECT * FROM chat_node
+                   WHERE session_id=? AND parent_id IS NULL AND deleted_at IS NULL
+                   ORDER BY created_at, rowid""",
+                (session_id,),
+            )
+        else:
+            rows = await self.db.fetch_all(
+                """SELECT * FROM chat_node
+                   WHERE session_id=? AND parent_id=? AND deleted_at IS NULL
+                   ORDER BY created_at, rowid""",
+                (session_id, parent_id),
+            )
+        return [self._to_node(r) for r in rows]
+
+    async def latest_leaf(self, session_id: str) -> dict[str, Any] | None:
+        """当前分支的叶节点：插入顺序上最新的未删除节点。
+
+        线性使用下它就是对话的末尾；有分叉时它是「最近活跃的那条分支」的末端，
+        前端据此选定默认分支。
+        """
+        row = await self.db.fetch_one(
+            """SELECT * FROM chat_node
+               WHERE session_id=? AND deleted_at IS NULL
+               ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (session_id,),
+        )
+        return self._to_node(row) if row else None
+
+    # ---- mappers ----
+
+    @staticmethod
+    def _to_session(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "session_id": row["session_id"],
+            "workspace_id": row["workspace_id"],
+            "title": row["title"],
+            "credential_ref": row["credential_ref"],
+            "model_override": row["model_override"],
+            "closed": bool(row["closed"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _to_node(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "node_id": row["node_id"],
+            "session_id": row["session_id"],
+            "parent_id": row["parent_id"],
+            "role": row["role"],
+            "content": row["content"],
+            "reasoning": row["reasoning"],
+            "backend": row["backend"],
+            "tokens_in": row["tokens_in"],
+            "tokens_out": row["tokens_out"],
+            "tool_calls": loads(row["tool_calls"], None),
+            "tool_name": row["tool_name"],
+            "tool_call_id": row["tool_call_id"],
+            "deleted_at": row["deleted_at"],
+            "created_at": row["created_at"],
+        }
+
+
+# ===========================================================================
 # 可更新字段白名单与编码
 # ===========================================================================
 
@@ -2109,6 +2359,7 @@ class Store:
         self.approvals = ApprovalRepository(db)
         self.assistant = AssistantRepository(db)
         self.capture = CaptureRepository(db)
+        self.chat = ChatRepository(db)
         self.events = EventLog(db)
         self.artifacts = ArtifactStore(db)
         self.messages = MessageBus(db)

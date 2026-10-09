@@ -1241,3 +1241,196 @@ kbd,
     transform: rotate(360deg);
   }
 }
+
+/* ===========================================================================
+ * Web Chat 页（v0.03 §5）：三栏布局——会话列表 ｜ 对话流 ｜ 文件树
+ * =========================================================================== */
+
+.chatpage {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.chatpage__sessions {
+  width: 200px;
+  flex: 0 0 auto;
+  border-right: 1px solid var(--line);
+  background: var(--bg-1);
+  overflow-y: auto;
+  padding: var(--sp-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.chatpage__sessions-head {
+  display: flex;
+  align-items: center;
+  margin-bottom: var(--sp-1);
+}
+.chatpage__sessions-empty {
+  color: var(--fg-3);
+  font-size: var(--fs-xs);
+  padding: var(--sp-2);
+}
+.chatpage__session {
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--fg-1);
+  font-size: var(--fs-sm);
+  padding: var(--sp-1) var(--sp-2);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chatpage__session:hover {
+  background: var(--bg-2);
+}
+.chatpage__session--active {
+  border-color: var(--accent-dim);
+  background: var(--accent-bg);
+}
+.chatpage__main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.chatpage__main-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.chatpage__badge {
+  font-size: var(--fs-xs);
+  color: var(--st-warn);
+  border: 1px solid var(--st-warn);
+  border-radius: var(--radius);
+  padding: 0 var(--sp-1);
+}
+.chatpage__refs {
+  font-size: var(--fs-xs);
+  color: var(--fg-3);
+  margin-bottom: var(--sp-1);
+  display: flex;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.chatpage__files {
+  width: 240px;
+  flex: 0 0 auto;
+  border-left: 1px solid var(--line);
+  background: var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* 工具往返节点：折叠展示，如实可见但不占对话流主体。 */
+.chat-tool {
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--fg-2);
+  background: var(--bg-1);
+}
+.chat-tool summary {
+  cursor: pointer;
+  user-select: none;
+}
+.chat-tool__body {
+  margin: var(--sp-1) 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.chat-toolcalls {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+  color: var(--fg-2);
+}
+.chat-toolcalls__item {
+  padding: 1px 0;
+}
+
+/* 工作区文件树：目录懒加载，点击文件插入 @引用。 */
+.filetree {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.filetree__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  border-bottom: 1px solid var(--line);
+}
+.filetree__body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: var(--sp-1) 0;
+}
+.filetree__row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  color: var(--fg-1);
+  font-size: var(--fs-xs);
+  padding: 2px var(--sp-2);
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.filetree__row:hover:not(:disabled) {
+  background: var(--bg-2);
+}
+.filetree__row:disabled {
+  color: var(--fg-3);
+  cursor: not-allowed;
+}
+.filetree__row--dir {
+  font-weight: 500;
+}
+.filetree__icon {
+  flex: 0 0 auto;
+  color: var(--fg-3);
+  width: 14px;
+  text-align: center;
+}
+.filetree__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.filetree__badge {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  color: var(--st-warn);
+  border: 1px solid var(--st-warn);
+  border-radius: var(--radius);
+  padding: 0 2px;
+}
+.filetree__loading,
+.filetree__empty {
+  color: var(--fg-3);
+  font-size: var(--fs-xs);
+  padding: 2px var(--sp-2);
+}
+.filetree__error {
+  color: var(--st-danger);
+  font-size: var(--fs-xs);
+  padding: var(--sp-2);
+}

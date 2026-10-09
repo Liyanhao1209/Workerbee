@@ -14,6 +14,7 @@ import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { useConnection } from '../store/connection';
 import { attentionCount, useAttention, wireAttention } from '../store/attention';
 import { wireAssistant } from '../store/assistant';
+import { wireChat } from '../store/chat';
 import { hostingDescription, useSystem, wireSystem } from '../store/system';
 import { useWorkspace, wireWorkspace } from '../store/workspace';
 import { AssistantPanel } from './AssistantPanel';
@@ -23,6 +24,7 @@ import { Banner } from './common';
 const NAV = [
   { to: '/workflows', label: '流程' },
   { to: '/captures', label: '捕获' },
+  { to: '/chat', label: '对话' },
   { to: '/tasks', label: '任务' },
   { to: '/execution', label: '执行图' },
   { to: '/sessions', label: '会话' },
@@ -50,6 +52,7 @@ export function AppShell(): JSX.Element {
   useEffect(() => {
     wireAttention();
     wireAssistant();
+    wireChat();
     wireSystem();
     wireWorkspace();
     void check();

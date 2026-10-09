@@ -130,6 +130,26 @@ __all__ = [
     "CaptureRunDetailResponse",
     "CaptureDraftResponse",
     "CaptureDraftAdoptRequest",
+    # Web Chat（v0.03 §5）
+    "ChatSessionCreateRequest",
+    "ChatSessionRenameRequest",
+    "ChatSessionResponse",
+    "ChatSessionListResponse",
+    "ChatSessionDeleteResponse",
+    "ChatNodeResponse",
+    "ChatMessageListResponse",
+    "ChatSendRequest",
+    "ChatSendResponse",
+    # 工作区文件系统（v0.03 §5.4）
+    "FsEntry",
+    "FsListResponse",
+    "FsReadResponse",
+    "FsWriteRequest",
+    "FsWriteResponse",
+    "FsMkdirRequest",
+    "FsMoveRequest",
+    "FsDeleteRequest",
+    "FsOpResponse",
     # 领域模型的再导出：前端契约与领域字段集保持一致
     "Approval",
     "Attempt",
@@ -1185,6 +1205,167 @@ class CaptureDraftAdoptRequest(ApiRequest):
     """采用草案。``as_template=True`` 时存为模板而不是建流程。"""
 
     as_template: bool = False
+
+
+# ===========================================================================
+# Web Chat（Phase 3a：对话 + 文件系统工具）
+# ===========================================================================
+
+
+class ChatSessionCreateRequest(ApiRequest):
+    """开新对话。留空字段走缺省：标题自动起、工作区用当前工作区、
+    凭据/模型回落到助手配置。"""
+
+    title: str | None = None
+    workspace_id: str | None = None
+    credential_ref: str | None = None
+    model_override: str | None = None
+
+
+class ChatSessionResponse(ApiResponse):
+    session_id: str
+    workspace_id: str
+    title: str = ""
+    credential_ref: str | None = None
+    model_override: str | None = None
+    closed: bool = False
+    created_at: str
+    updated_at: str
+
+
+class ChatSessionListResponse(ApiResponse):
+    sessions: list[ChatSessionResponse] = Field(default_factory=list)
+    returned: int = 0
+
+
+class ChatSessionRenameRequest(ApiRequest):
+    """改对话名。故意不用字段级校验：非法取值由服务层报 400 + 大白话。"""
+
+    title: str
+
+
+class ChatSessionDeleteResponse(ApiResponse):
+    session_id: str
+    deleted: bool = True
+    note: str | None = None
+
+
+class ChatNodeResponse(ApiResponse):
+    """对话树上的一个节点。``tool_calls``/``tool_name``/``tool_call_id``
+    仅工具往返节点携带；``tokens_*`` 为 None 表示后端没给用量。"""
+
+    node_id: str
+    session_id: str
+    parent_id: str | None = None
+    role: str
+    """user / assistant / tool / system。"""
+    content: str
+    reasoning: str | None = None
+    backend: str | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    created_at: str
+
+
+class ChatMessageListResponse(ApiResponse):
+    """从根到指定叶（缺省最新叶）的线性消息路径。"""
+
+    messages: list[ChatNodeResponse] = Field(default_factory=list)
+    leaf_id: str | None = None
+    returned: int = 0
+
+
+class ChatSendRequest(ApiRequest):
+    content: str
+    """用户的消息。空白内容会被拒绝。"""
+    parent_id: str | None = None
+    """缺省挂在最新叶之后；显式给出则从该节点分叉（重答/改问）；
+    空串表示显式挂在树根（改问第一条消息）。"""
+    refs: list[str] = Field(default_factory=list)
+    """``@路径`` 引用清单（相对工作区根），发送时把文件内容注入上下文。"""
+
+
+class ChatSendResponse(ApiResponse):
+    """一轮问答的结果：最终回复 + 本轮新生的全部节点（含工具往返）。"""
+
+    reply: ChatNodeResponse
+    user_node: ChatNodeResponse
+    nodes: list[ChatNodeResponse] = Field(default_factory=list)
+    dropped: int = 0
+    """因窗口限制未随本次发送的更早节点数。"""
+    degraded: bool = False
+    degraded_reasons: list[str] = Field(default_factory=list)
+    supports_tools: bool = True
+    """False 表示当前后端不支持工具，本轮退化为纯对话（如实告知）。"""
+
+
+class FsEntry(ApiResponse):
+    name: str
+    path: str
+    """相对工作区根的路径。"""
+    type: str
+    """file / dir。"""
+    size: int | None = None
+    mtime: str | None = None
+    hidden: bool = False
+    sensitive: bool = False
+    """命中敏感名（.env、私钥等）：列表可见但读写被拒。"""
+
+
+class FsListResponse(ApiResponse):
+    path: str
+    entries: list[FsEntry] = Field(default_factory=list)
+    returned: int = 0
+
+
+class FsReadResponse(ApiResponse):
+    path: str
+    content: str
+    truncated: bool = False
+    size: int = 0
+    mtime: str | None = None
+    """写回时用作 expected_mtime 的乐观并发凭证。"""
+
+
+class FsWriteRequest(ApiRequest):
+    path: str
+    content: str
+    expected_mtime: str | None = None
+    """覆盖已存在文件时必须携带（读时拿到的 mtime），不符返回 409。"""
+    workspace_id: str | None = None
+
+
+class FsWriteResponse(ApiResponse):
+    path: str
+    size: int = 0
+    mtime: str | None = None
+
+
+class FsMkdirRequest(ApiRequest):
+    path: str
+    workspace_id: str | None = None
+
+
+class FsMoveRequest(ApiRequest):
+    src: str
+    dst: str
+    workspace_id: str | None = None
+
+
+class FsDeleteRequest(ApiRequest):
+    path: str
+    workspace_id: str | None = None
+
+
+class FsOpResponse(ApiResponse):
+    """mkdir / move / delete 共用的结果形状。"""
+
+    ok: bool
+    path: str
+    detail: str | None = None
 
 
 StorageReportResponse.model_rebuild()

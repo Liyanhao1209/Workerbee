@@ -28,6 +28,8 @@ from .backend import (
     LLMResponse,
     LLMResponseError,
     LLMTimeoutError,
+    LLMToolCall,
+    LLMToolSpec,
     LLMUnavailableError,
     SecretResolver,
     extract_credentials,
@@ -48,6 +50,8 @@ __all__ = [
     "LLMMessage",
     "LLMResponse",
     "LLMChunk",
+    "LLMToolCall",
+    "LLMToolSpec",
     "LLMBackend",
     "SecretResolver",
     # 后端
