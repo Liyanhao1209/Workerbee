@@ -360,3 +360,24 @@ if not real.is_relative_to(root): 403             # 同时拦住 ../ 与 symlink
 | R4 | spawn supervisor 的孤儿进程/生命周期语义混乱 | 中 | `stop` 语义明确；锁文件 + 探活复用既有实例；README 写清进程拓扑 |
 | R5 | chat 与 assistant 双域并存造成用户困惑 | 低 | UI 命名区分（助手=只读问答 / 对话=可操作文件）；远期合并路线写入架构文档 |
 | R6 | 会话级审批授权被滥用放大风险 | 低 | 授权仅当前会话有效、按操作类别粒度；危险命令模式始终排除在外 |
+
+---
+
+## 10. 实现状态记录（2026-10-09 收尾）
+
+v0.03 四个 Phase 已全部按本文档实现并提交（分支 wb-main，未 push）。验证基线：后端 pytest 1085 passed / 1 skipped（interactive 排除）、前端 vitest 79 例全过、`npm run build` 绿、单命令端到端冒烟通过（serve 拉起 → workspace 按 cwd 自动注册 → chat/fs API 鉴权 → 路径逃逸 403 → stop 干净收束）。
+
+| Phase | Commit | 交付要点 | 实施期偏离（已审阅，均符合 §0.4 红线精神） |
+|---|---|---|---|
+| 1 单命令启动 | `bacab33` | `workerbee serve/stop`；裸 `workerbee`≡serve；锁文件+端口探测；token 文件化（chmod 600）CLI 自动读；dist 入 wheel + 三级回退；data-dir 默认 ~/.workerbee；修 use_supervisor 转发 bug | 另修复两个既存接线 bug：cli core 包装 argv 多带程序名导致必失败；supervisor 的 shutdown RPC 不终止进程（僵尸） |
+| 2 Workspace | `db78704` | migration 12；workspace CRUD/move/归档冻结发射；Scheduler cwd 按 workspace 解析；managed_roots 多 root；serve 最长前缀匹配+自动注册；前端顶栏切换器 | 修复 store.py 布尔更新 bug（False 被写成 1，取消归档曾永不生效） |
+| 3a Chat 主干 | `ca024b6` | migration 13（chat_session/chat_node 原生树）；LLM 协议层 tools（openai_compat/anthropic；harness_cli 显式不支持）；tool loop（25 轮上限）；六 FS 工具 + confinement + 敏感名拒读 + mtime CAS；模型发起的写过审批网关；Chat 页三栏 + @路径引用 | chat_node 增 tool_calls/tool_name/tool_call_id 三列（工具往返重放需要）；工具节点链式串联（assistant→tool→assistant）；REST FS 写端点不过审批（用户点击即批准，只留痕）；parent_id="" 表显式挂树根 |
+| 3b 执行与加固 | `c6d26af` | fs_run（60s 默认/300s 封顶、杀进程组防挂死、输出尾部 100KB）；D-G 落地：逐次审批默认 + 会话级授权（migration 14 的 grants 列）+ 危险命令模式（rm/sudo/dd/mkfs/fork 炸弹等）始终审批；红队测试进 AC | 授权存 chat_session 新列而非 meta_kv（随会话级联删除）；补 POST /api/fs/run REST 端点 |
+| 4 Fork 树 | `a3c5d1c` | tree/fork/delete(批次软删)/restore/move(环检测 409)/purge API；chat_tree_changed 推送；layoutForest 纯函数布局；分支视图（点选合并、非法目标禁用、确认+撤销）；hover 分叉入口 + 兄弟分支徽标 | 恢复按删除批次语义（共享 deleted_at）；撤销=响应返回 previous_parent_id 再移回；fork 端点不落库（分叉发生在下一次带 parent_id 发送）；**拖拽合并未做，点选合并已完整交付** |
+
+**遗留事项（后续迭代候选）**：
+1. 拖拽合并子树（onNodeDrag 命中检测 + 悬停高亮）——§6.3 定位的增强迭代。
+2. 审批决定内嵌到 Chat 页横幅（目前需去审批中心操作）；文件树的预览/编辑/重命名 UI（REST 已就绪）。
+3. 查询类 CLI 在 serve 使用自定义 --data-dir 时不会自动找到 token 文件。
+4. 危险命令模式清单是启发式（注释已明示"不是沙箱"），真实边界在审批层。
+5. 需求清单新编号（WS-/SRV-/CHAT-/FS-/FORK-）与 AC 的正式登记尚未写回《功能需求清单》文档。
