@@ -90,3 +90,25 @@ async def send_message(
 ) -> S.ChatSendResponse:
     """一轮问答同步返回；工具往返与等待审批期间经 WS 推 ``chat_status``。"""
     return await services.chat.send_message(session_id, req)
+
+
+@router.put(
+    "/api/chat/sessions/{session_id}/grants",
+    response_model=S.ChatSessionResponse,
+    summary="授予本会话某类操作的临时授权（本会话不再逐次询问，D-G）",
+)
+async def grant_session(
+    session_id: str, req: S.ChatGrantRequest, services: ServicesDep
+) -> S.ChatSessionResponse:
+    return await services.chat.grant_session(session_id, req)
+
+
+@router.delete(
+    "/api/chat/sessions/{session_id}/grants/{category}",
+    response_model=S.ChatSessionResponse,
+    summary="撤销本会话某类操作的临时授权（恢复逐次审批）",
+)
+async def revoke_session_grant(
+    session_id: str, category: str, services: ServicesDep
+) -> S.ChatSessionResponse:
+    return await services.chat.revoke_session_grant(session_id, category)

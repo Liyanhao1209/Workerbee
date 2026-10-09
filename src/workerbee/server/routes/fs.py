@@ -77,3 +77,15 @@ async def move_entry(req: S.FsMoveRequest, services: ServicesDep) -> S.FsOpRespo
 )
 async def delete_entry(req: S.FsDeleteRequest, services: ServicesDep) -> S.FsOpResponse:
     return await services.fs.delete_entry(req)
+
+
+@router.post(
+    "/api/fs/run",
+    response_model=S.FsRunResponse,
+    summary="在工作区内执行 shell 命令（cwd 限定工作区；超时与截断如实标注）",
+)
+async def run_command(req: S.FsRunRequest, services: ServicesDep) -> S.FsRunResponse:
+    """用户亲手发起的命令不再过审批（点按钮本身就是批准）；命令经 shell 执行，
+    威力与终端一致——这个端点只限本机 loopback + token 使用（--allow-remote
+    会显著放大它的风险，见 §5.4）。"""
+    return await services.fs.run_command(req)

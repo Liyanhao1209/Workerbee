@@ -69,6 +69,8 @@ interface ChatStoreState {
   deleteSession: () => Promise<boolean>;
   reloadMessages: () => Promise<void>;
   send: (content: string, refs?: string[]) => Promise<boolean>;
+  /** 撤销本会话某类操作的临时授权（D-G），恢复逐次审批。 */
+  revokeGrant: (category: string) => Promise<boolean>;
 }
 
 export const useChat = create<ChatStoreState>((set, get) => ({
@@ -181,6 +183,19 @@ export const useChat = create<ChatStoreState>((set, get) => ({
     }
   },
 
+  revokeGrant: async (category) => {
+    const sessionId = get().activeSessionId;
+    if (!sessionId) return false;
+    try {
+      await chatApi.revokeGrant(sessionId, category);
+      await get().refreshSessions();
+      return true;
+    } catch (err) {
+      set({ sendError: asFailure(err, '撤销授权失败。') });
+      return false;
+    }
+  },
+
   send: async (content, refs = []) => {
     const text = content.trim();
     if (!text || get().sending) return false;
@@ -267,6 +282,14 @@ export function wireChat(): void {
         useChat.setState({ pendingStatus: { status, detail, approvalId } });
       } else {
         useChat.setState({ pendingStatus: null });
+      }
+      return;
+    }
+    if (push.kind === 'chat_session') {
+      // 会话属性变化（如在审批中心授予了临时授权）：重拉列表对齐授权标识。
+      const sessionId = typeof push.payload['session_id'] === 'string' ? push.payload['session_id'] : null;
+      if (sessionId && sessionId === state.activeSessionId) {
+        void state.refreshSessions();
       }
     }
   });

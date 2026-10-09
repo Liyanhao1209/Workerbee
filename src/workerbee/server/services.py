@@ -49,7 +49,10 @@ from ..assistant import AssistantConfig, AssistantError
 from ..assistant.draft import DraftInvalid, DraftProposal, proposal_graph
 from ..capture import CaptureError
 from ..chat import fs as chat_fs
-from ..chat.service import ChatError
+from ..chat import run as chat_run
+from ..chat.service import ChatError, tool_grant_category
+from ..chat.tools import APPROVAL_TOOLS as CHAT_APPROVAL_TOOLS
+from ..chat.tools import RUN_TIMEOUT_CAP_S as CHAT_RUN_TIMEOUT_CAP_S
 from ..data.db import ConflictError
 from ..data.event_log import EventActor, EventScope, EventType
 from ..data.store import DEFAULT_WORKSPACE_ID
@@ -1365,6 +1368,7 @@ class ApprovalService(_Service):
         """做决定并回注。
 
         **重复决定不报错**：内核返回「实际生效结果」，网关原样呈现（AC-14）。
+        ``grant_session``（D-G）在批准 chat 域审批时额外记录会话级临时授权。
         """
         try:
             result = await self.engine.approve(
@@ -1376,6 +1380,8 @@ class ApprovalService(_Service):
         except KeyError as exc:
             raise NotFound(f"审批不存在: {approval_id}") from exc
 
+        grant_note = await self._apply_session_grant(approval_id, req) if req.grant_session else None
+
         # 决定已产生但没送达时，库里存的是 undeliverable；返回的 status 必须与之一致，
         # 否则前端会以为这条已经不欠处理，而它其实还挂在「需处理」列表里（HUM-04）。
         stored = await self.store.approvals.get(approval_id)
@@ -1383,12 +1389,36 @@ class ApprovalService(_Service):
         detail = result.detail
         if not result.delivered and status == ApprovalStatus.UNDELIVERABLE:
             detail = detail or "决定已记录，但未送达原会话；该审批已标记为 undeliverable，可重试回注"
+        if grant_note:
+            detail = f"{detail}；{grant_note}" if detail else grant_note
         return S.DeliveryResponse(
             approval_id=approval_id,
             delivered=result.delivered,
             status=status.value,
             detail=detail,
         )
+
+    async def _apply_session_grant(
+        self, approval_id: str, req: S.ApprovalDecideRequest
+    ) -> str | None:
+        """「本会话不再询问此类操作」（D-G）。返回给前端看的授权结果说明——
+        不适用时如实说明为何没记录，不静默吞掉这个选项（红线 4）。"""
+        if not req.approve:
+            return "拒绝不会记录授权"
+        stored = await self.store.approvals.get(approval_id)
+        task_id = str(stored.bound_to.task_id or "") if stored is not None else ""
+        tool_name = stored.tool_name if stored is not None else None
+        if not task_id.startswith("chat:"):
+            return "「本会话不再询问」只对对话里的操作生效，本次未记录授权"
+        if not tool_name or tool_name not in CHAT_APPROVAL_TOOLS:
+            return "该操作不支持会话级授权，未记录"
+        chat = getattr(self.engine, "chat", None)
+        if chat is None:
+            return "对话服务未装配，授权未记录"
+        category = tool_grant_category(tool_name)
+        await chat.grant_session(task_id[len("chat:"):], category)
+        label = "写文件类操作" if category == "write" else "执行命令"
+        return f"已授权本会话不再询问{label}（危险命令仍会逐次询问，可在对话页撤销）"
 
     async def retry_delivery(self, approval_id: str) -> S.DeliveryResponse:
         """undeliverable 的重试（HUM-04）。沿用原决定，不重新征求同意——
@@ -2209,6 +2239,34 @@ class FsService(_Service):
         )
         return S.FsOpResponse(ok=True, path=result["path"], detail=f"已删除{result['kind']}")
 
+    async def run_command(self, req: S.FsRunRequest) -> S.FsRunResponse:
+        """执行命令（§5.4）。用户在界面上发起即视为批准——审批只约束模型发起
+        的执行；命令本体与退出码留痕，输出本体不落事件日志（只记截断标注）。"""
+        ws_id, root = await self._resolve_root(req.workspace_id)
+        timeout = chat_run.DEFAULT_RUN_TIMEOUT_S
+        if req.timeout_seconds is not None:
+            timeout = min(max(float(req.timeout_seconds), 1.0), CHAT_RUN_TIMEOUT_CAP_S)
+        try:
+            result = await chat_run.run_command(
+                root, req.command, cwd=req.cwd, timeout=timeout
+            )
+        except chat_fs.FSError as exc:
+            raise self._translate(exc) from exc
+        await self._event(
+            EventType.FS_RUN,
+            scope=EventScope.CHAT,
+            scope_id=ws_id,
+            payload={
+                "command": result["command"][:500],
+                "cwd": result["cwd"],
+                "exit_code": result["exit_code"],
+                "timed_out": result["timed_out"],
+                "output_truncated": result["output_truncated"],
+                "duration_s": result["duration_s"],
+            },
+        )
+        return S.FsRunResponse.model_validate(result)
+
 
 class ChatService(_Service):
     """Web Chat 的网关门面。核心编排在 ``engine.chat``（chat/service.py），
@@ -2319,6 +2377,28 @@ class ChatService(_Service):
             degraded_reasons=result["degraded_reasons"],
             supports_tools=result["supports_tools"],
         )
+
+    async def grant_session(
+        self, session_id: str, req: S.ChatGrantRequest
+    ) -> S.ChatSessionResponse:
+        try:
+            session = await self._core().grant_session(session_id, req.category)
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        except ChatError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.ChatSessionResponse.model_validate(session)
+
+    async def revoke_session_grant(
+        self, session_id: str, category: str
+    ) -> S.ChatSessionResponse:
+        try:
+            session = await self._core().revoke_session_grant(session_id, category)
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        except ChatError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        return S.ChatSessionResponse.model_validate(session)
 
 
 # ===========================================================================

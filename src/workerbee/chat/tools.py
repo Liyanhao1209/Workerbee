@@ -16,22 +16,34 @@ from typing import Any, Awaitable, Callable
 
 from ..core.domain.base import DomainModel
 from ..data.llm import LLMToolCall, LLMToolSpec
-from . import fs
+from . import fs, run as run_mod
 
 __all__ = [
     "CHAT_TOOL_SPECS",
     "WRITE_TOOLS",
+    "RUN_TOOLS",
+    "APPROVAL_TOOLS",
     "ApprovalGate",
     "ToolOutcome",
     "execute_tool",
     "RESULT_MAX_CHARS",
+    "RUN_TIMEOUT_CAP_S",
 ]
 
 #: 单个工具结果回注给模型的字符上限（超出截断并标注）。
 RESULT_MAX_CHARS = 60_000
 
-#: 需要用户审批才能执行的工具。
+#: 需要用户审批才能执行的写类工具。
 WRITE_TOOLS: frozenset[str] = frozenset({"fs_write", "fs_mkdir", "fs_move", "fs_delete"})
+
+#: 需要用户审批才能执行的执行类工具（与写类分开授权，D-G）。
+RUN_TOOLS: frozenset[str] = frozenset({"fs_run"})
+
+#: 全部需审批工具。
+APPROVAL_TOOLS: frozenset[str] = WRITE_TOOLS | RUN_TOOLS
+
+#: fs_run 的 timeout_seconds 参数上限（秒）。模型可以给更短的，不能要更长的。
+RUN_TIMEOUT_CAP_S = 300.0
 
 _PATH_SCHEMA: dict[str, Any] = {"type": "string", "description": "工作区内的相对路径"}
 
@@ -103,6 +115,32 @@ CHAT_TOOL_SPECS: list[LLMToolSpec] = [
             "required": ["path"],
         },
     ),
+    LLMToolSpec(
+        name="fs_run",
+        description=(
+            "在工作区内执行一条 shell 命令（经 shell 解析，支持管道与重定向）。"
+            "威力与用户在终端里亲手敲这条命令完全相同——包括访问工作区之外的文件，"
+            "cwd 限制的只是起始目录，不是沙箱。因此每次执行都需要用户逐次批准；"
+            "危险命令（rm/sudo/dd/mkfs/向工作区外重定向等）永远需要批准。"
+            "默认超时 60 秒（可用 timeout_seconds 调短或调长，上限 300 秒），"
+            "stdout 与 stderr 合并返回，超长会截断并标注。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的 shell 命令"},
+                "cwd": {
+                    "type": ["string", "null"],
+                    "description": "工作目录（工作区内相对路径），缺省为工作区根",
+                },
+                "timeout_seconds": {
+                    "type": ["number", "null"],
+                    "description": "超时秒数，缺省 60，上限 300",
+                },
+            },
+            "required": ["command"],
+        },
+    ),
 ]
 
 #: 审批回调：``(tool_name, 动作摘要, 目标路径)`` → 是否获准执行。
@@ -117,7 +155,8 @@ class ToolOutcome(DomainModel):
 
     text: str
     effect: dict[str, Any] | None = None
-    """形如 {"type": "fs.write", "path": ..., "detail": ...}，只在写操作真实执行后给出。"""
+    """形如 {"type": "fs.write", "path": ..., "detail": ..., "extra": {...}}，
+    只在写/执行操作真实发生后给出。"""
 
     refused: bool = False
     """True 表示写操作被审批拦下（用户拒绝/超时/无审批通道）。"""
@@ -147,6 +186,8 @@ def _describe(call: LLMToolCall) -> tuple[str, str]:
         return "移动/改名", f"{args.get('src', '')} → {args.get('dst', '')}"
     if call.name == "fs_delete":
         return "删除", str(args.get("path", ""))
+    if call.name == "fs_run":
+        return "执行命令", str(args.get("command", ""))
     return call.name, str(args.get("path", ""))
 
 
@@ -155,14 +196,15 @@ async def execute_tool(
     *,
     workspace_root: str,
     approval_gate: ApprovalGate | None = None,
+    run_timeout_cap: float = RUN_TIMEOUT_CAP_S,
 ) -> ToolOutcome:
     """执行一次工具调用，返回回注给模型的结果（失败也是结果，不抛出）。
 
-    写类工具先过 ``approval_gate``；未获准（拒绝、超时、无审批通道）时返回
+    写/执行类工具先过 ``approval_gate``；未获准（拒绝、超时、无审批通道）时返回
     ``refused=True`` 的说明文本，让模型如实转告用户。
     """
     try:
-        if call.name in WRITE_TOOLS:
+        if call.name in APPROVAL_TOOLS:
             action, target = _describe(call)
             approved = (
                 await approval_gate(call.name, action, target)
@@ -245,6 +287,48 @@ async def execute_tool(
                     "type": "fs.delete",
                     "path": result["path"],
                     "detail": result["kind"],
+                },
+            )
+
+        if call.name == "fs_run":
+            timeout_raw = call.arguments.get("timeout_seconds")
+            timeout = run_mod.DEFAULT_RUN_TIMEOUT_S
+            if isinstance(timeout_raw, (int, float)) and not isinstance(timeout_raw, bool):
+                timeout = min(max(float(timeout_raw), 1.0), run_timeout_cap)
+            cwd_raw = call.arguments.get("cwd")
+            result = await run_mod.run_command(
+                workspace_root,
+                _arg_str(call, "command"),
+                cwd=cwd_raw if isinstance(cwd_raw, str) and cwd_raw.strip() else None,
+                timeout=timeout,
+            )
+            header = f"工作目录：{result['cwd'] or '（工作区根）'}\n"
+            if result["timed_out"]:
+                header += f"执行超过 {timeout:g} 秒，进程已被终止（超时）。\n"
+            else:
+                header += f"退出码：{result['exit_code']}（耗时 {result['duration_s']}s）\n"
+            if result["output_truncated"]:
+                header += (
+                    f"输出共 {result['output_bytes']} 字节，"
+                    f"只保留最后 {run_mod.RUN_OUTPUT_MAX_BYTES // 1024}KB。\n"
+                )
+            body = result["output"] or "（无输出）"
+            return ToolOutcome(
+                text=_truncate(f"{header}\n{body}"),
+                effect={
+                    "type": "fs.run",
+                    "path": result["cwd"],
+                    "detail": (
+                        "超时终止" if result["timed_out"]
+                        else f"退出码 {result['exit_code']}"
+                    ),
+                    "extra": {
+                        "command": result["command"][:500],
+                        "exit_code": result["exit_code"],
+                        "timed_out": result["timed_out"],
+                        "duration_s": result["duration_s"],
+                        "output_truncated": result["output_truncated"],
+                    },
                 },
             )
 

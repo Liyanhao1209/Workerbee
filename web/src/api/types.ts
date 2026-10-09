@@ -1246,6 +1246,8 @@ export interface ChatSession {
   credential_ref: string | null;
   model_override: string | null;
   closed: boolean;
+  /** 本会话已授予的临时授权类别（write / run，D-G）。 */
+  grants: string[];
   created_at: string;
   updated_at: string;
 }
@@ -1328,7 +1330,8 @@ export interface WsPush {
     | 'assistant_chunk'
     | 'chat_chunk'
     | 'chat_message'
-    | 'chat_status';
+    | 'chat_status'
+    | 'chat_session';
   task_id: string | null;
   stage_id: string | null;
   payload: Record<string, unknown>;

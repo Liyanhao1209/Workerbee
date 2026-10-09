@@ -68,7 +68,7 @@ class TestMigration:
             version = await store.db.fetch_value(
                 "SELECT MAX(version) FROM schema_version", default=0
             )
-            assert int(version) == SCHEMA_VERSION == 13
+            assert int(version) == SCHEMA_VERSION == 14
 
             # 旧数据自动归 default（列默认值），不需要任何数据搬运
             wf = await store.workflows.get("w-legacy")
@@ -95,7 +95,7 @@ class TestMigration:
             version = await store.db.fetch_value(
                 "SELECT MAX(version) FROM schema_version", default=0
             )
-            assert int(version) == 13
+            assert int(version) == 14
         finally:
             await store.close()
 
@@ -117,7 +117,7 @@ class TestMigration13:
         version = await store.db.fetch_value(
             "SELECT MAX(version) FROM schema_version", default=0
         )
-        assert int(version) == SCHEMA_VERSION == 13
+        assert int(version) == SCHEMA_VERSION == 14
         tables = {
             r[0]
             for r in await store.db.fetch_all(
@@ -143,7 +143,7 @@ class TestMigration13:
             version = await store.db.fetch_value(
                 "SELECT MAX(version) FROM schema_version", default=0
             )
-            assert int(version) == 13
+            assert int(version) == 14
             await store.workspaces.ensure_default(
                 root_dir=str((tmp_path / "workspace").resolve())
             )
@@ -151,6 +151,44 @@ class TestMigration13:
                 "cs1", workspace_id=DEFAULT_WORKSPACE_ID, title="升级后的对话"
             )
             assert session["session_id"] == "cs1"
+        finally:
+            await store.close()
+
+
+class TestMigration14:
+    """迁移 14（v0.03 §2 D-G）：chat_session.grants 会话级临时授权。"""
+
+    async def test_grants列存在且默认为空(self, store: Store) -> None:
+        cols = {
+            r[1] for r in await store.db.fetch_all("PRAGMA table_info(chat_session)")
+        }
+        assert "grants" in cols
+        session = await store.chat.create_session(
+            "cs-g", workspace_id=DEFAULT_WORKSPACE_ID
+        )
+        assert session["grants"] == []
+
+    async def test_grants读写(self, store: Store) -> None:
+        session = await store.chat.create_session(
+            "cs-g2", workspace_id=DEFAULT_WORKSPACE_ID
+        )
+        await store.chat.set_grants(session["session_id"], ["run", "write"])
+        stored = await store.chat.get_session(session["session_id"])
+        assert stored is not None
+        assert stored["grants"] == ["run", "write"]  # 去重排序落库
+
+    async def test_旧库升级后grants可用(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "legacy.db"
+        _build_v11_db(db_path)
+        store = await Store.open(str(db_path))
+        try:
+            await store.workspaces.ensure_default(
+                root_dir=str((tmp_path / "workspace").resolve())
+            )
+            session = await store.chat.create_session(
+                "cs-old", workspace_id=DEFAULT_WORKSPACE_ID
+            )
+            assert session["grants"] == []
         finally:
             await store.close()
 

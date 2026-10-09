@@ -438,4 +438,298 @@ class TestToolLoop:
         tools_seen = backend.tools_seen[-1]
         assert tools_seen is not None
         names = {t.name for t in tools_seen}
-        assert {"fs_list", "fs_read", "fs_write", "fs_mkdir", "fs_move", "fs_delete"} == names
+        assert {
+            "fs_list", "fs_read", "fs_write", "fs_mkdir", "fs_move", "fs_delete", "fs_run",
+        } == names
+
+
+# ===========================================================================
+# run 工具与会话级授权（D-G）
+# ===========================================================================
+
+
+def _run_call(command: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            LLMToolCall(id="call-run", name="fs_run", arguments={"command": command, **extra})
+        ]
+    }
+
+
+class TestRunTool:
+    async def test_执行命令经审批通过(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        backend = FakeLLMBackend(
+            _run_call("echo 命令输出 && pwd"),
+            "命令跑完了。",
+            supports_tools=True,
+        )
+        gateway = ApprovalGateway(store=store, timeout_seconds=10.0)
+        service = _make_service(store, backend, approval_gateway=gateway)
+        session = await _create_session(service)
+
+        send = asyncio.create_task(service.send_message(session["session_id"], "跑个命令"))
+        await _decide_pending(store, approved=True)
+        result = await send
+
+        tool_node = result["nodes"][1]
+        assert "退出码：0" in tool_node["content"]
+        assert "命令输出" in tool_node["content"]
+        # 执行留痕：命令摘要 + 退出码 + 审批路径
+        rows = await store.db.fetch_all(
+            "SELECT payload FROM event_log WHERE type='fs.run'"
+        )
+        assert len(rows) == 1
+        import json as _json
+
+        payload = _json.loads(rows[0][0])
+        assert payload["exit_code"] == 0
+        assert payload["command"] == "echo 命令输出 && pwd"
+        assert payload["approval"] == "approval"
+
+    async def test_无审批网关时run一律拒绝(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        backend = FakeLLMBackend(
+            _run_call("touch ran.txt"), "没跑成。", supports_tools=True
+        )
+        service = _make_service(store, backend, approval_gateway=None)
+        session = await _create_session(service)
+        result = await service.send_message(session["session_id"], "跑命令")
+        assert not (workspace_root / "ran.txt").exists()
+        assert "未获用户批准" in result["nodes"][1]["content"]
+
+    async def test_审批超时按拒绝处理且如实告知(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        backend = FakeLLMBackend(
+            _run_call("touch timed-out.txt"), "超时了。", supports_tools=True
+        )
+        # 极短超时 + 没人做决定 → deny_pause 同语义：按拒绝处理
+        gateway = ApprovalGateway(store=store, timeout_seconds=0.08)
+        service = _make_service(store, backend, approval_gateway=gateway)
+        session = await _create_session(service)
+        result = await service.send_message(session["session_id"], "跑命令")
+        assert not (workspace_root / "timed-out.txt").exists()
+        assert "未获用户批准" in result["nodes"][1]["content"]
+
+    async def test_run的cwd越界如实回注(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        backend = FakeLLMBackend(
+            _run_call("ls", cwd="../"), "越界被拦了。", supports_tools=True
+        )
+        service = _make_service(store, backend, approval_gateway=None)
+        session = await _create_session(service)
+        await service.grant_session(session["session_id"], "run")
+        result = await service.send_message(session["session_id"], "去上级目录看看")
+        tool_node = result["nodes"][1]
+        assert "越出了当前工作区" in tool_node["content"]
+        assert result["reply"]["content"] == "越界被拦了。"
+
+    async def test_会话授权后同类命令跳过审批且事件留痕(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        backend = FakeLLMBackend(
+            _run_call("echo 直接跑"), "跑完了。", supports_tools=True
+        )
+        gateway = ApprovalGateway(store=store, timeout_seconds=10.0)
+        service = _make_service(store, backend, approval_gateway=gateway)
+        session = await _create_session(service)
+        await service.grant_session(session["session_id"], "run")
+
+        result = await service.send_message(session["session_id"], "跑命令")
+
+        assert "退出码：0" in result["nodes"][1]["content"]
+        # 没有登记任何审批
+        approvals = await store.approvals.list_for_task(f"chat:{session['session_id']}")
+        assert approvals == []
+        # 但事件日志如实记下「经会话授权放行」
+        rows = await store.db.fetch_all(
+            "SELECT payload FROM event_log WHERE type='fs.run'"
+        )
+        import json as _json
+
+        assert _json.loads(rows[0][0])["approval"] == "session_grant"
+
+    async def test_危险命令绕过会话授权仍触发审批(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        backend = FakeLLMBackend(
+            _run_call("rm -rf subdir"), "删掉了。", supports_tools=True
+        )
+        gateway = ApprovalGateway(store=store, timeout_seconds=10.0)
+        notifier = _Notifier()
+        service = _make_service(
+            store, backend, notifier=notifier, approval_gateway=gateway
+        )
+        session = await _create_session(service)
+        await service.grant_session(session["session_id"], "run")
+
+        send = asyncio.create_task(service.send_message(session["session_id"], "删掉它"))
+        await _decide_pending(store, approved=True)
+        result = await send
+
+        assert result["reply"]["content"] == "删掉了。"
+        # 危险命令确实走了审批，且审批卡片上带威胁说明
+        approvals = await store.approvals.list_for_task(f"chat:{session['session_id']}")
+        assert len(approvals) == 1
+        assert "危险命令" in approvals[0].action
+        assert "rm" in approvals[0].action
+
+    async def test_写类操作的会话授权跳过审批(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        backend = FakeLLMBackend(
+            _write_call("granted.txt", "免审批写入"), "写好了。", supports_tools=True
+        )
+        gateway = ApprovalGateway(store=store, timeout_seconds=10.0)
+        service = _make_service(store, backend, approval_gateway=gateway)
+        session = await _create_session(service)
+        await service.grant_session(session["session_id"], "write")
+
+        result = await service.send_message(session["session_id"], "写文件")
+
+        assert (workspace_root / "granted.txt").read_text(encoding="utf-8") == "免审批写入"
+        assert await store.approvals.list_for_task(f"chat:{session['session_id']}") == []
+        rows = await store.db.fetch_all(
+            "SELECT payload FROM event_log WHERE type='fs.write'"
+        )
+        import json as _json
+
+        assert _json.loads(rows[0][0])["approval"] == "session_grant"
+
+    async def test_授权只对本会话有效(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        backend = FakeLLMBackend(
+            _write_call("other.txt", "x"), "好的。", supports_tools=True
+        )
+        gateway = ApprovalGateway(store=store, timeout_seconds=10.0)
+        service = _make_service(store, backend, approval_gateway=gateway)
+        first = await _create_session(service)
+        second = await _create_session(service)
+        await service.grant_session(first["session_id"], "write")
+
+        # 另一个会话里的同类操作照常要审批
+        send = asyncio.create_task(service.send_message(second["session_id"], "写文件"))
+        await _decide_pending(store, approved=True)
+        await send
+        assert (workspace_root / "other.txt").exists()
+        approvals = await store.approvals.list_for_task(f"chat:{second['session_id']}")
+        assert len(approvals) == 1
+
+    async def test_run输出过脱敏(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        secret = "sk-test-SECRETVALUE"
+        backend = FakeLLMBackend(
+            _run_call(f"echo {secret}"), "看到了输出。", supports_tools=True
+        )
+
+        def redactor(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.replace(secret, "[已脱敏]")
+            if isinstance(value, dict):
+                return {k: redactor(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [redactor(v) for v in value]
+            return value
+
+        service = _make_service(store, backend)
+        service.redactor = redactor
+        session = await _create_session(service)
+        await service.grant_session(session["session_id"], "run")
+
+        result = await service.send_message(session["session_id"], "跑一下")
+
+        tool_node = result["nodes"][1]
+        assert secret not in tool_node["content"]
+        assert "[已脱敏]" in tool_node["content"]
+
+    async def test_敏感文件名经工具循环拒读(
+        self, store: Store, workspace_root: Path, credential: str
+    ) -> None:
+        (workspace_root / ".env").write_text("KEY=x", encoding="utf-8")
+        backend = FakeLLMBackend(
+            {
+                "tool_calls": [
+                    LLMToolCall(id="c-env", name="fs_read", arguments={"path": ".env"})
+                ]
+            },
+            "这个文件读不了。",
+            supports_tools=True,
+        )
+        service = _make_service(store, backend)
+        session = await _create_session(service)
+        result = await service.send_message(session["session_id"], "读 .env")
+        tool_node = result["nodes"][1]
+        assert "敏感文件名" in tool_node["content"]
+        assert "KEY=x" not in tool_node["content"]
+
+    async def test_越界路径经工具循环被拒且内容不出站(
+        self, store: Store, workspace_root: Path, credential: str, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "outside.txt"
+        outside.write_text("外面的秘密", encoding="utf-8")
+        backend = FakeLLMBackend(
+            {
+                "tool_calls": [
+                    LLMToolCall(
+                        id="c-esc", name="fs_read", arguments={"path": "../outside.txt"}
+                    )
+                ]
+            },
+            "读不到。",
+            supports_tools=True,
+        )
+        service = _make_service(store, backend)
+        session = await _create_session(service)
+        result = await service.send_message(session["session_id"], "读上级目录")
+        tool_node = result["nodes"][1]
+        assert "越出了当前工作区" in tool_node["content"]
+        assert "外面的秘密" not in tool_node["content"]
+        # 模型上下文里也没有这份内容
+        assert "外面的秘密" not in backend.calls[-1][-1].content
+
+
+class TestSessionGrants:
+    async def test_授予与撤销(self, store: Store, workspace_root: Path) -> None:
+        service = _make_service(store, FakeLLMBackend("x"))
+        session = await _create_session(service)
+
+        granted = await service.grant_session(session["session_id"], "write")
+        assert granted["grants"] == ["write"]
+        granted = await service.grant_session(session["session_id"], "run")
+        assert granted["grants"] == ["run", "write"]
+        # 幂等：重复授予不重复留痕
+        before = await store.db.fetch_all(
+            "SELECT * FROM event_log WHERE type='chat.grant_changed'"
+        )
+        await service.grant_session(session["session_id"], "run")
+        after = await store.db.fetch_all(
+            "SELECT * FROM event_log WHERE type='chat.grant_changed'"
+        )
+        assert len(before) == len(after) == 2
+
+        revoked = await service.revoke_session_grant(session["session_id"], "write")
+        assert revoked["grants"] == ["run"]
+
+    async def test_未知类别显式失败(self, store: Store, workspace_root: Path) -> None:
+        service = _make_service(store, FakeLLMBackend("x"))
+        session = await _create_session(service)
+        with pytest.raises(ChatError, match="不认识的操作类别"):
+            await service.grant_session(session["session_id"], "everything")
+
+    async def test_幽灵会话KeyError(self, store: Store) -> None:
+        service = _make_service(store, FakeLLMBackend("x"))
+        with pytest.raises(KeyError):
+            await service.grant_session("ghost", "write")
+
+    async def test_授权随会话删除消失(self, store: Store, workspace_root: Path) -> None:
+        service = _make_service(store, FakeLLMBackend("x"))
+        session = await _create_session(service)
+        await service.grant_session(session["session_id"], "run")
+        await service.delete_session(session["session_id"])
+        assert await store.chat.get_session(session["session_id"]) is None

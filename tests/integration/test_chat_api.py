@@ -156,6 +156,107 @@ class TestSessionApi:
         assert resp.status_code == 404
 
 
+class TestGrantApi:
+    """会话级临时授权（D-G）：授予/撤销/幂等/非法类别。"""
+
+    async def test_授予与撤销(self, client: Any) -> None:
+        session = (await client.post("/api/chat/sessions", json={})).json()
+        sid = session["session_id"]
+        assert session["grants"] == []
+
+        granted = await client.put(
+            f"/api/chat/sessions/{sid}/grants", json={"category": "run"}
+        )
+        assert granted.status_code == 200, granted.text
+        assert granted.json()["grants"] == ["run"]
+
+        # 列表与详情也透出授权状态
+        got = await client.get(f"/api/chat/sessions/{sid}")
+        assert got.json()["grants"] == ["run"]
+
+        revoked = await client.delete(f"/api/chat/sessions/{sid}/grants/run")
+        assert revoked.status_code == 200
+        assert revoked.json()["grants"] == []
+
+    async def test_非法类别400(self, client: Any) -> None:
+        session = (await client.post("/api/chat/sessions", json={})).json()
+        resp = await client.put(
+            f"/api/chat/sessions/{session['session_id']}/grants",
+            json={"category": "everything"},
+        )
+        assert resp.status_code == 400
+        assert "类别" in resp.json()["detail"]
+
+    async def test_幽灵会话404(self, client: Any) -> None:
+        resp = await client.put(
+            "/api/chat/sessions/ghost/grants", json={"category": "run"}
+        )
+        assert resp.status_code == 404
+
+    async def test_审批决定附带会话授权(
+        self, client: Any, engine: Engine, workspace_root: Path
+    ) -> None:
+        """批准时勾选「本会话不再询问」→ 该会话的 run 类别授权落库。"""
+        await _setup_credential(engine, client)
+        backend = FakeLLMBackend(
+            {
+                "tool_calls": [
+                    LLMToolCall(id="c-run", name="fs_run", arguments={"command": "echo ok"})
+                ]
+            },
+            "跑完了。",
+            supports_tools=True,
+        )
+        _plug_backend(engine, backend)
+        session = (await client.post("/api/chat/sessions", json={})).json()
+
+        send = asyncio.create_task(
+            client.post(
+                f"/api/chat/sessions/{session['session_id']}/messages",
+                json={"content": "跑个命令"},
+            )
+        )
+        approval_id = None
+        for _ in range(200):
+            approvals = (await client.get("/api/approvals")).json()["approvals"]
+            if approvals:
+                approval_id = approvals[0]["approval_id"]
+                break
+            await asyncio.sleep(0.02)
+        assert approval_id is not None, "run 工具没有触发审批"
+
+        decided = await client.post(
+            f"/api/approvals/{approval_id}/decide",
+            json={"approve": True, "grant_session": True},
+        )
+        assert decided.status_code == 200, decided.text
+        assert "不再询问" in (decided.json()["detail"] or "")
+        resp = await send
+        assert resp.status_code == 200, resp.text
+
+        got = await client.get(f"/api/chat/sessions/{session['session_id']}")
+        assert got.json()["grants"] == ["run"]
+
+    async def test_非chat审批的授权标志如实告知未生效(self, client: Any, engine: Engine) -> None:
+        """grant_session 对非 chat 域审批不生效，返回里要如实说明。"""
+        approval = await engine.approvals.request(
+            approval_id="ap-non-chat",
+            task_id="task-x",
+            stage_id="stage-x",
+            attempt_id="attempt-x",
+            revision_seq=1,
+            node_id=None,
+            action="执行 harness 命令",
+            tool_name="Bash",
+        )
+        decided = await client.post(
+            f"/api/approvals/{approval.approval_id}/decide",
+            json={"approve": True, "grant_session": True},
+        )
+        assert decided.status_code == 200, decided.text
+        assert "只对对话里的操作生效" in (decided.json()["detail"] or "")
+
+
 # ===========================================================================
 # 消息收发
 # ===========================================================================
@@ -364,3 +465,47 @@ class TestFsApi:
         )
         assert rows
         assert all(r[1] == "user" and r[2] == "chat" for r in rows)
+
+    async def test_越界URL编码变体403(self, client: Any) -> None:
+        # %2e%2e%2f 解码后就是 ../——编码绕不过 confinement
+        resp = await client.get("/api/fs/read?path=%2e%2e%2f%2e%2e%2fetc%2fpasswd")
+        assert resp.status_code == 403, resp.text
+
+    async def test_symlink逃逸403(self, client: Any, workspace_root: Path) -> None:
+        (workspace_root / "link.txt").symlink_to("/etc/hostname")
+        resp = await client.get("/api/fs/read", params={"path": "link.txt"})
+        assert resp.status_code == 403
+
+    async def test_run端点(self, client: Any, engine: Engine, workspace_root: Path) -> None:
+        resp = await client.post("/api/fs/run", json={"command": "echo 你好 && pwd"})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["exit_code"] == 0
+        assert body["timed_out"] is False
+        assert "你好" in body["output"]
+        assert body["cwd"] == ""
+
+        # 非零退出码如实返回，不是 HTTP 错误
+        failed = await client.post("/api/fs/run", json={"command": "exit 7"})
+        assert failed.status_code == 200
+        assert failed.json()["exit_code"] == 7
+
+        # 用户发起的执行也留痕（actor=user）
+        rows = await engine.store.db.fetch_all(
+            "SELECT actor, scope, payload FROM event_log WHERE type='fs.run'"
+        )
+        assert rows
+        assert all(r[0] == "user" and r[1] == "chat" for r in rows)
+
+    async def test_run的cwd越界403(self, client: Any) -> None:
+        resp = await client.post("/api/fs/run", json={"command": "ls", "cwd": "../"})
+        assert resp.status_code == 403
+
+    async def test_run超时如实标注(self, client: Any) -> None:
+        resp = await client.post(
+            "/api/fs/run", json={"command": "sleep 30", "timeout_seconds": 0.3}
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["timed_out"] is True
+        assert body["exit_code"] is None

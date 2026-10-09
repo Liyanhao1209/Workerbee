@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -617,6 +617,17 @@ CREATE TABLE IF NOT EXISTS chat_node (
     created_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_node_session ON chat_node(session_id, parent_id);
+""",
+    ),
+    (
+        14,
+        """
+-- Phase 3b（v0.03 §2 D-G）：会话级临时授权的落点。用户在审批界面勾选
+-- 「本会话不再询问此类操作」后，该会话对同**类别**（write / run）的操作
+-- 跳过逐次审批；授权是会话属性（新会话不继承、删会话即消失），所以存
+-- chat_session 的 JSON 列而不是全局 meta_kv。危险命令模式不受它豁免——
+-- 豁免判定在执行侧（chat/service.py），本列只是一份类别清单。
+ALTER TABLE chat_session ADD COLUMN grants TEXT NOT NULL DEFAULT '[]';
 """,
     ),
 ]

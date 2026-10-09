@@ -140,6 +140,7 @@ __all__ = [
     "ChatMessageListResponse",
     "ChatSendRequest",
     "ChatSendResponse",
+    "ChatGrantRequest",
     # 工作区文件系统（v0.03 §5.4）
     "FsEntry",
     "FsListResponse",
@@ -150,6 +151,8 @@ __all__ = [
     "FsMoveRequest",
     "FsDeleteRequest",
     "FsOpResponse",
+    "FsRunRequest",
+    "FsRunResponse",
     # 领域模型的再导出：前端契约与领域字段集保持一致
     "Approval",
     "Attempt",
@@ -947,6 +950,9 @@ class ApprovalDecideRequest(ApiRequest):
     """修改后批准：回注原会话的是修改后的动作，原动作不再被授权。"""
     by: str = "user"
     note: str | None = None
+    grant_session: bool = False
+    """仅限 chat 域审批：批准的同时给当前会话授予该类操作的临时授权
+    （「本会话不再询问此类操作」，D-G）。对其他域的审批此标志不生效。"""
 
 
 class DeliveryResponse(ApiResponse):
@@ -1229,8 +1235,17 @@ class ChatSessionResponse(ApiResponse):
     credential_ref: str | None = None
     model_override: str | None = None
     closed: bool = False
+    grants: list[str] = Field(default_factory=list)
+    """本会话已授予的临时授权类别（write / run，D-G）。新会话恒为空。"""
     created_at: str
     updated_at: str
+
+
+class ChatGrantRequest(ApiRequest):
+    """授予/撤销会话级临时授权。类别非法由服务层报 400 + 大白话。"""
+
+    category: str
+    """write（写文件类）/ run（执行命令）。"""
 
 
 class ChatSessionListResponse(ApiResponse):
@@ -1366,6 +1381,32 @@ class FsOpResponse(ApiResponse):
     ok: bool
     path: str
     detail: str | None = None
+
+
+class FsRunRequest(ApiRequest):
+    """执行一条 shell 命令（§5.4）。命令经 shell 解析，威力与终端一致——
+    cwd 只限定起始目录；用户在界面上发起即视为批准（审批只约束模型发起）。"""
+
+    command: str
+    cwd: str | None = None
+    """工作目录（工作区内相对路径），缺省为工作区根。"""
+    timeout_seconds: float | None = None
+    """缺省 60 秒；超过上限（300 秒）按上限执行。"""
+    workspace_id: str | None = None
+
+
+class FsRunResponse(ApiResponse):
+    command: str
+    cwd: str
+    """相对工作区根的工作目录（空串 = 根）。"""
+    exit_code: int | None = None
+    """None 表示超时被杀，没有退出码可报。"""
+    timed_out: bool = False
+    duration_s: float = 0.0
+    output: str
+    """stdout 与 stderr 合并；超长只保留末尾 100KB。"""
+    output_truncated: bool = False
+    output_bytes: int = 0
 
 
 StorageReportResponse.model_rebuild()

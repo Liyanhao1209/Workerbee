@@ -3,15 +3,17 @@
 公开面：
 
 - :class:`ChatService` —— 会话 CRUD、消息读取（线性分支路径）、发送
-  （流式 + 工具循环 + 审批）；
+  （流式 + 工具循环 + 审批）、会话级临时授权（D-G）；
 - ``fs`` —— workspace 文件系统 confinement 与读写操作（REST 端点与
   LLM 工具共用同一实现）；
+- ``run`` —— 命令执行边界：cwd confinement、超时杀整组、输出截断、
+  危险命令模式清单（DANGEROUS_COMMAND_PATTERNS）；
 - ``tools`` —— LLM 工具清单（CHAT_TOOL_SPECS）与执行器；
 - ``context`` —— 分支路径重建、滑窗截断、工具序列清理；
 - ``tool_loop`` —— 工具循环驱动器。
 """
 
-from . import context, fs, tool_loop, tools
+from . import context, fs, run, tool_loop, tools
 from .service import (
     ChatCallFailed,
     ChatError,
@@ -28,6 +30,7 @@ __all__ = [
     "ChatCallFailed",
     "context",
     "fs",
+    "run",
     "tool_loop",
     "tools",
 ]

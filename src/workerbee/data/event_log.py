@@ -145,6 +145,11 @@ class EventType(StrEnum):
     FS_MKDIR = "fs.mkdir"
     FS_MOVE = "fs.move"
     FS_DELETE = "fs.delete"
+    FS_RUN = "fs.run"
+    """chat 域的命令执行（v0.03 §2 D-G）：command 摘要、退出码、超时/截断标注、
+    审批路径（逐次批准 / 会话级授权）。命令输出本体不落事件日志（在 chat_node 里）。"""
+    CHAT_GRANT_CHANGED = "chat.grant_changed"
+    """会话级临时授权的授予/撤销（D-G）。"""
 
 
 RedactorFn = Callable[[Any], Any]

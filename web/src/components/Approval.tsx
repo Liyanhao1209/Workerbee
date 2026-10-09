@@ -29,6 +29,9 @@ export function ApprovalCard({
   const label = APPROVAL_LABELS[approval.status];
   const [modifying, setModifying] = useState(false);
   const [modifiedAction, setModifiedAction] = useState(approval.action);
+  // 「本会话不再询问此类操作」（D-G）：只对对话（chat:）里发起的审批有意义。
+  const isChatBound = approval.bound_to.task_id?.startsWith('chat:') ?? false;
+  const [grantSession, setGrantSession] = useState(false);
   const submit = useSubmit();
 
   const decide = async (approve: boolean, modified?: string): Promise<void> => {
@@ -36,6 +39,7 @@ export function ApprovalCard({
       approvalApi.decide(approval.approval_id, {
         approve,
         modified_action: modified ?? null,
+        grant_session: approve && grantSession,
       }),
     );
     if (result) {
@@ -219,6 +223,16 @@ export function ApprovalCard({
               {submit.busy ? <span className="spin" /> : null}
             </div>
           )}
+          {isChatBound && approval.status === 'pending' ? (
+            <label className="text-xs muted" style={{ display: 'flex', gap: 6, marginTop: 6, alignItems: 'center' }}>
+              <input
+                type="checkbox"
+                checked={grantSession}
+                onChange={(e) => setGrantSession(e.target.checked)}
+              />
+              本会话不再询问此类操作（危险命令仍会逐次询问；可在对话页撤销）
+            </label>
+          ) : null}
         </div>
       ) : (
         <div className="row row--tight" style={{ marginTop: 'var(--sp-2)' }}>

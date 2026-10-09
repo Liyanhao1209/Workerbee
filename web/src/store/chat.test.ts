@@ -20,6 +20,8 @@ const harness = vi.hoisted(() => ({
     deleteSession: vi.fn(),
     messages: vi.fn(),
     send: vi.fn(),
+    grantSession: vi.fn(),
+    revokeGrant: vi.fn(),
   },
 }));
 
@@ -44,6 +46,7 @@ const SESSION = {
   credential_ref: null,
   model_override: null,
   closed: false,
+  grants: [] as string[],
   created_at: '2026-10-01T00:00:00Z',
   updated_at: '2026-10-01T00:00:00Z',
 };
@@ -189,6 +192,49 @@ describe('重连对账', () => {
   it('重连成功后重拉会话列表', async () => {
     harness.reconnect!();
     await vi.waitFor(() => expect(harness.api.sessions).toHaveBeenCalled());
+  });
+});
+
+describe('会话级临时授权（D-G）', () => {
+  it('撤销授权调用 REST 并重拉会话（授权标识随列表对账）', async () => {
+    harness.api.revokeGrant.mockResolvedValue({ ...SESSION, grants: [] });
+    harness.api.sessions.mockResolvedValue({ sessions: [SESSION], returned: 1 });
+    useChat.setState({ activeSessionId: 's-1' });
+
+    const ok = await useChat.getState().revokeGrant('run');
+
+    expect(ok).toBe(true);
+    expect(harness.api.revokeGrant).toHaveBeenCalledWith('s-1', 'run');
+    await vi.waitFor(() => expect(harness.api.sessions).toHaveBeenCalled());
+  });
+
+  it('撤销失败时错误如实可见', async () => {
+    harness.api.revokeGrant.mockRejectedValue(new Error('网络不可达'));
+    useChat.setState({ activeSessionId: 's-1' });
+
+    const ok = await useChat.getState().revokeGrant('write');
+
+    expect(ok).toBe(false);
+    expect(useChat.getState().sendError?.detail).toBe('撤销授权失败。');
+  });
+
+  it('chat_session 推送触发当前会话的重拉', async () => {
+    useChat.setState({ activeSessionId: 's-1' });
+    harness.api.sessions.mockResolvedValue({ sessions: [SESSION], returned: 1 });
+
+    harness.push!(push('chat_session', { session_id: 's-1' }));
+
+    await vi.waitFor(() => expect(harness.api.sessions).toHaveBeenCalled());
+  });
+
+  it('别的会话的 chat_session 推送不影响当前页', async () => {
+    useChat.setState({ activeSessionId: 's-1' });
+    vi.clearAllMocks();
+
+    harness.push!(push('chat_session', { session_id: 's-other' }));
+
+    await Promise.resolve();
+    expect(harness.api.sessions).not.toHaveBeenCalled();
   });
 });
 

@@ -463,7 +463,7 @@ export const templates = {
 export const approvals = {
   list: () => request<{ approvals: Approval[]; returned: number }>('/api/approvals'),
 
-  decide: (id: string, body: { approve: boolean; modified_action?: string | null; note?: string | null }) =>
+  decide: (id: string, body: { approve: boolean; modified_action?: string | null; note?: string | null; grant_session?: boolean }) =>
     request<DeliveryResult>(`/api/approvals/${encodeURIComponent(id)}/decide`, { method: 'POST', body }),
 
   /** 回注失败（undeliverable）后的重试入口（HUM-04）。 */
@@ -567,6 +567,20 @@ export const chat = {
     request<ChatSendResult>(
       `/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`,
       { method: 'POST', body },
+    ),
+
+  /** 会话级临时授权（D-G）：本会话不再逐次询问该类操作（write / run）。 */
+  grantSession: (sessionId: string, category: string) =>
+    request<ChatSession>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/grants`, {
+      method: 'PUT',
+      body: { category },
+    }),
+
+  /** 撤销会话级临时授权（恢复逐次审批）。 */
+  revokeGrant: (sessionId: string, category: string) =>
+    request<ChatSession>(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/grants/${encodeURIComponent(category)}`,
+      { method: 'DELETE' },
     ),
 };
 

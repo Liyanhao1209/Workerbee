@@ -13,8 +13,10 @@
    降级原因如实返回并可推送；
 4. 工具循环（``tool_loop.py``）：流式 chunk 推 ``chat_chunk``，
    assistant/tool 节点即时落库（REST 是事实源，推送只是加速器）；
-5. 写类工具过 ApprovalGateway（合成绑定 ``chat:<session_id>``），
-   等待期间推 ``chat_status``；审批通过才执行；
+5. 写/执行类工具过 ApprovalGateway（合成绑定 ``chat:<session_id>``），
+   等待期间推 ``chat_status``；审批通过才执行。会话级临时授权（D-G：
+   「本会话不再询问此类操作」）按 write / run 类别跳过逐次审批，
+   危险命令模式不豁免；
 6. 回复、推理、工具结果落库前过 SecretRedactor；事件日志只记元信息。
 
 本模块不 import server 层（组装范本 §0.5）：审批网关、推送、凭据解析
@@ -40,8 +42,16 @@ from ..data.llm.router import BackendConfig
 from ..data.store import Store
 from . import fs
 from .context import branch_path, build_context
+from .run import DEFAULT_RUN_TIMEOUT_S, dangerous_reason
 from .tool_loop import DEFAULT_MAX_TOOL_ROUNDS, run_tool_loop
-from .tools import CHAT_TOOL_SPECS, WRITE_TOOLS, ToolOutcome, execute_tool
+from .tools import (
+    APPROVAL_TOOLS,
+    CHAT_TOOL_SPECS,
+    RUN_TIMEOUT_CAP_S,
+    RUN_TOOLS,
+    ToolOutcome,
+    execute_tool,
+)
 
 __all__ = [
     "ChatService",
@@ -52,6 +62,8 @@ __all__ = [
     "SESSION_TITLE_MAX_CHARS",
     "AUTO_TITLE_CHARS",
     "MAX_REFS",
+    "GRANT_CATEGORIES",
+    "tool_grant_category",
 ]
 
 #: 会话名长度上限（重命名与自动标题共用同一口径，与助手域一致）。
@@ -66,17 +78,42 @@ MAX_REFS = 10
 #: 发给模型的单次调用超时（秒）。同步等待的问答不能无限挂住。
 CALL_TIMEOUT_S = 120.0
 
+#: 会话级临时授权的操作类别（D-G）：write = 写类工具（write/mkdir/move/delete），
+#: run = 命令执行（fs_run）。两类分开授权。
+GRANT_CATEGORIES: frozenset[str] = frozenset({"write", "run"})
+
+
+def tool_grant_category(tool_name: str) -> str:
+    """工具所属的授权类别。只应对需审批工具调用（读类工具不参与授权）。"""
+    return "run" if tool_name in RUN_TOOLS else "write"
+
+
+async def _always_allow(_tool: str, _action: str, _target: str) -> bool:
+    """会话级授权生效时的审批回调：直接放行（审批已被用户按类别预先给出）。"""
+    return True
+
 _ROLE_PROMPT = """你是 Workerbee（本机多智能体工作流编排工具）对话页的助手。
 
+你可以使用的工具：
+- 列目录用 fs_list，读文件用 fs_read（单文件最多读 100KB，超出会截断并标注）。
+- 写文件 fs_write、建目录 fs_mkdir、移动/改名 fs_move、删除 fs_delete
+  （只能删文件或空目录，没有递归删除）。
+- 执行命令用 fs_run，可指定工作目录与超时（默认 60 秒，上限 300 秒），
+  标准输出与标准错误合并返回，过长会截断并标注。
+
 规则：
-- 你只能在工作区目录内操作文件；调用工具时使用工作区内的相对路径，
-  操作前先确认目标路径没有越出工作区。
-- 列目录用 fs_list，读文件用 fs_read；写文件（fs_write）、建目录（fs_mkdir）、
-  移动/改名（fs_move）、删除（fs_delete）执行前会请用户批准——用户拒绝时
-  如实告知，不要假装操作成功。
+- 所有路径都是工作区内的相对路径；越出工作区的路径会被直接拒绝，不要尝试。
+- 写、建目录、移动、删除和执行命令在执行前会请用户批准；被拒绝或等待超时
+  时如实告知用户，不要假装操作成功。用户可能已对本会话的某类操作勾选
+  「不再询问」，那时同类操作会直接执行，结果照样如实返回。
+- 命令经 shell 执行，威力与用户在终端里亲手输入相同（能看到工作区之外的
+  文件）。危险命令（rm、sudo、dd、mkfs、向工作区外重定向等）任何时候都
+  需要逐次批准，会话授权也不豁免——主动避开这类命令，确有必要时先向用户
+  说明风险再发起。
 - 覆盖已存在的文件前，先用 fs_read 读取它，把返回的 mtime 作为
   expected_mtime 传给 fs_write。
-- 不要编造你没读过的文件内容；操作失败时把失败原因如实告诉用户。
+- 不要编造你没读过的文件内容或没执行过的命令结果；操作失败时把失败原因
+  如实告诉用户。
 - 用大白话中文回答，先给结论。"""
 
 _ROLE_PROMPT_NO_TOOLS = """你是 Workerbee（本机多智能体工作流编排工具）对话页的助手。
@@ -159,6 +196,7 @@ class ChatService:
         approval_poll_interval: float = 0.5,
         window_rounds: int = DEFAULT_WINDOW_ROUNDS,
         window_chars: int = DEFAULT_WINDOW_CHARS,
+        run_timeout_cap: float = RUN_TIMEOUT_CAP_S,
     ) -> None:
         self.store = store
         self.notifier = notifier
@@ -171,6 +209,7 @@ class ChatService:
         self.approval_poll_interval = approval_poll_interval
         self.window_rounds = window_rounds
         self.window_chars = window_chars
+        self.run_timeout_cap = run_timeout_cap
         self._router_cache: tuple[str, LLMRouter] | None = None
 
     # ------------------------------------------------------------------
@@ -229,6 +268,53 @@ class ChatService:
         await self.store.chat.delete_session(session_id)
 
     # ------------------------------------------------------------------
+    # 会话级临时授权（D-G）
+    # ------------------------------------------------------------------
+
+    async def grant_session(self, session_id: str, category: str) -> dict[str, Any]:
+        """授予本会话某类操作的临时授权（之后同类操作跳过逐次审批）。
+
+        授权只对当前会话有效（落在 chat_session.grants 列，删会话即消失）；
+        命中危险模式的命令不受豁免（见 ``chat.run.dangerous_reason``）。
+        """
+        return await self._set_grant(session_id, category, granted=True)
+
+    async def revoke_session_grant(self, session_id: str, category: str) -> dict[str, Any]:
+        """撤销本会话某类操作的临时授权（恢复逐次审批）。"""
+        return await self._set_grant(session_id, category, granted=False)
+
+    async def _set_grant(
+        self, session_id: str, category: str, *, granted: bool
+    ) -> dict[str, Any]:
+        category = (category or "").strip()
+        if category not in GRANT_CATEGORIES:
+            raise ChatError(
+                "不认识的操作类别",
+                hint="只有 write（写文件类）和 run（执行命令）两类授权",
+            )
+        session = await self._require_session(session_id)
+        grants = set(session.get("grants") or [])
+        if (category in grants) == granted:
+            return session  # 幂等：状态已是目标态，不重复留痕
+        if granted:
+            grants.add(category)
+        else:
+            grants.discard(category)
+        await self.store.chat.set_grants(session_id, sorted(grants))
+        await self.store.events.append(
+            scope=EventScope.CHAT,
+            type=EventType.CHAT_GRANT_CHANGED,
+            actor=EventActor.USER,
+            scope_id=session_id,
+            payload={"category": category, "granted": granted, "grants": sorted(grants)},
+        )
+        # 授权状态在 Chat 页工具栏可见：推一下让别的页面（审批中心）的改动同步过去。
+        self._publish("chat_session", {"session_id": session_id})
+        updated = await self.store.chat.get_session(session_id)
+        assert updated is not None
+        return updated
+
+    # ------------------------------------------------------------------
     # 消息读取（线性视图：根 → 叶的分支路径）
     # ------------------------------------------------------------------
 
@@ -275,6 +361,8 @@ class ChatService:
                 hint="新建一个属于现有工作区的会话",
             )
         root_dir = str(workspace["root_dir"])
+        # 会话级临时授权（D-G）：发送开始时的快照；授权变更走 grant/revoke 方法。
+        grants = set(session.get("grants") or [])
 
         # 用户消息先脱敏再入库、再发给模型（可能粘贴含密钥的内容，AUTH-02）。
         safe_text = self._redact(content)
@@ -324,23 +412,44 @@ class ChatService:
 
         async def execute(call: LLMToolCall, via_node_id: str) -> ToolOutcome:
             gate = None
-            if self.approval_gateway is not None and call.name in WRITE_TOOLS:
-                gate = self._make_approval_gate(session_id, via_node_id)
+            approval_path = "approval"
+            if call.name in APPROVAL_TOOLS:
+                category = tool_grant_category(call.name)
+                # 危险命令永远逐次审批，会话级授权不豁免（D-G）。
+                dangerous = False
+                if call.name in RUN_TOOLS:
+                    reason = dangerous_reason(str(call.arguments.get("command", "")))
+                    dangerous = reason is not None
+                if category in grants and not dangerous:
+                    gate = _always_allow
+                    approval_path = "session_grant"
+                elif self.approval_gateway is not None:
+                    note = f"危险命令：{reason}" if dangerous else None
+                    gate = self._make_approval_gate(session_id, via_node_id, note=note)
+                # 无审批通道且无会话授权：gate=None → 工具层如实拒绝（deny by default）
             outcome = await execute_tool(
-                call, workspace_root=root_dir, approval_gate=gate
+                call,
+                workspace_root=root_dir,
+                approval_gate=gate,
+                run_timeout_cap=self.run_timeout_cap,
             )
             if outcome.effect is not None:
+                payload = {
+                    "path": outcome.effect["path"],
+                    "detail": outcome.effect.get("detail"),
+                    "tool": call.name,
+                    "node_id": via_node_id,
+                }
+                payload.update(outcome.effect.get("extra") or {})
+                if call.name in APPROVAL_TOOLS:
+                    # 授权路径留痕：逐次批准还是会话级授权，事后可查。
+                    payload["approval"] = approval_path
                 await self.store.events.append(
                     scope=EventScope.CHAT,
                     type=EventType(outcome.effect["type"]),
                     actor=EventActor.AI,
                     scope_id=session_id,
-                    payload={
-                        "path": outcome.effect["path"],
-                        "detail": outcome.effect.get("detail"),
-                        "tool": call.name,
-                        "node_id": via_node_id,
-                    },
+                    payload=payload,
                 )
             return outcome
 
@@ -575,16 +684,22 @@ class ChatService:
         self._router_cache = (cache_key, router)
         return router, []
 
-    def _make_approval_gate(self, session_id: str, via_node_id: str):
-        """写类工具的审批回调：登记审批 → 推「等待审批」状态 → 轮询决定。
+    def _make_approval_gate(
+        self, session_id: str, via_node_id: str, *, note: str | None = None
+    ):
+        """写/执行类工具的审批回调：登记审批 → 推「等待审批」状态 → 轮询决定。
 
         合成绑定（``chat:<session_id>``）：chat 的审批不挂在任何任务/尝试上，
         决定由本循环直接从审批表读取，不需要回注 harness 会话
         （``Engine._deliver_approval`` 对这个前缀直通返回）。
+        ``note`` 是给审批卡片看的补充说明（如危险命令的威胁原因）。
         """
         gateway = self.approval_gateway
 
         async def gate(tool_name: str, action: str, target: str) -> bool:
+            shown_action = f"{action}（{tool_name}）"
+            if note:
+                shown_action = f"{shown_action} —— {note}"
             approval = await gateway.request(
                 approval_id=new_id(),
                 task_id=f"chat:{session_id}",
@@ -592,9 +707,9 @@ class ChatService:
                 attempt_id=f"chat:{session_id}",
                 revision_seq=0,
                 node_id=None,
-                action=f"{action}（{tool_name}）",
+                action=shown_action,
                 target=target,
-                risk="write",
+                risk="write" if tool_name not in RUN_TOOLS else "execute",
                 tool_name=tool_name,
             )
             self._publish_status(

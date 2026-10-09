@@ -2058,6 +2058,7 @@ class ChatRepository:
             "credential_ref": credential_ref,
             "model_override": model_override,
             "closed": False,
+            "grants": [],
             "created_at": now,
             "updated_at": now,
         }
@@ -2110,6 +2111,16 @@ class ChatRepository:
         return (
             await self.db.execute_rowcount(
                 "DELETE FROM chat_session WHERE session_id=?", (session_id,)
+            )
+            > 0
+        )
+
+    async def set_grants(self, session_id: str, grants: Sequence[str]) -> bool:
+        """覆盖会话级临时授权清单（D-G，迁移 14 的 grants 列，JSON 类别数组）。"""
+        return (
+            await self.db.execute_rowcount(
+                "UPDATE chat_session SET grants=?, updated_at=? WHERE session_id=?",
+                (dumps(sorted(set(grants))), utcnow().isoformat(), session_id),
             )
             > 0
         )
@@ -2239,6 +2250,7 @@ class ChatRepository:
             "credential_ref": row["credential_ref"],
             "model_override": row["model_override"],
             "closed": bool(row["closed"]),
+            "grants": loads(row["grants"], []),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

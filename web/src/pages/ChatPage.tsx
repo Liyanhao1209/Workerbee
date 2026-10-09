@@ -157,6 +157,26 @@ export function ChatPage(): JSX.Element {
               仅纯对话
             </span>
           ) : null}
+          {activeSession?.grants.includes('write') ? (
+            <button
+              type="button"
+              className="chatpage__badge chatpage__badge--grant"
+              title="本会话内写文件类操作不再逐次询问；点击撤销，恢复逐次批准"
+              onClick={() => void state.revokeGrant('write')}
+            >
+              写文件免审批 ✕
+            </button>
+          ) : null}
+          {activeSession?.grants.includes('run') ? (
+            <button
+              type="button"
+              className="chatpage__badge chatpage__badge--grant"
+              title="本会话内执行命令不再逐次询问（危险命令仍会询问）；点击撤销，恢复逐次批准"
+              onClick={() => void state.revokeGrant('run')}
+            >
+              执行命令免审批 ✕
+            </button>
+          ) : null}
           <span className="spacer" />
           {activeSession && !renaming ? (
             <>
@@ -255,7 +275,7 @@ export function ChatPage(): JSX.Element {
                 <Banner
                   variant="warn"
                   title={`等待批准：${state.pendingStatus.detail}`}
-                  hint="到审批中心（右上角铃铛）批准或拒绝；批准后操作才会执行。"
+                  hint="到审批中心（右上角铃铛）批准或拒绝；批准时可勾选「本会话不再询问此类操作」。批准后操作才会执行。"
                 />
               ) : null}
               {state.sendError ? (
@@ -362,6 +382,7 @@ const TOOL_LABELS: Record<string, string> = {
   fs_mkdir: '建目录',
   fs_move: '移动/改名',
   fs_delete: '删除',
+  fs_run: '执行命令',
 };
 
 function toolLabel(name: string | null): string {
@@ -370,7 +391,7 @@ function toolLabel(name: string | null): string {
 
 function toolTarget(args: Record<string, unknown> | undefined): string {
   if (!args) return '';
-  const candidate = args['path'] ?? args['dst'] ?? args['src'];
+  const candidate = args['path'] ?? args['command'] ?? args['dst'] ?? args['src'];
   return typeof candidate === 'string' ? candidate : '';
 }
 

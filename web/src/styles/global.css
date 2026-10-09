@@ -1314,6 +1314,17 @@ kbd,
   border-radius: var(--radius);
   padding: 0 var(--sp-1);
 }
+.chatpage__badge--grant {
+  background: none;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--st-success);
+  border-color: var(--st-success);
+}
+.chatpage__badge--grant:hover {
+  color: var(--st-danger);
+  border-color: var(--st-danger);
+}
 .chatpage__refs {
   font-size: var(--fs-xs);
   color: var(--fg-3);
