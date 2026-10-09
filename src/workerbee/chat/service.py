@@ -33,7 +33,7 @@ from typing import Any, Callable, Sequence
 from ..assistant.memory import DEFAULT_WINDOW_CHARS, DEFAULT_WINDOW_ROUNDS
 from ..assistant.service import AssistantConfig, load_config
 from ..core.domain.approval import ApprovalStatus
-from ..core.domain.base import new_id
+from ..core.domain.base import new_id, utcnow
 from ..core.runtime.notifier import Notification
 from ..data.event_log import EventActor, EventScope, EventType
 from ..data.llm import LLMBackend, LLMError, LLMRouter
@@ -59,6 +59,7 @@ __all__ = [
     "ChatNotConfigured",
     "ChatLocked",
     "ChatCallFailed",
+    "ChatConflict",
     "SESSION_TITLE_MAX_CHARS",
     "AUTO_TITLE_CHARS",
     "MAX_REFS",
@@ -86,6 +87,26 @@ GRANT_CATEGORIES: frozenset[str] = frozenset({"write", "run"})
 def tool_grant_category(tool_name: str) -> str:
     """工具所属的授权类别。只应对需审批工具调用（读类工具不参与授权）。"""
     return "run" if tool_name in RUN_TOOLS else "write"
+
+
+def _subtree_ids(nodes: Sequence[dict[str, Any]], root_id: str) -> set[str]:
+    """root 及其全部后代的 id 集合（含软删节点：删除/环检测都要看到完整结构）。
+
+    父链断裂的孤儿节点不会误入（只有经 children 可达才算后代）；
+    数据有环时靠访问集合截断，显式截断而不是无限循环。
+    """
+    children: dict[str | None, list[str]] = {}
+    for n in nodes:
+        children.setdefault(n.get("parent_id"), []).append(n["node_id"])
+    out: set[str] = set()
+    stack = [root_id]
+    while stack:
+        nid = stack.pop()
+        if nid in out:
+            continue
+        out.add(nid)
+        stack.extend(children.get(nid, ()))
+    return out
 
 
 async def _always_allow(_tool: str, _action: str, _target: str) -> bool:
@@ -149,6 +170,10 @@ class ChatLocked(ChatError):
 
 class ChatCallFailed(ChatError):
     """模型调用失败（含超时与全部后端耗尽）。"""
+
+
+class ChatConflict(ChatError):
+    """树操作在当前状态下不成立（移动成环等）——网关层翻译成 409。"""
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +363,175 @@ class ChatService:
                 "指定的分支末端不存在（可能已被删除）", hint="刷新对话后重试"
             ) from None
         return {"messages": path, "leaf_id": leaf_id}
+
+    # ------------------------------------------------------------------
+    # 树操作（v0.03 §6.2）：分叉 / 软删子树 / 移动合并 / 恢复 / 清空
+    # ------------------------------------------------------------------
+
+    async def get_tree(self, session_id: str) -> dict[str, Any]:
+        """会话的完整节点森林（含软删节点），前端自组树（单会话消息量有界）。"""
+        await self._require_session(session_id)
+        nodes = await self.store.chat.list_nodes(session_id, include_deleted=True)
+        return {"session_id": session_id, "nodes": nodes}
+
+    async def fork_node(self, node_id: str) -> dict[str, Any]:
+        """以 ``node_id`` 为分叉点：返回从根到该节点的分支上下文。
+
+        本端点不创建节点——真正的分叉发生在下一次带 ``parent_id`` 的发送；
+        这里做存在性校验并给出新分支的线性视图（前端切过去即处于分叉态）。
+        """
+        node = await self._require_node(node_id)
+        if node.get("deleted_at"):
+            raise ChatError(
+                "这条消息已被删除，不能作为分叉点", hint="先恢复它，或换一条消息分叉"
+            )
+        session_id = node["session_id"]
+        nodes = await self.store.chat.list_nodes(session_id)
+        path = branch_path(nodes, node_id)
+        return {"messages": path, "leaf_id": node_id}
+
+    async def delete_subtree(self, node_id: str) -> dict[str, Any]:
+        """级联软删除子树（D-F）：自身 + 全部后代打同一批次的 deleted_at。
+
+        已删除的节点不重复打标（保留它们原本的删除批次，恢复语义才不串）。
+        撤销窗口 = 清空前（``restore_subtree`` 按批次还原）。
+        """
+        node = await self._require_node(node_id)
+        if node.get("deleted_at"):
+            raise ChatError("这条消息已经在回收站里了", hint="要恢复请用「恢复」操作")
+        session_id = node["session_id"]
+        nodes = await self.store.chat.list_nodes(session_id, include_deleted=True)
+        subtree = _subtree_ids(nodes, node_id)
+        to_mark = [
+            n["node_id"]
+            for n in nodes
+            if n["node_id"] in subtree and not n.get("deleted_at")
+        ]
+        deleted_at = utcnow().isoformat()
+        marked = await self.store.chat.mark_deleted(to_mark, deleted_at)
+        await self.store.events.append(
+            scope=EventScope.CHAT,
+            type=EventType.CHAT_TREE_DELETED,
+            actor=EventActor.USER,
+            scope_id=session_id,
+            payload={"node_id": node_id, "count": marked, "deleted_at": deleted_at},
+        )
+        self._publish_tree_changed(session_id)
+        return {
+            "session_id": session_id,
+            "node_id": node_id,
+            "deleted": to_mark,
+            "deleted_at": deleted_at,
+            "count": marked,
+        }
+
+    async def restore_subtree(self, node_id: str) -> dict[str, Any]:
+        """按删除批次恢复软删子树：只清与根节点同一批 deleted_at 的标记。
+
+        子树里更早被单独删除的节点（批次不同）保持删除态——恢复一次删除
+        不应顺带复活另一次删除。
+        """
+        node = await self._require_node(node_id)
+        deleted_at = node.get("deleted_at")
+        if not deleted_at:
+            raise ChatError("这条消息没有被删除，无需恢复")
+        session_id = node["session_id"]
+        nodes = await self.store.chat.list_nodes(session_id, include_deleted=True)
+        subtree = _subtree_ids(nodes, node_id)
+        candidates = [nid for nid in subtree]
+        restored = await self.store.chat.restore_deleted(candidates, deleted_at)
+        # 恢复后父链可能仍指向已删除节点（父被单独删了）：如实返回，由前端重拉对账。
+        await self.store.events.append(
+            scope=EventScope.CHAT,
+            type=EventType.CHAT_TREE_RESTORED,
+            actor=EventActor.USER,
+            scope_id=session_id,
+            payload={"node_id": node_id, "count": restored, "deleted_at": deleted_at},
+        )
+        self._publish_tree_changed(session_id)
+        return {
+            "session_id": session_id,
+            "node_id": node_id,
+            "restored": restored,
+        }
+
+    async def move_node(self, node_id: str, new_parent_id: str | None) -> dict[str, Any]:
+        """移动/合并子树：改挂子树根的 parent_id（§6.2 单条 UPDATE）。
+
+        环检测：目标不得是被移子树的成员（含根自身）——目标在子树内时，
+        从目标上溯必然命中根，树即成环。命中即 409（``ChatConflict``）。
+        跨树移动即「合并」。``new_parent_id=""`` 表示显式挂到森林根
+        （与发消息的 parent_id 约定一致）。返回旧 parent_id 供撤销：
+        撤销 = 以旧 parent 再移动一次（原状态无环，移回必然合法）。
+        """
+        node = await self._require_node(node_id)
+        if node.get("deleted_at"):
+            raise ChatError(
+                "已删除的消息不能移动", hint="先在分支视图里恢复它，再移动"
+            )
+        session_id = node["session_id"]
+        old_parent_id = node.get("parent_id") or None
+        if new_parent_id == "":
+            new_parent_id = None  # 显式挂森林根
+        if new_parent_id == old_parent_id:
+            return {
+                "session_id": session_id,
+                "node": node,
+                "previous_parent_id": old_parent_id,
+            }  # 幂等：位置未变
+        nodes = await self.store.chat.list_nodes(session_id, include_deleted=True)
+        by_id = {n["node_id"]: n for n in nodes}
+        if new_parent_id is not None:
+            target = by_id.get(new_parent_id)
+            if target is None or target["session_id"] != session_id:
+                raise ChatError(
+                    "移动目标不是这个会话里的有效节点", hint="刷新分支视图后重试"
+                )
+            if target.get("deleted_at"):
+                raise ChatError(
+                    "不能移动到已删除的消息下", hint="先恢复目标消息，或换一个目标"
+                )
+            subtree = _subtree_ids(nodes, node_id)
+            if new_parent_id in subtree:
+                raise ChatConflict(
+                    "不能移动到它自己或它的后代下面（会形成循环）",
+                    hint="选择子树之外的节点作为新父节点",
+                )
+        await self.store.chat.move_node(node_id, new_parent_id)
+        await self.store.events.append(
+            scope=EventScope.CHAT,
+            type=EventType.CHAT_TREE_MOVED,
+            actor=EventActor.USER,
+            scope_id=session_id,
+            payload={
+                "node_id": node_id,
+                "previous_parent_id": old_parent_id,
+                "new_parent_id": new_parent_id,
+            },
+        )
+        self._publish_tree_changed(session_id)
+        moved = await self.store.chat.get_node(node_id)
+        assert moved is not None  # 刚更新过
+        return {
+            "session_id": session_id,
+            "node": moved,
+            "previous_parent_id": old_parent_id,
+        }
+
+    async def purge_deleted(self, session_id: str) -> dict[str, Any]:
+        """清空会话内全部软删节点（硬删，不可恢复；D-F 撤销窗口至此关闭）。"""
+        await self._require_session(session_id)
+        purged = await self.store.chat.purge_deleted(session_id)
+        if purged:
+            await self.store.events.append(
+                scope=EventScope.CHAT,
+                type=EventType.CHAT_TREE_PURGED,
+                actor=EventActor.USER,
+                scope_id=session_id,
+                payload={"count": purged},
+            )
+            self._publish_tree_changed(session_id)
+        return {"session_id": session_id, "purged": purged}
 
     # ------------------------------------------------------------------
     # 发送（流式 + 工具循环）
@@ -558,6 +752,16 @@ class ChatService:
         if session is None:
             raise KeyError(session_id)
         return session
+
+    async def _require_node(self, node_id: str) -> dict[str, Any]:
+        node = await self.store.chat.get_node(node_id)
+        if node is None:
+            raise KeyError(node_id)
+        return node
+
+    def _publish_tree_changed(self, session_id: str) -> None:
+        """树结构变更推送。推送只是加速器：前端收到后 REST 重拉树对账。"""
+        self._publish("chat_tree_changed", {"session_id": session_id})
 
     async def _resolve_parent(self, session_id: str, parent_id: str | None) -> str | None:
         if parent_id is None:

@@ -10,9 +10,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ChatNode } from '../api/types';
 import { extractAtRefs } from '../lib/atrefs';
 import { renderMarkdown } from '../lib/markdown';
-import { useChat } from '../store/chat';
+import { computeBranchInfo, useChat, type BranchInfo } from '../store/chat';
 import { useWorkspace } from '../store/workspace';
 import { FileTree } from '../components/chat/FileTree';
+import { BranchView } from '../components/chat/BranchView';
 import { Banner, Empty, Loading, Modal } from '../components/common';
 
 export function ChatPage(): JSX.Element {
@@ -24,9 +25,16 @@ export function ChatPage(): JSX.Element {
   const [renaming, setRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [branchViewOpen, setBranchViewOpen] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottom = useRef(true);
+
+  // 兄弟分支标识：树（REST 事实源）× 当前线性路径派生，不另存状态。
+  const branchInfo = useMemo(
+    () => computeBranchInfo(state.tree, state.messages),
+    [state.tree, state.messages],
+  );
 
   // 页面打开时与内核重新对账一次；平时靠 wireChat 的推送与重连兜底。
   useEffect(() => {
@@ -183,6 +191,14 @@ export function ChatPage(): JSX.Element {
               <button
                 type="button"
                 className="btn btn--ghost btn--sm"
+                title="查看全部分支；删除、移动、清空都在这里进行"
+                onClick={() => setBranchViewOpen(true)}
+              >
+                分支视图
+              </button>
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm"
                 onClick={() => {
                   setRenameDraft(activeSession.title);
                   setRenaming(true);
@@ -248,6 +264,9 @@ export function ChatPage(): JSX.Element {
                   key={m.node_id}
                   node={m}
                   reasons={state.degradedReasons[m.node_id]}
+                  branch={branchInfo[m.node_id]}
+                  onFork={() => void state.forkAt(m.node_id)}
+                  onSwitchBranch={() => void state.switchBranch(m.node_id)}
                 />
               ))}
               {state.streaming ? (
@@ -271,6 +290,22 @@ export function ChatPage(): JSX.Element {
             </div>
 
             <div className="chat-composer">
+              {state.forkParentId ? (
+                <Banner
+                  variant="info"
+                  title="将从上方选中的消息处开始新分支"
+                  hint="发送后形成新分支，原分支保留；点「分支视图」可以看到整棵树。"
+                  actions={
+                    <button
+                      type="button"
+                      className="btn btn--ghost btn--sm"
+                      onClick={() => state.cancelFork()}
+                    >
+                      取消分叉
+                    </button>
+                  }
+                />
+              ) : null}
               {state.pendingStatus ? (
                 <Banner
                   variant="warn"
@@ -321,6 +356,8 @@ export function ChatPage(): JSX.Element {
       <aside className="chatpage__files">
         <FileTree workspaceId={workspaceId} onPick={insertRef} />
       </aside>
+
+      {branchViewOpen ? <BranchView onClose={() => setBranchViewOpen(false)} /> : null}
 
       {confirmDelete && activeSession ? (
         <Modal
@@ -398,10 +435,30 @@ function toolTarget(args: Record<string, unknown> | undefined): string {
 function ChatNodeView({
   node,
   reasons,
+  branch,
+  onFork,
+  onSwitchBranch,
 }: {
   node: ChatNode;
   reasons?: string[];
+  /** 兄弟分支标识（有分支时才传）：点击切换到下一个分支。 */
+  branch?: BranchInfo;
+  onFork: () => void;
+  onSwitchBranch: () => void;
 }): JSX.Element | null {
+  const branchBadge = branch ? (
+    <div>
+      <button
+        type="button"
+        className="chat-branch-badge"
+        title="这条消息后面有多个分支，点击切换"
+        onClick={onSwitchBranch}
+      >
+        分支 {branch.index + 1}/{branch.count} ›
+      </button>
+    </div>
+  ) : null;
+
   if (node.role === 'tool') {
     // 工具结果节点：折叠展示，如实可见但不占对话流主体。
     return (
@@ -414,6 +471,7 @@ function ChatNodeView({
             </summary>
             <pre className="chat-tool__body">{node.content}</pre>
           </details>
+          {branchBadge}
         </div>
       </div>
     );
@@ -424,6 +482,17 @@ function ChatNodeView({
   const calls = node.tool_calls ?? [];
   return (
     <div className={isUser ? 'chat-row chat-row--user' : 'chat-row'}>
+      {/* 分叉入口在每条消息的 hover 工具条（§6.4 原则 2）。 */}
+      <div className="chat-actions">
+        <button
+          type="button"
+          className="btn btn--ghost"
+          title="以这条消息为起点开一条新分支，原分支保留"
+          onClick={onFork}
+        >
+          从此分叉
+        </button>
+      </div>
       <div style={{ maxWidth: '88%' }}>
         <div
           className={
@@ -457,6 +526,7 @@ function ChatNodeView({
               : ''}
           </div>
         ) : null}
+        {branchBadge}
       </div>
     </div>
   );

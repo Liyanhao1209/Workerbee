@@ -80,6 +80,62 @@ async def list_messages(
     return await services.chat.list_messages(session_id, leaf_id)
 
 
+@router.get(
+    "/api/chat/sessions/{session_id}/tree",
+    response_model=S.ChatTreeResponse,
+    summary="读取会话的完整节点森林（含软删节点，前端自组树）",
+)
+async def get_tree(session_id: str, services: ServicesDep) -> S.ChatTreeResponse:
+    return await services.chat.get_tree(session_id)
+
+
+@router.post(
+    "/api/chat/sessions/{session_id}/purge_deleted",
+    response_model=S.ChatPurgeResponse,
+    summary="清空会话内全部软删消息（硬删，不可恢复）",
+)
+async def purge_deleted(session_id: str, services: ServicesDep) -> S.ChatPurgeResponse:
+    return await services.chat.purge_deleted(session_id)
+
+
+@router.post(
+    "/api/chat/nodes/{node_id}/fork",
+    response_model=S.ChatForkResponse,
+    summary="以该节点为分叉点，返回新分支的上下文（实际分叉发生在下一次带 parent_id 的发送）",
+)
+async def fork_node(node_id: str, services: ServicesDep) -> S.ChatForkResponse:
+    return await services.chat.fork_node(node_id)
+
+
+@router.delete(
+    "/api/chat/nodes/{node_id}",
+    response_model=S.ChatNodeDeleteResponse,
+    summary="级联软删除该节点及其全部后代（D-F；清空前可恢复）",
+)
+async def delete_node(node_id: str, services: ServicesDep) -> S.ChatNodeDeleteResponse:
+    return await services.chat.delete_node(node_id)
+
+
+@router.post(
+    "/api/chat/nodes/{node_id}/move",
+    response_model=S.ChatNodeMoveResponse,
+    summary="移动/合并子树到新父节点（目标在自己或后代下时 409）",
+)
+async def move_node(
+    node_id: str, req: S.ChatNodeMoveRequest, services: ServicesDep
+) -> S.ChatNodeMoveResponse:
+    return await services.chat.move_node(node_id, req)
+
+
+@router.post(
+    "/api/chat/nodes/{node_id}/restore",
+    response_model=S.ChatNodeRestoreResponse,
+    summary="恢复软删子树（按删除批次还原；清空后不可恢复）",
+)
+async def restore_node(node_id: str, services: ServicesDep) -> S.ChatNodeRestoreResponse:
+    return await services.chat.restore_node(node_id)
+
+
 @router.post(
     "/api/chat/sessions/{session_id}/messages",
     response_model=S.ChatSendResponse,

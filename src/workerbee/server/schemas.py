@@ -1282,6 +1282,8 @@ class ChatNodeResponse(ApiResponse):
     tool_calls: list[dict[str, Any]] | None = None
     tool_name: str | None = None
     tool_call_id: str | None = None
+    deleted_at: str | None = None
+    """软删除标记（D-F）。非空即已删除；树端点会带回，线性消息端点恒为 None。"""
     created_at: str
 
 
@@ -1291,6 +1293,60 @@ class ChatMessageListResponse(ApiResponse):
     messages: list[ChatNodeResponse] = Field(default_factory=list)
     leaf_id: str | None = None
     returned: int = 0
+
+
+class ChatTreeResponse(ApiResponse):
+    """会话的完整节点森林（含软删节点，v0.03 §6.2）：前端自组树。"""
+
+    session_id: str
+    nodes: list[ChatNodeResponse] = Field(default_factory=list)
+    returned: int = 0
+
+
+class ChatForkResponse(ApiResponse):
+    """分叉点的分支上下文（根 → 分叉节点的路径），前端据此切到新分支。"""
+
+    messages: list[ChatNodeResponse] = Field(default_factory=list)
+    leaf_id: str | None = None
+
+
+class ChatNodeDeleteResponse(ApiResponse):
+    """级联软删除的结果。``deleted_at`` 是删除批次号，恢复按批次还原。"""
+
+    session_id: str
+    node_id: str
+    deleted: list[str] = Field(default_factory=list)
+    deleted_at: str
+    count: int = 0
+
+
+class ChatNodeMoveRequest(ApiRequest):
+    """移动/合并子树。空串表示显式挂到森林根（与发消息的 parent_id 约定一致）。"""
+
+    new_parent_id: str
+
+
+class ChatNodeMoveResponse(ApiResponse):
+    """移动结果。``previous_parent_id`` 供撤销：以它再移动一次即还原。"""
+
+    session_id: str
+    node: ChatNodeResponse
+    previous_parent_id: str | None = None
+
+
+class ChatNodeRestoreResponse(ApiResponse):
+    """恢复软删子树的结果。``restored`` 为实际清除标记的节点数。"""
+
+    session_id: str
+    node_id: str
+    restored: int = 0
+
+
+class ChatPurgeResponse(ApiResponse):
+    """清空软删节点的结果（硬删，不可恢复）。"""
+
+    session_id: str
+    purged: int = 0
 
 
 class ChatSendRequest(ApiRequest):

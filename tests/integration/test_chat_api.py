@@ -509,3 +509,146 @@ class TestFsApi:
         body = resp.json()
         assert body["timed_out"] is True
         assert body["exit_code"] is None
+
+
+# ===========================================================================
+# Fork 树操作（v0.03 §6.2）
+# ===========================================================================
+
+
+class TestTreeApi:
+    async def _session_with_tree(self, client: Any, engine: Engine) -> dict[str, str]:
+        """两棵树：t1 = [u1, a1, u2, a2]；t2 = [u3, a3]（parent_id=\"\" 显式挂森林根）。"""
+        await _setup_credential(engine, client)
+        _plug_backend(engine, FakeLLMBackend("接口层回答。"))
+        sid = (await client.post("/api/chat/sessions", json={})).json()["session_id"]
+
+        async def send(content: str, **extra: Any) -> dict[str, Any]:
+            resp = await client.post(
+                f"/api/chat/sessions/{sid}/messages",
+                json={"content": content, **extra},
+            )
+            assert resp.status_code == 200, resp.text
+            return resp.json()
+
+        r1 = await send("第一问")
+        r2 = await send("第二问")
+        r3 = await send("从头再问", parent_id="")
+        return {
+            "sid": sid,
+            "u1": r1["user_node"]["node_id"],
+            "a1": r1["reply"]["node_id"],
+            "u2": r2["user_node"]["node_id"],
+            "a2": r2["reply"]["node_id"],
+            "u3": r3["user_node"]["node_id"],
+            "a3": r3["reply"]["node_id"],
+        }
+
+    async def test_tree端点返回全量节点与两棵树(
+        self, client: Any, engine: Engine
+    ) -> None:
+        ids = await self._session_with_tree(client, engine)
+        resp = await client.get(f"/api/chat/sessions/{ids['sid']}/tree")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["returned"] == 6
+        by_id = {n["node_id"]: n for n in body["nodes"]}
+        assert by_id[ids["u1"]]["parent_id"] is None
+        assert by_id[ids["u3"]]["parent_id"] is None
+        assert by_id[ids["a2"]]["parent_id"] == ids["u2"]
+        assert all(n["deleted_at"] is None for n in body["nodes"])
+
+    async def test_fork端点返回分支上下文(
+        self, client: Any, engine: Engine
+    ) -> None:
+        ids = await self._session_with_tree(client, engine)
+        resp = await client.post(f"/api/chat/nodes/{ids['u2']}/fork")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["leaf_id"] == ids["u2"]
+        assert [n["node_id"] for n in body["messages"]] == [ids["u1"], ids["a1"], ids["u2"]]
+        assert (await client.post("/api/chat/nodes/ghost/fork")).status_code == 404
+
+    async def test_删除子树与恢复闭环(self, client: Any, engine: Engine) -> None:
+        ids = await self._session_with_tree(client, engine)
+        sid = ids["sid"]
+
+        deleted = await client.delete(f"/api/chat/nodes/{ids['u2']}")
+        assert deleted.status_code == 200, deleted.text
+        body = deleted.json()
+        assert body["count"] == 2
+        assert set(body["deleted"]) == {ids["u2"], ids["a2"]}
+
+        # 树端点能看到软删标记（含 deleted_at），线性视图默认避开。
+        tree = (await client.get(f"/api/chat/sessions/{sid}/tree")).json()
+        by_id = {n["node_id"]: n for n in tree["nodes"]}
+        assert by_id[ids["u2"]]["deleted_at"] == body["deleted_at"]
+        linear = (await client.get(f"/api/chat/sessions/{sid}/messages")).json()
+        assert ids["u2"] not in [m["node_id"] for m in linear["messages"]]
+        # 兄弟分支（第二棵树）不受影响。
+        assert by_id[ids["u3"]]["deleted_at"] is None
+
+        restored = await client.post(f"/api/chat/nodes/{ids['u2']}/restore")
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["restored"] == 2
+        tree = (await client.get(f"/api/chat/sessions/{sid}/tree")).json()
+        assert all(n["deleted_at"] is None for n in tree["nodes"])
+
+    async def test_移动成环409与跨树合并(self, client: Any, engine: Engine) -> None:
+        ids = await self._session_with_tree(client, engine)
+        sid = ids["sid"]
+
+        # 移到自己下面 → 409；移到后代下面 → 409。
+        for target in (ids["u1"], ids["a2"]):
+            resp = await client.post(
+                f"/api/chat/nodes/{ids['u1']}/move", json={"new_parent_id": target}
+            )
+            assert resp.status_code == 409, resp.text
+            assert "循环" in resp.json()["detail"]
+
+        # 跨树移动即合并：第二棵树挂到 a2 下，森林里只剩一个根。
+        moved = await client.post(
+            f"/api/chat/nodes/{ids['u3']}/move", json={"new_parent_id": ids["a2"]}
+        )
+        assert moved.status_code == 200, moved.text
+        body = moved.json()
+        assert body["previous_parent_id"] is None
+        assert body["node"]["parent_id"] == ids["a2"]
+
+        tree = (await client.get(f"/api/chat/sessions/{sid}/tree")).json()
+        roots = [n for n in tree["nodes"] if n["parent_id"] is None]
+        assert [r["node_id"] for r in roots] == [ids["u1"]]
+
+        # 撤销 = 以返回的旧 parent（空串 = 森林根）再移动一次。
+        back = await client.post(
+            f"/api/chat/nodes/{ids['u3']}/move", json={"new_parent_id": ""}
+        )
+        assert back.status_code == 200
+        assert back.json()["node"]["parent_id"] is None
+
+    async def test_清空后不可恢复(self, client: Any, engine: Engine) -> None:
+        ids = await self._session_with_tree(client, engine)
+        sid = ids["sid"]
+        await client.delete(f"/api/chat/nodes/{ids['u2']}")
+
+        purged = await client.post(f"/api/chat/sessions/{sid}/purge_deleted")
+        assert purged.status_code == 200, purged.text
+        assert purged.json()["purged"] == 2
+
+        tree = (await client.get(f"/api/chat/sessions/{sid}/tree")).json()
+        assert tree["returned"] == 4
+        assert (await client.post(f"/api/chat/nodes/{ids['u2']}/restore")).status_code == 404
+
+    async def test_幽灵目标404(self, client: Any) -> None:
+        sid = (await client.post("/api/chat/sessions", json={})).json()["session_id"]
+        assert (await client.get(f"/api/chat/sessions/{sid}/tree")).status_code == 200
+        assert (await client.get("/api/chat/sessions/ghost/tree")).status_code == 404
+        assert (
+            await client.post("/api/chat/sessions/ghost/purge_deleted")
+        ).status_code == 404
+        assert (await client.delete("/api/chat/nodes/ghost")).status_code == 404
+        resp = await client.post(
+            "/api/chat/nodes/ghost/move", json={"new_parent_id": "x"}
+        )
+        assert resp.status_code == 404
+        assert (await client.post("/api/chat/nodes/ghost/restore")).status_code == 404

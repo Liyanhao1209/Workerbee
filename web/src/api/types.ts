@@ -1267,7 +1267,49 @@ export interface ChatNode {
   tool_calls: { id: string; name: string; arguments: Record<string, unknown> }[] | null;
   tool_name: string | null;
   tool_call_id: string | null;
+  /** 软删除标记（D-F）：非空即已删除。树端点会带回，线性消息端点恒为 null。 */
+  deleted_at: string | null;
   created_at: string;
+}
+
+/** 会话的完整节点森林（含软删节点）：前端自组树。 */
+export interface ChatTreeResult {
+  session_id: string;
+  nodes: ChatNode[];
+  returned: number;
+}
+
+/** 分叉点的分支上下文（根 → 分叉节点的路径）。 */
+export interface ChatForkResult {
+  messages: ChatNode[];
+  leaf_id: string | null;
+}
+
+/** 级联软删除的结果。deleted_at 是删除批次号，恢复按批次还原。 */
+export interface ChatNodeDeleteResult {
+  session_id: string;
+  node_id: string;
+  deleted: string[];
+  deleted_at: string;
+  count: number;
+}
+
+/** 移动结果。previous_parent_id 供撤销：以它再移动一次即还原。 */
+export interface ChatNodeMoveResult {
+  session_id: string;
+  node: ChatNode;
+  previous_parent_id: string | null;
+}
+
+export interface ChatNodeRestoreResult {
+  session_id: string;
+  node_id: string;
+  restored: number;
+}
+
+export interface ChatPurgeResult {
+  session_id: string;
+  purged: number;
 }
 
 /** 一轮问答的结果：最终回复 + 本轮新生的全部节点（含工具往返）。 */
@@ -1331,7 +1373,8 @@ export interface WsPush {
     | 'chat_chunk'
     | 'chat_message'
     | 'chat_status'
-    | 'chat_session';
+    | 'chat_session'
+    | 'chat_tree_changed';
   task_id: string | null;
   stage_id: string | null;
   payload: Record<string, unknown>;

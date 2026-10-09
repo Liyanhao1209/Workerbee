@@ -151,6 +151,16 @@ class EventType(StrEnum):
     CHAT_GRANT_CHANGED = "chat.grant_changed"
     """会话级临时授权的授予/撤销（D-G）。"""
 
+    # Session Fork 树操作（v0.03 §6.2）。payload 只放节点 id 与数量等元信息。
+    CHAT_TREE_DELETED = "chat.tree_deleted"
+    """级联软删除一棵子树（D-F）；payload 带 deleted_at 以便按批次恢复。"""
+    CHAT_TREE_RESTORED = "chat.tree_restored"
+    """恢复一次软删除（按 deleted_at 批次还原）。"""
+    CHAT_TREE_MOVED = "chat.tree_moved"
+    """移动/合并子树；payload 记旧 parent_id，撤销 = 再移回去。"""
+    CHAT_TREE_PURGED = "chat.tree_purged"
+    """清空会话内全部软删节点（硬删，不可恢复；撤销窗口至此关闭）。"""
+
 
 RedactorFn = Callable[[Any], Any]
 

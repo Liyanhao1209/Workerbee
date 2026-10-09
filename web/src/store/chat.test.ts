@@ -22,6 +22,12 @@ const harness = vi.hoisted(() => ({
     send: vi.fn(),
     grantSession: vi.fn(),
     revokeGrant: vi.fn(),
+    tree: vi.fn(),
+    forkNode: vi.fn(),
+    deleteNode: vi.fn(),
+    moveNode: vi.fn(),
+    restoreNode: vi.fn(),
+    purgeDeleted: vi.fn(),
   },
 }));
 
@@ -64,6 +70,11 @@ function resetStore(): void {
     messages: [],
     leafId: null,
     messagesLoaded: false,
+    tree: [],
+    treeLoaded: false,
+    forkParentId: null,
+    undo: null,
+    treeError: null,
     sending: false,
     streaming: null,
     sendError: null,
@@ -77,6 +88,7 @@ function resetStore(): void {
 beforeAll(async () => {
   harness.api.sessions.mockResolvedValue({ sessions: [SESSION], returned: 1 });
   harness.api.messages.mockResolvedValue({ messages: [], leaf_id: null, returned: 0 });
+  harness.api.tree.mockResolvedValue({ session_id: 's-1', nodes: [], returned: 0 });
   // wireChat 有模块级 wired 防重入，整个文件只挂一次。
   wireChat();
   await vi.waitFor(() => {
@@ -130,7 +142,7 @@ describe('chat_message 对账', () => {
 
     expect(useChat.getState().streaming).toBeNull();
     expect(useChat.getState().pendingStatus).toBeNull();
-    await vi.waitFor(() => expect(harness.api.messages).toHaveBeenCalledWith('s-1'));
+    await vi.waitFor(() => expect(harness.api.messages).toHaveBeenCalledWith('s-1', undefined));
   });
 
   it('别的会话完成：当前气泡不动，也不重拉', async () => {
@@ -290,5 +302,217 @@ describe('发送流程', () => {
     expect(useChat.getState().degradedReasons['n-2']).toEqual([
       '当前后端不支持文件操作，仅纯对话',
     ]);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Fork 树（v0.03 §6）：分支标识、分支切换、树操作与撤销
+// ---------------------------------------------------------------------------
+
+import { computeBranchInfo, nextBranchLeaf } from './chat';
+import type { ChatNode } from '../api/types';
+
+function mkNode(id: string, parentId: string | null, deleted = false): ChatNode {
+  return {
+    node_id: id,
+    session_id: 's-1',
+    parent_id: parentId,
+    role: 'user',
+    content: id,
+    reasoning: null,
+    backend: null,
+    tokens_in: null,
+    tokens_out: null,
+    tool_calls: null,
+    tool_name: null,
+    tool_call_id: null,
+    deleted_at: deleted ? '2026-10-02T00:00:00Z' : null,
+    created_at: '2026-10-01T00:00:00Z',
+  };
+}
+
+/** r → a → b1（当前路径）；a → b2 → c2（兄弟分支）。 */
+const FORKED_TREE = [
+  mkNode('r', null),
+  mkNode('a', 'r'),
+  mkNode('b1', 'a'),
+  mkNode('b2', 'a'),
+  mkNode('c2', 'b2'),
+];
+const CURRENT_PATH = [FORKED_TREE[0]!, FORKED_TREE[1]!, FORKED_TREE[2]!];
+
+describe('分支标识与切换（纯函数）', () => {
+  it('computeBranchInfo：分叉点给出兄弟数与当前序号，单分支不出现', () => {
+    const info = computeBranchInfo(FORKED_TREE, CURRENT_PATH);
+    expect(info['a']).toEqual({ index: 0, count: 2 });
+    expect(info['r']).toBeUndefined();
+    expect(info['b1']).toBeUndefined();
+  });
+
+  it('computeBranchInfo：多根森林时首条消息携带根分支信息', () => {
+    const tree = [mkNode('t1', null), mkNode('t2', null)];
+    const info = computeBranchInfo(tree, [tree[1]!]);
+    expect(info['t2']).toEqual({ index: 1, count: 2 });
+  });
+
+  it('computeBranchInfo：软删的兄弟不算分支', () => {
+    const tree = [...FORKED_TREE.slice(0, 3), mkNode('b2', 'a', true)];
+    const info = computeBranchInfo(tree, CURRENT_PATH);
+    expect(info['a']).toBeUndefined();
+  });
+
+  it('nextBranchLeaf：切到兄弟分支并下到其最深最新叶', () => {
+    expect(nextBranchLeaf(FORKED_TREE, 'a', ['r', 'a', 'b1'])).toBe('c2');
+    // 再点一次环形回到原分支。
+    expect(nextBranchLeaf(FORKED_TREE, 'a', ['r', 'a', 'b2', 'c2'])).toBe('b1');
+  });
+
+  it('nextBranchLeaf：根分支切换与无分支时的 null', () => {
+    const tree = [mkNode('t1', null), mkNode('t1a', 't1'), mkNode('t2', null)];
+    expect(nextBranchLeaf(tree, 't1', ['t1', 't1a'])).toBe('t2');
+    expect(nextBranchLeaf(FORKED_TREE, 'b1', ['r', 'a', 'b1'])).toBeNull();
+  });
+});
+
+describe('分叉入口与分支切换（store）', () => {
+  it('forkAt 切换线性视图到分叉点路径，下一次发送以它为父', async () => {
+    const path = [mkNode('r', null), mkNode('a', 'r')];
+    harness.api.forkNode.mockResolvedValue({ messages: path, leaf_id: 'a' });
+    harness.api.send.mockResolvedValue({
+      reply: { node_id: 'n-reply', session_id: 's-1', role: 'assistant' },
+      user_node: { node_id: 'n-user', session_id: 's-1', role: 'user' },
+      nodes: [],
+      dropped: 0,
+      degraded: false,
+      degraded_reasons: [],
+      supports_tools: true,
+    });
+    // 发送后的重拉以服务端为准：新分支叶随对账回来。
+    harness.api.messages.mockResolvedValue({
+      messages: [...path, mkNode('n-user', 'a'), mkNode('n-reply', 'n-user')],
+      leaf_id: 'n-reply',
+      returned: 4,
+    });
+    useChat.setState({ activeSessionId: 's-1' });
+
+    expect(await useChat.getState().forkAt('a')).toBe(true);
+    expect(useChat.getState().messages.map((m) => m.node_id)).toEqual(['r', 'a']);
+    expect(useChat.getState().leafId).toBe('a');
+    expect(useChat.getState().forkParentId).toBe('a');
+
+    await useChat.getState().send('改问');
+    expect(harness.api.send).toHaveBeenCalledWith('s-1', {
+      content: '改问',
+      parent_id: 'a',
+      refs: [],
+    });
+    // 发送后分叉点消费掉，分支叶推进到新回复。
+    expect(useChat.getState().forkParentId).toBeNull();
+    expect(useChat.getState().leafId).toBe('n-reply');
+  });
+
+  it('forkAt 失败如实可见', async () => {
+    harness.api.forkNode.mockRejectedValue(new Error('网络不可达'));
+    useChat.setState({ activeSessionId: 's-1' });
+    expect(await useChat.getState().forkAt('a')).toBe(false);
+    expect(useChat.getState().treeError?.detail).toBe('分叉失败。');
+    expect(useChat.getState().forkParentId).toBeNull();
+  });
+
+  it('switchBranch 重拉到兄弟分支的叶', async () => {
+    const newPath = [mkNode('r', null), mkNode('a', 'r'), mkNode('b2', 'a'), mkNode('c2', 'b2')];
+    harness.api.messages.mockResolvedValue({ messages: newPath, leaf_id: 'c2', returned: 4 });
+    useChat.setState({
+      activeSessionId: 's-1',
+      tree: FORKED_TREE,
+      messages: CURRENT_PATH,
+      leafId: 'b1',
+      forkParentId: 'a',
+    });
+
+    await useChat.getState().switchBranch('a');
+
+    expect(harness.api.messages).toHaveBeenCalledWith('s-1', 'c2');
+    expect(useChat.getState().leafId).toBe('c2');
+    // 切分支即放弃未发送的分叉意图。
+    expect(useChat.getState().forkParentId).toBeNull();
+  });
+});
+
+describe('树操作与撤销（store）', () => {
+  it('deleteSubtree 记录可撤销操作并重拉树与消息', async () => {
+    harness.api.deleteNode.mockResolvedValue({
+      session_id: 's-1',
+      node_id: 'b1',
+      deleted: ['b1'],
+      deleted_at: '2026-10-02T00:00:00Z',
+      count: 1,
+    });
+    useChat.setState({ activeSessionId: 's-1', tree: FORKED_TREE, leafId: 'b1' });
+
+    expect(await useChat.getState().deleteSubtree('b1')).toBe(true);
+    expect(useChat.getState().undo).toEqual({ kind: 'delete', nodeId: 'b1' });
+    await vi.waitFor(() => expect(harness.api.tree).toHaveBeenCalledWith('s-1'));
+    await vi.waitFor(() => expect(harness.api.messages).toHaveBeenCalledWith('s-1', 'b1'));
+  });
+
+  it('undoLast：删除的撤销 = 恢复同一节点', async () => {
+    harness.api.restoreNode.mockResolvedValue({ session_id: 's-1', node_id: 'b1', restored: 1 });
+    useChat.setState({ activeSessionId: 's-1', undo: { kind: 'delete', nodeId: 'b1' } });
+
+    expect(await useChat.getState().undoLast()).toBe(true);
+    expect(harness.api.restoreNode).toHaveBeenCalledWith('b1');
+    expect(useChat.getState().undo).toBeNull();
+  });
+
+  it('undoLast：移动的撤销 = 移回旧父节点（空为森林根）', async () => {
+    harness.api.moveNode.mockResolvedValue({
+      session_id: 's-1',
+      node: mkNode('b1', null),
+      previous_parent_id: null,
+    });
+    useChat.setState({
+      activeSessionId: 's-1',
+      undo: { kind: 'move', nodeId: 'b1', previousParentId: 'a' },
+    });
+
+    expect(await useChat.getState().undoLast()).toBe(true);
+    expect(harness.api.moveNode).toHaveBeenCalledWith('b1', 'a');
+  });
+
+  it('purgeDeleted 关闭撤销窗口', async () => {
+    harness.api.purgeDeleted.mockResolvedValue({ session_id: 's-1', purged: 2 });
+    useChat.setState({ activeSessionId: 's-1', undo: { kind: 'delete', nodeId: 'b1' } });
+
+    expect(await useChat.getState().purgeDeleted()).toBe(true);
+    expect(harness.api.purgeDeleted).toHaveBeenCalledWith('s-1');
+    expect(useChat.getState().undo).toBeNull();
+  });
+
+  it('删除失败如实可见且不产生撤销项', async () => {
+    harness.api.deleteNode.mockRejectedValue(new Error('网络不可达'));
+    useChat.setState({ activeSessionId: 's-1' });
+    expect(await useChat.getState().deleteSubtree('b1')).toBe(false);
+    expect(useChat.getState().treeError?.detail).toBe('删除失败。');
+    expect(useChat.getState().undo).toBeNull();
+  });
+});
+
+describe('chat_tree_changed 推送', () => {
+  it('当前会话的树变更触发树与消息重拉', async () => {
+    useChat.setState({ activeSessionId: 's-1', leafId: null });
+    harness.push!(push('chat_tree_changed', { session_id: 's-1' }));
+    await vi.waitFor(() => expect(harness.api.tree).toHaveBeenCalledWith('s-1'));
+    await vi.waitFor(() => expect(harness.api.messages).toHaveBeenCalledWith('s-1', undefined));
+  });
+
+  it('别的会话的树变更不影响当前页', async () => {
+    useChat.setState({ activeSessionId: 's-1' });
+    vi.clearAllMocks();
+    harness.push!(push('chat_tree_changed', { session_id: 's-other' }));
+    await Promise.resolve();
+    expect(harness.api.tree).not.toHaveBeenCalled();
+    expect(harness.api.messages).not.toHaveBeenCalled();
   });
 });

@@ -50,7 +50,7 @@ from ..assistant.draft import DraftInvalid, DraftProposal, proposal_graph
 from ..capture import CaptureError
 from ..chat import fs as chat_fs
 from ..chat import run as chat_run
-from ..chat.service import ChatError, tool_grant_category
+from ..chat.service import ChatConflict, ChatError, tool_grant_category
 from ..chat.tools import APPROVAL_TOOLS as CHAT_APPROVAL_TOOLS
 from ..chat.tools import RUN_TIMEOUT_CAP_S as CHAT_RUN_TIMEOUT_CAP_S
 from ..data.db import ConflictError
@@ -2353,6 +2353,74 @@ class ChatService(_Service):
         return S.ChatMessageListResponse(
             messages=messages, leaf_id=result["leaf_id"], returned=len(messages)
         )
+
+    # ---- 树操作（v0.03 §6.2）----
+
+    @staticmethod
+    def _translate_tree_error(exc: ChatError) -> ServiceError:
+        if isinstance(exc, ChatConflict):
+            return Conflict(exc.detail, hint=exc.hint)
+        return BadRequest(exc.detail, hint=exc.hint)
+
+    async def get_tree(self, session_id: str) -> S.ChatTreeResponse:
+        try:
+            result = await self._core().get_tree(session_id)
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        nodes = [S.ChatNodeResponse.model_validate(n) for n in result["nodes"]]
+        return S.ChatTreeResponse(
+            session_id=session_id, nodes=nodes, returned=len(nodes)
+        )
+
+    async def fork_node(self, node_id: str) -> S.ChatForkResponse:
+        try:
+            result = await self._core().fork_node(node_id)
+        except KeyError:
+            raise NotFound("这条消息不存在（可能已被清空）") from None
+        except ChatError as exc:
+            raise BadRequest(exc.detail, hint=exc.hint) from exc
+        messages = [S.ChatNodeResponse.model_validate(m) for m in result["messages"]]
+        return S.ChatForkResponse(messages=messages, leaf_id=result["leaf_id"])
+
+    async def delete_node(self, node_id: str) -> S.ChatNodeDeleteResponse:
+        try:
+            result = await self._core().delete_subtree(node_id)
+        except KeyError:
+            raise NotFound("这条消息不存在（可能已被清空）") from None
+        except ChatError as exc:
+            raise self._translate_tree_error(exc) from exc
+        return S.ChatNodeDeleteResponse.model_validate(result)
+
+    async def move_node(
+        self, node_id: str, req: S.ChatNodeMoveRequest
+    ) -> S.ChatNodeMoveResponse:
+        try:
+            result = await self._core().move_node(node_id, req.new_parent_id)
+        except KeyError:
+            raise NotFound("这条消息不存在（可能已被清空）") from None
+        except ChatError as exc:
+            raise self._translate_tree_error(exc) from exc
+        return S.ChatNodeMoveResponse(
+            session_id=result["session_id"],
+            node=S.ChatNodeResponse.model_validate(result["node"]),
+            previous_parent_id=result["previous_parent_id"],
+        )
+
+    async def restore_node(self, node_id: str) -> S.ChatNodeRestoreResponse:
+        try:
+            result = await self._core().restore_subtree(node_id)
+        except KeyError:
+            raise NotFound("这条消息不存在（可能已被清空）") from None
+        except ChatError as exc:
+            raise self._translate_tree_error(exc) from exc
+        return S.ChatNodeRestoreResponse.model_validate(result)
+
+    async def purge_deleted(self, session_id: str) -> S.ChatPurgeResponse:
+        try:
+            result = await self._core().purge_deleted(session_id)
+        except KeyError:
+            raise NotFound(f"对话不存在: {session_id}") from None
+        return S.ChatPurgeResponse.model_validate(result)
 
     async def send_message(
         self, session_id: str, req: S.ChatSendRequest

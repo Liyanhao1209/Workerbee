@@ -12,7 +12,6 @@ import { ApiError } from '../api/client';
 import { chat as chatApi } from '../api/endpoints';
 import type { ChatNode, ChatSession } from '../api/types';
 import { onKernelPush, onKernelReconnect } from './connection';
-
 export interface ChatFailure {
   detail: string;
   hint: string | null;
@@ -34,9 +33,89 @@ export interface ChatStatus {
   approvalId: string | null;
 }
 
+/** 分支视图里可撤销的最近一次树操作（撤销窗口 = 清空前，D-F）。 */
+export type ChatUndo =
+  | { kind: 'delete'; nodeId: string }
+  | { kind: 'move'; nodeId: string; previousParentId: string | null };
+
+/** 一条消息的分支标识：它有 count 个分支，当前显示第 index 个（0 起）。 */
+export interface BranchInfo {
+  index: number;
+  count: number;
+}
+
 function asFailure(err: unknown, fallback: string): ChatFailure {
   if (err instanceof ApiError) return { detail: err.detail, hint: err.hint };
   return { detail: fallback, hint: null };
+}
+
+/** 未删除的子节点（插入顺序）。parentId 为 null 时取森林的根列表。 */
+export function liveChildren(tree: ChatNode[], parentId: string | null): ChatNode[] {
+  return tree.filter(
+    (n) => (n.parent_id ?? null) === parentId && !n.deleted_at,
+  );
+}
+
+/**
+ * 线性视图的分支标识：当前路径上每个「后面还有别的分支」的消息，
+ * 给出兄弟分支数与当前所在分支的序号（含森林多根：首条消息携带根分支信息）。
+ */
+export function computeBranchInfo(
+  tree: ChatNode[],
+  messages: ChatNode[],
+): Record<string, BranchInfo> {
+  const info: Record<string, BranchInfo> = {};
+  if (messages.length === 0 || tree.length === 0) return info;
+  const first = messages[0]!;
+  const roots = liveChildren(tree, null);
+  if (roots.length > 1) {
+    const index = roots.findIndex((r) => r.node_id === first.node_id);
+    info[first.node_id] = { index: Math.max(index, 0), count: roots.length };
+  }
+  for (let i = 0; i < messages.length - 1; i += 1) {
+    const current = messages[i]!;
+    const next = messages[i + 1]!;
+    const kids = liveChildren(tree, current.node_id);
+    if (kids.length < 2) continue;
+    const index = kids.findIndex((k) => k.node_id === next.node_id);
+    info[current.node_id] = { index: Math.max(index, 0), count: kids.length };
+  }
+  return info;
+}
+
+/**
+ * 分支切换的目标叶：从 nodeId 的第 (current+1) 个分支（环形）一路向下，
+ * 每步取最近活跃的未删除子节点，直到叶子。没有别的分支时返回 null。
+ */
+export function nextBranchLeaf(
+  tree: ChatNode[],
+  nodeId: string,
+  currentPath: string[],
+): string | null {
+  const node = tree.find((n) => n.node_id === nodeId);
+  if (!node) return null;
+  // 根分支：nodeId 本身在根列表里时，兄弟是其他根；否则兄弟是 nodeId 的子节点。
+  const roots = liveChildren(tree, null);
+  let siblings: ChatNode[];
+  let currentId: string | null;
+  if (roots.length > 1 && roots.some((r) => r.node_id === nodeId)) {
+    siblings = roots;
+    currentId = nodeId;
+  } else {
+    siblings = liveChildren(tree, nodeId);
+    const idx = currentPath.indexOf(nodeId);
+    currentId = idx >= 0 && idx + 1 < currentPath.length ? currentPath[idx + 1]! : null;
+  }
+  if (siblings.length < 2) return null;
+  const currentIdx = siblings.findIndex((s) => s.node_id === currentId);
+  const next = siblings[(currentIdx + 1) % siblings.length]!;
+  // 沿「最近活跃」的子节点一路向下到叶子。
+  let leaf = next;
+  for (;;) {
+    const children = liveChildren(tree, leaf.node_id);
+    if (children.length === 0) return leaf.node_id;
+    leaf = children[children.length - 1]!;
+  }
 }
 
 interface ChatStoreState {
@@ -48,6 +127,16 @@ interface ChatStoreState {
   messages: ChatNode[];
   leafId: string | null;
   messagesLoaded: boolean;
+
+  /** 会话的完整节点森林（含软删节点），分支视图与分支标识的事实源。 */
+  tree: ChatNode[];
+  treeLoaded: boolean;
+  /** 待生效的分叉点：下一次发送以它为 parent（「从此分叉」之后）。 */
+  forkParentId: string | null;
+  /** 最近一次树操作（可撤销；清空后撤销窗口关闭）。 */
+  undo: ChatUndo | null;
+  /** 树操作的失败（分支视图横幅；与发送错误分开，互不覆盖）。 */
+  treeError: ChatFailure | null;
 
   sending: boolean;
   streaming: ChatStreaming | null;
@@ -67,10 +156,30 @@ interface ChatStoreState {
   newSession: (workspaceId?: string) => Promise<void>;
   renameSession: (title: string) => Promise<boolean>;
   deleteSession: () => Promise<boolean>;
-  reloadMessages: () => Promise<void>;
+  reloadMessages: (leafId?: string) => Promise<void>;
+  reloadTree: () => Promise<void>;
   send: (content: string, refs?: string[]) => Promise<boolean>;
   /** 撤销本会话某类操作的临时授权（D-G），恢复逐次审批。 */
   revokeGrant: (category: string) => Promise<boolean>;
+
+  /** 从此分叉：把线性视图切到该节点所在路径，下一次发送以它为父。 */
+  forkAt: (nodeId: string) => Promise<boolean>;
+  /** 取消待生效的分叉点（回到「挂在当前分支末尾」的默认语义）。 */
+  cancelFork: () => void;
+  /** 把线性视图切到以该节点为末端的分支（分支视图双击节点用）。 */
+  openBranchAt: (nodeId: string) => Promise<void>;
+  /** 切换到该消息的下一个兄弟分支（环形）。 */
+  switchBranch: (nodeId: string) => Promise<void>;
+  /** 级联软删除子树（清空前可经 undoLast 撤销）。 */
+  deleteSubtree: (nodeId: string) => Promise<boolean>;
+  /** 恢复软删子树（按删除批次还原）。 */
+  restoreSubtree: (nodeId: string) => Promise<boolean>;
+  /** 移动/合并子树；newParentId 为空串表示挂到森林根。 */
+  moveSubtree: (nodeId: string, newParentId: string) => Promise<boolean>;
+  /** 清空全部软删消息（硬删，不可恢复，撤销窗口关闭）。 */
+  purgeDeleted: () => Promise<boolean>;
+  /** 撤销最近一次树操作（删除→恢复；移动→移回原父节点）。 */
+  undoLast: () => Promise<boolean>;
 }
 
 export const useChat = create<ChatStoreState>((set, get) => ({
@@ -82,6 +191,12 @@ export const useChat = create<ChatStoreState>((set, get) => ({
   messages: [],
   leafId: null,
   messagesLoaded: false,
+
+  tree: [],
+  treeLoaded: false,
+  forkParentId: null,
+  undo: null,
+  treeError: null,
 
   sending: false,
   streaming: null,
@@ -100,8 +215,20 @@ export const useChat = create<ChatStoreState>((set, get) => ({
       const nextActive = stillThere ? active : (sessions[0]?.session_id ?? null);
       const switched = nextActive !== active;
       set({ sessions, sessionsLoaded: true, loadError: null, activeSessionId: nextActive });
-      if (switched) set({ messages: [], leafId: null, messagesLoaded: false, lastDropped: 0 });
+      if (switched)
+        set({
+          messages: [],
+          leafId: null,
+          messagesLoaded: false,
+          lastDropped: 0,
+          tree: [],
+          treeLoaded: false,
+          forkParentId: null,
+          undo: null,
+          treeError: null,
+        });
       await get().reloadMessages();
+      void get().reloadTree();
     } catch (err) {
       set({ sessionsLoaded: true, loadError: asFailure(err, '读取会话列表失败。') });
     }
@@ -118,14 +245,30 @@ export const useChat = create<ChatStoreState>((set, get) => ({
       lastDropped: 0,
       streaming: null, // 生成中的增量属于旧会话，切走即丢弃（完成后靠重拉对账）
       pendingStatus: null,
+      tree: [],
+      treeLoaded: false,
+      forkParentId: null,
+      undo: null,
+      treeError: null,
     });
     await get().reloadMessages();
+    void get().reloadTree();
   },
 
   newSession: async (workspaceId) => {
     try {
       const session = await chatApi.createSession(workspaceId ? { workspace_id: workspaceId } : {});
-      set({ sendError: null, lastDropped: 0, streaming: null, pendingStatus: null });
+      set({
+        sendError: null,
+        lastDropped: 0,
+        streaming: null,
+        pendingStatus: null,
+        tree: [],
+        treeLoaded: false,
+        forkParentId: null,
+        undo: null,
+        treeError: null,
+      });
       await get().refreshSessions(workspaceId);
       await get().selectSession(session.session_id);
     } catch (err) {
@@ -161,14 +304,16 @@ export const useChat = create<ChatStoreState>((set, get) => ({
     }
   },
 
-  reloadMessages: async () => {
+  reloadMessages: async (leafId) => {
     const sessionId = get().activeSessionId;
     if (!sessionId) {
       set({ messages: [], leafId: null, messagesLoaded: true });
       return;
     }
+    // 缺省沿当前分支叶读取；显式传 leafId 用于分支切换。
+    const leaf = leafId ?? get().leafId ?? undefined;
     try {
-      const data = await chatApi.messages(sessionId);
+      const data = await chatApi.messages(sessionId, leaf);
       // 拉取期间用户切了会话：结果属于旧会话，丢弃。
       if (get().activeSessionId !== sessionId) return;
       set({
@@ -179,7 +324,40 @@ export const useChat = create<ChatStoreState>((set, get) => ({
       });
     } catch (err) {
       if (get().activeSessionId !== sessionId) return;
+      // 当前叶已被删除（如刚删了所在分支）：落回默认分支再试一次。
+      if (leafId !== undefined || get().leafId !== null) {
+        set({ leafId: null });
+        try {
+          const data = await chatApi.messages(sessionId);
+          if (get().activeSessionId !== sessionId) return;
+          set({
+            messages: data.messages ?? [],
+            leafId: data.leaf_id,
+            messagesLoaded: true,
+            loadError: null,
+          });
+          return;
+        } catch {
+          // 落到下面的错误处理
+        }
+      }
       set({ messagesLoaded: true, loadError: asFailure(err, '读取对话历史失败。') });
+    }
+  },
+
+  reloadTree: async () => {
+    const sessionId = get().activeSessionId;
+    if (!sessionId) {
+      set({ tree: [], treeLoaded: true });
+      return;
+    }
+    try {
+      const data = await chatApi.tree(sessionId);
+      if (get().activeSessionId !== sessionId) return;
+      set({ tree: data.nodes ?? [], treeLoaded: true });
+    } catch (err) {
+      if (get().activeSessionId !== sessionId) return;
+      set({ treeLoaded: true, treeError: asFailure(err, '读取分支结构失败。') });
     }
   },
 
@@ -208,7 +386,13 @@ export const useChat = create<ChatStoreState>((set, get) => ({
         sessionId = session.session_id;
         set({ activeSessionId: sessionId, messages: [], leafId: null, messagesLoaded: true, lastDropped: 0 });
       }
-      const result = await chatApi.send(sessionId, { content: text, refs });
+      // 分叉点优先；否则沿当前分支叶继续（不会跳到别的分支的最新叶上）。
+      const parentId = get().forkParentId ?? get().leafId ?? undefined;
+      const result = await chatApi.send(sessionId, {
+        content: text,
+        ...(parentId !== undefined ? { parent_id: parentId } : {}),
+        refs,
+      });
       const reasons = { ...get().degradedReasons };
       if (result.degraded && result.degraded_reasons.length > 0) {
         reasons[result.reply.node_id] = result.degraded_reasons;
@@ -220,14 +404,130 @@ export const useChat = create<ChatStoreState>((set, get) => ({
         lastDropped: result.dropped,
         degradedReasons: reasons,
         supportsTools: result.supports_tools,
+        forkParentId: null,
+        // 分支叶推进到本轮回复：紧随其后的重拉沿新分支读取。
+        leafId: result.reply.node_id,
       });
-      // 回复已在响应里，但会话排序与消息列表仍以服务端为准重拉一次。
+      // 回复已在响应里，但消息列表、分支结构与会话排序仍以服务端为准重拉一次。
       await get().refreshSessions();
       return true;
     } catch (err) {
       set({ sending: false, streaming: null, pendingStatus: null, sendError: asFailure(err, '发送失败。') });
       return false;
     }
+  },
+
+  forkAt: async (nodeId) => {
+    try {
+      const result = await chatApi.forkNode(nodeId);
+      set({
+        messages: result.messages ?? [],
+        leafId: result.leaf_id,
+        forkParentId: result.leaf_id,
+        messagesLoaded: true,
+        treeError: null,
+        sendError: null,
+      });
+      return true;
+    } catch (err) {
+      set({ treeError: asFailure(err, '分叉失败。') });
+      return false;
+    }
+  },
+
+  cancelFork: () => {
+    set({ forkParentId: null });
+  },
+
+  openBranchAt: async (nodeId) => {
+    set({ forkParentId: null });
+    await get().reloadMessages(nodeId);
+  },
+
+  switchBranch: async (nodeId) => {
+    const { tree, messages } = get();
+    const leaf = nextBranchLeaf(
+      tree,
+      nodeId,
+      messages.map((m) => m.node_id),
+    );
+    if (!leaf || leaf === get().leafId) return;
+    set({ forkParentId: null });
+    await get().reloadMessages(leaf);
+  },
+
+  deleteSubtree: async (nodeId) => {
+    try {
+      const result = await chatApi.deleteNode(nodeId);
+      const { forkParentId } = get();
+      set({
+        undo: { kind: 'delete', nodeId },
+        treeError: null,
+        // 分叉点被删掉了：清掉，避免下一次发送挂在已删除节点上。
+        ...(forkParentId && result.deleted.includes(forkParentId)
+          ? { forkParentId: null }
+          : {}),
+      });
+      await get().reloadTree();
+      await get().reloadMessages();
+      return true;
+    } catch (err) {
+      set({ treeError: asFailure(err, '删除失败。') });
+      return false;
+    }
+  },
+
+  restoreSubtree: async (nodeId) => {
+    try {
+      await chatApi.restoreNode(nodeId);
+      set({ treeError: null });
+      await get().reloadTree();
+      await get().reloadMessages();
+      return true;
+    } catch (err) {
+      set({ treeError: asFailure(err, '恢复失败。') });
+      return false;
+    }
+  },
+
+  moveSubtree: async (nodeId, newParentId) => {
+    try {
+      const result = await chatApi.moveNode(nodeId, newParentId);
+      set({
+        undo: { kind: 'move', nodeId, previousParentId: result.previous_parent_id },
+        treeError: null,
+      });
+      await get().reloadTree();
+      await get().reloadMessages();
+      return true;
+    } catch (err) {
+      set({ treeError: asFailure(err, '移动失败。') });
+      return false;
+    }
+  },
+
+  purgeDeleted: async () => {
+    const sessionId = get().activeSessionId;
+    if (!sessionId) return false;
+    try {
+      await chatApi.purgeDeleted(sessionId);
+      // 硬删后撤销窗口关闭（D-F）。
+      set({ undo: null, treeError: null });
+      await get().reloadTree();
+      await get().reloadMessages();
+      return true;
+    } catch (err) {
+      set({ treeError: asFailure(err, '清空失败。') });
+      return false;
+    }
+  },
+
+  undoLast: async () => {
+    const undo = get().undo;
+    if (!undo) return false;
+    set({ undo: null });
+    if (undo.kind === 'delete') return get().restoreSubtree(undo.nodeId);
+    return get().moveSubtree(undo.nodeId, undo.previousParentId ?? '');
   },
 }));
 
@@ -282,6 +582,15 @@ export function wireChat(): void {
         useChat.setState({ pendingStatus: { status, detail, approvalId } });
       } else {
         useChat.setState({ pendingStatus: null });
+      }
+      return;
+    }
+    if (push.kind === 'chat_tree_changed') {
+      // 树结构变更（软删/移动/恢复/清空）：重拉树与线性视图对账。
+      const sessionId = typeof push.payload['session_id'] === 'string' ? push.payload['session_id'] : null;
+      if (sessionId && sessionId === state.activeSessionId) {
+        void state.reloadTree();
+        void state.reloadMessages();
       }
       return;
     }

@@ -2239,6 +2239,50 @@ class ChatRepository:
         )
         return self._to_node(row) if row else None
 
+    # ---- 树操作（§6.2）----
+
+    async def mark_deleted(self, node_ids: Sequence[str], deleted_at: str) -> int:
+        """给一批节点打软删除标记（同一个 deleted_at = 同一删除批次）。
+
+        批次时间戳是恢复语义的锚点：``restore_deleted`` 只清同批次的标记，
+        不会顺带复活子树里更早被单独删除的节点。
+        """
+        if not node_ids:
+            return 0
+        marks = ",".join("?" for _ in node_ids)
+        return await self.db.execute_rowcount(
+            f"UPDATE chat_node SET deleted_at=? WHERE node_id IN ({marks})",
+            (deleted_at, *node_ids),
+        )
+
+    async def restore_deleted(self, node_ids: Sequence[str], deleted_at: str) -> int:
+        """清除一批节点上**等于指定批次**的软删除标记（其余标记原样保留）。"""
+        if not node_ids:
+            return 0
+        marks = ",".join("?" for _ in node_ids)
+        return await self.db.execute_rowcount(
+            f"""UPDATE chat_node SET deleted_at=NULL
+                WHERE node_id IN ({marks}) AND deleted_at=?""",
+            (*node_ids, deleted_at),
+        )
+
+    async def move_node(self, node_id: str, new_parent_id: str | None) -> bool:
+        """改挂子树根的 parent_id（§6.2：移动=单条 UPDATE；环检测在服务层）。"""
+        return (
+            await self.db.execute_rowcount(
+                "UPDATE chat_node SET parent_id=? WHERE node_id=?",
+                (new_parent_id, node_id),
+            )
+            > 0
+        )
+
+    async def purge_deleted(self, session_id: str) -> int:
+        """硬删会话内全部软删节点（D-F 的「清空」入口；不可恢复）。"""
+        return await self.db.execute_rowcount(
+            "DELETE FROM chat_node WHERE session_id=? AND deleted_at IS NOT NULL",
+            (session_id,),
+        )
+
     # ---- mappers ----
 
     @staticmethod

@@ -21,8 +21,14 @@ import type {
   CaptureRun,
   CaptureRunDetail,
   ChatNode,
+  ChatNodeDeleteResult,
+  ChatNodeMoveResult,
+  ChatNodeRestoreResult,
+  ChatForkResult,
+  ChatPurgeResult,
   ChatSendResult,
   ChatSession,
+  ChatTreeResult,
   CredentialKind,
   CredentialRef,
   DeleteTaskResponse,
@@ -557,9 +563,47 @@ export const chat = {
       { method: 'DELETE' },
     ),
 
-  messages: (sessionId: string) =>
+  messages: (sessionId: string, leafId?: string) =>
     request<{ messages: ChatNode[]; leaf_id: string | null; returned: number }>(
       `/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`,
+      { query: leafId ? { leaf_id: leafId } : {} },
+    ),
+
+  /** 会话的完整节点森林（含软删节点），分支视图与分支标识的事实源。 */
+  tree: (sessionId: string) =>
+    request<ChatTreeResult>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/tree`),
+
+  /** 以该节点为分叉点：返回根 → 该节点的分支上下文；实际分叉在下一次带 parent_id 的发送。 */
+  forkNode: (nodeId: string) =>
+    request<ChatForkResult>(`/api/chat/nodes/${encodeURIComponent(nodeId)}/fork`, {
+      method: 'POST',
+    }),
+
+  /** 级联软删除该节点及其全部后代（清空前可恢复）。 */
+  deleteNode: (nodeId: string) =>
+    request<ChatNodeDeleteResult>(`/api/chat/nodes/${encodeURIComponent(nodeId)}`, {
+      method: 'DELETE',
+    }),
+
+  /** 移动/合并子树；newParentId 为空串表示挂到森林根；成环时 409。 */
+  moveNode: (nodeId: string, newParentId: string) =>
+    request<ChatNodeMoveResult>(`/api/chat/nodes/${encodeURIComponent(nodeId)}/move`, {
+      method: 'POST',
+      body: { new_parent_id: newParentId },
+    }),
+
+  /** 恢复软删子树（按删除批次还原）。 */
+  restoreNode: (nodeId: string) =>
+    request<ChatNodeRestoreResult>(
+      `/api/chat/nodes/${encodeURIComponent(nodeId)}/restore`,
+      { method: 'POST' },
+    ),
+
+  /** 清空会话内全部软删消息（硬删，不可恢复）。 */
+  purgeDeleted: (sessionId: string) =>
+    request<ChatPurgeResult>(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/purge_deleted`,
+      { method: 'POST' },
     ),
 
   /** 发消息，同步返回最终回复（含本轮全部新节点）。生成期间的增量经 WS 推 chat_chunk。 */
