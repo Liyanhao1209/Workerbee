@@ -43,10 +43,11 @@ workerbee-supervisor = "workerbee.supervisor.main:main"
 packages = ["src/workerbee"]
 
 # 前端产物随 wheel 分发（server/app.py 的 static_dir 第一级回退读这里）。
-# 构建顺序必须是先 `cd web && npm ci && npm run build` 再打包——
-# web/dist 不存在时打包会直接失败，不会悄悄产出一个没有前端的 wheel。
-[tool.hatch.build.targets.wheel.force-include]
-"web/dist" = "workerbee/web/dist"
+# 由构建钩子注入：standard 构建时 web/dist 必须已存在（先
+# `cd web && npm ci && npm run build` 再打包），缺失即显式失败；
+# editable 安装（CI、源码开发）无 dist 也放行，运行时回退源码布局/解释页。
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "scripts/hatch_dist_hook.py"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

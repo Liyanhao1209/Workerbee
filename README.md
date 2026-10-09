@@ -166,9 +166,9 @@ Workerbee 是单机应用，由一个数据目录和三个进程组成，不依�
 
 ### 1. 构建前端与打包
 
-`web/dist/` 已被 `.gitignore` 排除，但**会被 `force-include` 打进 wheel**——pip 安装的包内嵌前端产物，目标机器不需要安装 Node。
+`web/dist/` 已被 `.gitignore` 排除，但**会被构建钩子（`scripts/hatch_dist_hook.py`）打进 wheel**——pip 安装的包内嵌前端产物，目标机器不需要安装 Node。
 
-发布制品时的构建顺序（先前端后打包，`web/dist` 不存在时打包直接失败）：
+发布制品时的构建顺序（先前端后打包；打 wheel 时 `web/dist` 不存在会显式失败，但 editable 安装 `pip install -e .` 无 dist 也放行，运行时回退到源码布局或解释页）：
 
 ```bash
 cd web && npm ci && npm run build    # 输出到 web/dist/
